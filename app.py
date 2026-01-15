@@ -64,58 +64,13 @@ def display_aggrid(df: pd.DataFrame):
     """Display data using AgGrid with interactive features."""
     st.subheader("📊 Jute Transfer Data Grid")
     
-    # Configure AgGrid options
-    gb = GridOptionsBuilder.from_dataframe(df)
-    gb.configure_pagination(paginationAutoPageSize=True)
-    gb.configure_side_bar()
-    gb.configure_selection(
-        selection_mode="multiple",
-        use_checkbox=True,
-        groupSelectsChildren=True,
-        groupSelectsFiltered=True
-    )
-    gb.configure_default_column(
-        groupable=True,
-        value=True,
-        enableRowGroup=True,
-        editable=False,
-        filterable=True,
-    )
-    
-    # Highlight rows based on status
-    cell_style_jscode = """
-    function(params) {
-        if (params.data.Status === 'Completed') {
-            return {'backgroundColor': '#d4edda', 'color': '#155724'};
-        } else if (params.data.Status === 'In Transit') {
-            return {'backgroundColor': '#d1ecf1', 'color': '#0c5460'};
-        } else if (params.data.Status === 'Delayed') {
-            return {'backgroundColor': '#f8d7da', 'color': '#721c24'};
-        }
-    };
-    """
-    gb.configure_column("Status", cellStyle=cell_style_jscode)
-    
-    grid_options = gb.build()
-    
-    # Display grid
-    grid_response = AgGrid(
+    # Simple AgGrid display
+    AgGrid(
         df,
-        gridOptions=grid_options,
-        update_mode=GridUpdateMode.MODEL_CHANGED,
-        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+        height=500,
         fit_columns_on_grid_load=True,
         theme="streamlit",
-        height=500,
-        width="100%",
-        reload_data=False,
     )
-    
-    # Display selected rows
-    selected_rows = grid_response["selected_rows"]
-    if len(selected_rows) > 0:
-        st.subheader("Selected Rows")
-        st.dataframe(pd.DataFrame(selected_rows), use_container_width=True)
 
 
 def dashboard_page(df: pd.DataFrame):
