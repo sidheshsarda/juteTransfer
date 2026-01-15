@@ -1,0 +1,22 @@
+#!/bin/bash
+# .devcontainer/postCreateCommand.sh - Runs after Codespace is created
+
+echo ""
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║                                                           ║"
+echo "║        Welcome to JuteTransfer Development! 🌾           ║"
+echo "║                                                           ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+echo "🎯 Quick Start:"
+echo "   1. ./setup_codespace_env.sh    - Configure database"
+echo "   2. python init_database.py     - Initialize tables"
+echo "   3. streamlit run app.py        - Run the app"
+echo ""
+echo "📚 Documentation:"
+echo "   • QUICKSTART_ENV.md           - Environment setup"
+echo "   • DATABASE_SETUP.md           - Database guide"
+echo "   • CODESPACES_ENV_SETUP.md     - Codespaces guide"
+echo ""
+echo "💡 Tip: The app runs on port 8501 (auto-forwarded)"
+echo ""
