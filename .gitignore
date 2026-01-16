@@ -40,9 +40,5 @@ Thumbs.db
 # Streamlit
 .streamlit/
 
-# Environment variables
-.env
-.env.local
-
 # uv
 uv.lock
