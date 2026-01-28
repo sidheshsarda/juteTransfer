@@ -5,6 +5,7 @@ import pandas as pd
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 from src.jutetransfer.auth import login, logout, is_authenticated, get_username
 from src.jutetransfer.data import generate_sample_data, get_summary_statistics
+from src.jutetransfer.database import DatabaseConnection
 
 
 def configure_page():
@@ -30,7 +31,7 @@ def display_sidebar():
             st.subheader("Navigation")
             page = st.radio(
                 "Select Page",
-                ["Dashboard", "Data View", "Analytics"],
+                ["Dashboard", "Data View", "Analytics", "Jute MR Table"],
                 label_visibility="collapsed"
             )
             
@@ -164,6 +165,39 @@ def analytics_page(df: pd.DataFrame):
         st.dataframe(cost_by_destination, use_container_width=True)
 
 
+def jute_mr_table_page():
+    """Display Jute MR table from database."""
+    st.title("📦 Jute MR Table")
+    
+    try:
+        # Query the jute_mr table
+        query = "SELECT * FROM jute_mr"
+        df = DatabaseConnection.execute_query(query)
+        
+        if df is not None and not df.empty:
+            st.success(f"✅ Loaded {len(df)} records from jute_mr table")
+            
+            # Display record count
+            st.metric("Total Records", len(df))
+            
+            st.markdown("---")
+            
+            # Display the data in AgGrid
+            st.subheader("📊 Jute MR Data")
+            AgGrid(
+                df,
+                height=600,
+                fit_columns_on_grid_load=True,
+                theme="streamlit",
+            )
+        else:
+            st.warning("⚠️ No data found in jute_mr table")
+            
+    except Exception as e:
+        st.error(f"❌ Error loading jute_mr table: {str(e)}")
+        st.info("💡 Make sure the database is configured and the jute_mr table exists")
+
+
 def main():
     """Main application entry point."""
     configure_page()
@@ -185,6 +219,8 @@ def main():
         data_view_page(df)
     elif page == "Analytics":
         analytics_page(df)
+    elif page == "Jute MR Table":
+        jute_mr_table_page()
 
 
 if __name__ == "__main__":

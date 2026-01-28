@@ -56,8 +56,8 @@ def get_summary_statistics(df: pd.DataFrame) -> dict:
     return {
         "Total Transfers": len(df),
         "Total Quantity (kg)": df["Quantity (kg)"].sum(),
-        "Total Cost ($)": df["Cost ($)"].sum().round(2),
-        "Average Quantity (kg)": df["Quantity (kg)"].mean().round(2),
+        "Total Cost ($)": round(df["Cost ($)"].sum(), 2),
+        "Average Quantity (kg)": round(df["Quantity (kg)"].mean(), 2),
         "Completed Transfers": len(df[df["Status"] == "Completed"]),
         "In Transit": len(df[df["Status"] == "In Transit"]),
     }
