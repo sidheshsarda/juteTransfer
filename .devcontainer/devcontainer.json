@@ -2,6 +2,10 @@
   "name": "JuteTransfer Development",
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
   
+  "features": {
+    "ghcr.io/devcontainers/features/git-lfs:1": {}
+  },
+  
   "customizations": {
     "vscode": {
       "extensions": [
