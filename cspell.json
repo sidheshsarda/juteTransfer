@@ -1,0 +1,20 @@
+{
+    "version": "0.2",
+    "language": "en",
+    "words": [
+        "streamlit",
+        "aggrid",
+        "jutetransfer",
+        "sqlalchemy",
+        "dotenv",
+        "mysql",
+        "vscode",
+        "pylance",
+        "debugpy"
+    ],
+    "ignorePaths": [
+        "node_modules",
+        ".venv",
+        "*.lock"
+    ]
+}
