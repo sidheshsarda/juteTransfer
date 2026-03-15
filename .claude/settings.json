@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/code/juteTransfer -maxdepth 3 -type f \\\\\\(-name *.css -o -name .streamlit* -o -name *style* -o -name *theme* \\\\\\) ! -path ./.venv/*)",
+      "Bash(find /c/code/juteTransfer/src -type f -name *.py)",
+      "Bash(find /c/code/juteTransfer -type d -not -path */.* -not -path */.venv* -not -path */__pycache__*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/jutetransfer/pages/jute_mr.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''src/jutetransfer/queries.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(grep -r \"dashboard\\\\|data.view\\\\|analytics\" /c/code/juteTransfer/src/jutetransfer/ --include=*.py)"
+    ]
+  }
+}

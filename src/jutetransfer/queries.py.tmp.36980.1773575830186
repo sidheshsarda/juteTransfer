@@ -174,12 +174,7 @@ def get_jute_mr_with_line_items(
             li.accepted_weight AS `Weight (KG)`,
             mr.invoice_no AS `Invoice No`,
             DATE(mr.invoice_date) AS `Invoice Date`,
-            CASE mr.status_id
-                WHEN 0 THEN 'Pending'
-                WHEN 1 THEN 'Approved'
-                WHEN 2 THEN 'Completed'
-                ELSE CONCAT('Status-', mr.status_id)
-            END AS `Status`,
+            mr.status_id AS `Status`,
             li.rate AS `MR Rate`,
             (COALESCE(li.accepted_weight, 0) * COALESCE(li.rate, 0) / 100) AS `Total Amount`,
             li.claim_rate AS `Claim Rate`,
