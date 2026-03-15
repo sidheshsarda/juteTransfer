@@ -56,6 +56,8 @@ source .venv/bin/activate  # On Unix/macOS
 # or
 .venv\Scripts\activate  # On Windows
 
+source /c/code/juteTransfer/.venv/Scripts/activate
+
 # Run the application
 streamlit run app.py
 ```
