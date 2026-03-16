@@ -299,7 +299,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
 
     changed = False
 
-    # Source card (read-only)
+    # Source card
     with cols[0]:
         st.markdown("**Source**")
         st.markdown(f"**{source_co_branch or 'N/A'}**")
@@ -308,6 +308,28 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
         st.metric("Total Amt", f"{orig_total:,.0f}")
         st.metric("Claim", f"{orig_claim:,.0f}")
         st.metric("Net", f"{orig_total - orig_claim:,.0f}")
+
+        # Warehouse selector for source company
+        if selected_branch_id:
+            src_warehouses = get_warehouses_by_branch(selected_branch_id)
+            if src_warehouses:
+                src_wh_names = [""] + list(src_warehouses.keys())
+                src_wh_key = f"src_wh_{filter_key}_{mr_id}"
+                current_src_wh_id = st.session_state.get(src_wh_key)
+                current_src_wh_name = ""
+                for wn, wid in src_warehouses.items():
+                    if wid == current_src_wh_id:
+                        current_src_wh_name = wn
+                        break
+                src_wh_index = src_wh_names.index(current_src_wh_name) if current_src_wh_name in src_wh_names else 0
+                new_src_wh = st.selectbox(
+                    "Warehouse",
+                    options=src_wh_names,
+                    index=src_wh_index,
+                    key=f"src_wh_sel_{filter_key}_{mr_id}",
+                )
+                if new_src_wh and new_src_wh in src_warehouses:
+                    st.session_state[src_wh_key] = src_warehouses[new_src_wh]
 
     # Render each step card
     for i, step in enumerate(steps):
@@ -368,27 +390,26 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                 if new_co and new_co in co_branch_mapping:
                     _, step_branch_id = co_branch_mapping[new_co]
                     warehouses = get_warehouses_by_branch(step_branch_id)
-                    wh_names = [""] + list(warehouses.keys()) if warehouses else [""]
-                    current_wh_id = step.get("warehouse_id")
-                    current_wh_name = ""
                     if warehouses:
+                        wh_names = [""] + list(warehouses.keys())
+                        current_wh_id = step.get("warehouse_id")
+                        # Find current warehouse name
+                        current_wh_name = ""
                         for wn, wid in warehouses.items():
                             if wid == current_wh_id:
                                 current_wh_name = wn
                                 break
-                    wh_index = wh_names.index(current_wh_name) if current_wh_name in wh_names else 0
-                    new_wh = st.selectbox(
-                        "Warehouse",
-                        options=wh_names,
-                        index=wh_index,
-                        key=f"wh_{filter_key}_{mr_id}_{i}",
-                    )
-                    if new_wh and warehouses and new_wh in warehouses:
-                        if warehouses[new_wh] != current_wh_id:
-                            step["warehouse_id"] = warehouses[new_wh]
-                            changed = True
-                    if not warehouses:
-                        st.caption("No warehouses found")
+                        wh_index = wh_names.index(current_wh_name) if current_wh_name in wh_names else 0
+                        new_wh = st.selectbox(
+                            "Warehouse",
+                            options=wh_names,
+                            index=wh_index,
+                            key=f"wh_{filter_key}_{mr_id}_{i}",
+                        )
+                        if new_wh and new_wh in warehouses:
+                            if warehouses[new_wh] != current_wh_id:
+                                step["warehouse_id"] = warehouses[new_wh]
+                                changed = True
 
                 # % Rate Increase (step 2+)
                 if i >= 1:

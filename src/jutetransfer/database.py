@@ -99,6 +99,32 @@ class DatabaseConnection:
             raise
     
     @classmethod
+    @contextmanager
+    def get_transaction(cls):
+        """Context manager that yields a connection inside an explicit transaction.
+
+        Commits on clean exit, rolls back on exception.
+        """
+        engine = cls.get_engine()
+        connection = engine.connect()
+        trans = connection.begin()
+        try:
+            yield connection
+            trans.commit()
+        except Exception:
+            trans.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @classmethod
+    def execute_insert_returning_id(cls, conn, query: str, params: dict) -> int:
+        """Execute an INSERT on an existing connection and return the auto-increment ID."""
+        conn.execute(text(query), params)
+        result = conn.execute(text("SELECT LAST_INSERT_ID()"))
+        return result.scalar()
+
+    @classmethod
     def execute_non_query(cls, query: str, params: Optional[dict] = None) -> int:
         """Execute INSERT, UPDATE, DELETE queries.
         

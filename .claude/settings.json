@@ -6,7 +6,9 @@
       "Bash(find /c/code/juteTransfer -type d -not -path */.* -not -path */.venv* -not -path */__pycache__*)",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/jutetransfer/pages/jute_mr.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''src/jutetransfer/queries.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(grep -r \"dashboard\\\\|data.view\\\\|analytics\" /c/code/juteTransfer/src/jutetransfer/ --include=*.py)"
+      "Bash(grep -r \"dashboard\\\\|data.view\\\\|analytics\" /c/code/juteTransfer/src/jutetransfer/ --include=*.py)",
+      "Bash(find /c/code/juteTransfer -type f \\\\\\(-name *.py -o -name *.html -o -name *.js -o -name *.jsx -o -name *.ts -o -name *.tsx \\\\\\) -not -path */.venv/* -not -path */__pycache__/*)",
+      "Read(//c/Users/silve/.claude/projects/c--code-juteTransfer/memory/**)"
     ]
   }
 }

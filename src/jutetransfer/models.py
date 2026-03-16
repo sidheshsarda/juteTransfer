@@ -195,6 +195,48 @@ class JuteSupplierPartyMap(Base):
     updated_date_time = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class Item(Base):
+    """Item master table (item_mst)."""
+    __tablename__ = 'item_mst'
+    
+    item_id = Column(Integer, primary_key=True, autoincrement=True)
+    item_name = Column(String(255))
+    item_code = Column(String(255))
+    legacy_item_code = Column(String(255))
+    hsn_code = Column(String(255))
+    item_grp_id = Column(BigInteger)
+    uom_id = Column(Integer)
+    tangible = Column(Boolean)
+    saleable = Column(Boolean)
+    consumable = Column(Boolean)
+    purchaseable = Column(Boolean)
+    manufacturable = Column(Boolean)
+    assembly = Column(Boolean)
+    tax_percentage = Column(Float)
+    uom_rounding = Column(Integer)
+    rate_rounding = Column(Integer)
+    item_photo = Column(Text)
+    active = Column(Integer, nullable=False, default=1)
+    updated_by = Column(Integer, nullable=False)
+    updated_date_time = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+
+class ItemGroup(Base):
+    """Item Group master table (item_grp_mst)."""
+    __tablename__ = 'item_grp_mst'
+    
+    item_grp_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    item_grp_name = Column(String(255))
+    item_grp_code = Column(String(255))
+    parent_grp_id = Column(BigInteger)
+    co_id = Column(Integer, ForeignKey('co_mst.co_id'))
+    item_type_id = Column(Integer)
+    purchase_code = Column(BigInteger)
+    active = Column(String(255))
+    updated_by = Column(Integer, nullable=False)
+    updated_date_time = Column(DateTime, nullable=False, default=datetime.now, onupdate=datetime.now)
+
+
 class Party(Base):
     """Party master table (party_mst)."""
     __tablename__ = 'party_mst'
@@ -377,6 +419,8 @@ def get_model_by_tablename(tablename: str):
         'jute_mukam_mst': JuteMukam,
         'jute_supplier_mst': JuteSupplier,
         'jute_supp_party_map': JuteSupplierPartyMap,
+        'item_mst': Item,
+        'item_grp_mst': ItemGroup,
         'party_mst': Party,
         'party_branch_mst': PartyBranch,
         'sales_invoice': SalesInvoice,
@@ -397,7 +441,7 @@ def get_all_models():
     """
     return [
         Company, Branch, JuteMR, JuteMRLineItem, JuteMukam,
-        JuteSupplier, JuteSupplierPartyMap, Party, PartyBranch,
+        JuteSupplier, JuteSupplierPartyMap, Item, ItemGroup, Party, PartyBranch,
         SalesInvoice, SalesInvoiceDetail, SalesInvoiceJute,
         SalesInvoiceJuteDetail, Warehouse, Status
     ]
