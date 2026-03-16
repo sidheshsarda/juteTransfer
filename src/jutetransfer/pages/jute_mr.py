@@ -11,6 +11,14 @@ from ..queries import (
     get_company_branch_options,
     get_jute_mr_with_line_items,
     get_next_mr_numbers_batch,
+    get_transfer_chain,
+    get_warehouses_by_branch,
+)
+from ..transfer import (
+    finalize_transfer_chain,
+    save_transfer_step,
+    delete_chain_from_step,
+    TransferStep,
 )
 
 # Maximum number of transfer steps in a chain
@@ -23,10 +31,106 @@ MONTH_NAMES = [
 
 # Columns shown in the compact monthly overview table
 COMPACT_COLUMNS = [
-    "Jute Gate Entry No", "MR DATE", "Party Name", "Item Quality",
+    "Jute Gate Entry No", "MR DATE", "Jute Supplier", "Party Name",
+    "Party Branch Address", "Item Quality",
     "Weight (KG)", "MR Rate", "Total Amount", "Claim Amount", "Net Total",
     "Transfer Chain", "Chain Status",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Grouping: collapse per-line-item rows into one row per jute_mr_id
+# ---------------------------------------------------------------------------
+
+def _group_by_mr(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Group raw per-line-item dataframe into one row per jute_mr_id.
+
+    Returns:
+        (grouped_df, line_items_map) where line_items_map is
+        {jute_mr_id: [{weight, original_rate, original_claim}, ...]}
+    """
+    if df is None or df.empty:
+        return df, {}
+
+    line_items_map = {}
+    grouped_rows = []
+
+    for mr_id, group in df.groupby("jute_mr_id"):
+        # Extract per-line-item details
+        items = []
+        for _, row in group.iterrows():
+            items.append({
+                "weight": round(float(row.get("Weight (KG)") or 0), 0),
+                "original_rate": float(row.get("MR Rate") or 0),
+                "original_claim": float(row.get("Claim Amount") or 0),
+            })
+        line_items_map[int(mr_id)] = items
+
+        # Aggregated row
+        first = group.iloc[0].to_dict()
+        total_weight = sum(li["weight"] for li in items)
+        total_amount = sum(float(r.get("Total Amount") or 0) for _, r in group.iterrows())
+        claim_amount = sum(float(r.get("Claim Amount") or 0) for _, r in group.iterrows())
+
+        first["Weight (KG)"] = total_weight
+        first["Total Amount"] = total_amount
+        first["Claim Amount"] = claim_amount
+        first["Net Total"] = total_amount - claim_amount
+        first["MR Rate"] = (total_amount / total_weight * 100) if total_weight > 0 else 0.0
+
+        # Combine qualities
+        qualities = group["Item Quality"].dropna().unique()
+        if len(qualities) > 1:
+            first["Item Quality"] = " / ".join(str(q) for q in qualities)
+
+        grouped_rows.append(first)
+
+    grouped_df = pd.DataFrame(grouped_rows)
+    return grouped_df, line_items_map
+
+
+# ---------------------------------------------------------------------------
+# Chain reconstruction: order MR records by src_com_id linkage
+# ---------------------------------------------------------------------------
+
+def _reconstruct_chain(chain_mrs: list[dict], root_co_id: int) -> list[dict]:
+    """Reconstruct transfer chain order from MR records.
+
+    Args:
+        chain_mrs: List of MR dicts with jute_mr_id, src_com_id, owner_co_id, branch_id.
+                   Must be sorted by jute_mr_id ASC.
+        root_co_id: The root/source company's co_id.
+
+    Returns:
+        Ordered list of MR dicts representing the chain.
+    """
+    if not chain_mrs:
+        return []
+
+    # Ensure sorted by jute_mr_id for tie-breaking
+    sorted_mrs = sorted(chain_mrs, key=lambda m: m["jute_mr_id"])
+
+    visited = set()
+    ordered = []
+    current_co = root_co_id
+
+    while True:
+        # Find unvisited MR where src_com_id == current_co, lowest jute_mr_id first
+        candidate = None
+        for mr in sorted_mrs:
+            if mr["jute_mr_id"] not in visited and mr.get("src_com_id") == current_co:
+                candidate = mr
+                break
+
+        if candidate is None:
+            break
+
+        visited.add(candidate["jute_mr_id"])
+        ordered.append(candidate)
+        # Derive next current_co from this MR's owner
+        current_co = candidate.get("owner_co_id") or candidate.get("co_id")
+
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +148,7 @@ def _empty_transfer_step() -> dict:
         "total_amount": 0.0,
         "claim_amount": 0.0,
         "net_amount": 0.0,
+        "warehouse_id": None,
     }
 
 
@@ -83,31 +188,51 @@ def _get_chain_status(steps: list, source_co_branch: str) -> str:
     return f"{len(companies)} step(s)"
 
 
-def _recalculate_chain(steps: list, weight: float, original_mr_rate: float,
-                       original_claim: float) -> list:
-    """Recalculate all derived values in a transfer chain."""
-    prev_rate = original_mr_rate
-    claim = original_claim
+def _recalculate_chain(steps: list, line_items: list) -> list:
+    """Recalculate all derived values in a transfer chain.
+
+    Args:
+        steps: List of transfer step dicts (mutated in place and returned).
+        line_items: List of {weight, original_rate, original_claim} per line item.
+
+    Returns:
+        The steps list with computed aggregates filled in.
+    """
+    weights = [round(float(li.get("weight") or 0), 0) for li in line_items]
+    original_rates = [float(li.get("original_rate") or 0) for li in line_items]
+    claims = [float(li.get("original_claim") or 0) for li in line_items]
+    total_weight = sum(weights)
+
+    prev_rates = list(original_rates)
 
     for i, step in enumerate(steps):
-        if not step["company"]:
-            # Clear downstream values
-            step["mr_rate"] = 0.0
-            step["total_amount"] = 0.0
-            step["claim_amount"] = 0.0
-            step["net_amount"] = 0.0
+        if not step.get("company"):
+            step["total_amount"] = 0
+            step["claim_amount"] = 0
+            step["net_amount"] = 0
+            step["roundoff"] = 0.0
+            step["weighted_avg_rate"] = 0.0
             continue
 
         if i == 0:
-            step["mr_rate"] = prev_rate
+            rates_i = list(prev_rates)
         else:
             pct = float(step.get("pct_rate_increase", 0) or 0)
-            step["mr_rate"] = prev_rate * (1 + pct / 100)
+            rates_i = [r * (1 + pct / 100) for r in prev_rates]
 
-        step["total_amount"] = weight * step["mr_rate"] / 100
-        step["claim_amount"] = claim
-        step["net_amount"] = step["total_amount"] - claim
-        prev_rate = step["mr_rate"]
+        # Line item level: round to 2
+        li_totals = [round(weights[j] * rates_i[j] / 100, 2) for j in range(len(line_items))]
+        li_claims = [round(claims[j], 2) for j in range(len(line_items))]
+
+        # Header level: round to 0
+        raw_total = sum(li_totals)
+        step["total_amount"] = round(raw_total, 0)
+        step["roundoff"] = round(raw_total - step["total_amount"], 2)
+        step["claim_amount"] = round(sum(li_claims), 0)
+        step["net_amount"] = step["total_amount"] - step["claim_amount"]
+        step["weighted_avg_rate"] = (step["total_amount"] / total_weight * 100) if total_weight > 0 else 0.0
+
+        prev_rates = rates_i
 
     return steps
 
@@ -160,7 +285,9 @@ def _find_source_co_branch(selected_company_id, selected_branch_id,
 
 def _render_transfer_editor(row_idx: int, row: pd.Series, steps: list,
                             co_branch_options: list, source_co_branch: str,
-                            co_branch_mapping: dict, filter_key: str):
+                            co_branch_mapping: dict, filter_key: str,
+                            selected_company_id: int = None,
+                            selected_branch_id: int = None):
     """Render the transfer editor panel for a selected row."""
     gate_entry = row["Jute Gate Entry No"]
     party = row["Party Name"] or "Unknown"
@@ -286,7 +413,51 @@ def _render_transfer_editor(row_idx: int, row: pd.Series, steps: list,
         st.success("Chain returns to source company — ready for finalization.")
         if st.button("Finalize MR", key=f"finalize_{filter_key}_{row_idx}",
                      type="primary", use_container_width=True):
-            st.info("MR finalization triggered. (Persistence not yet implemented.)")
+            with st.spinner("Finalizing transfer chain..."):
+                try:
+                    source_mr_id = int(row.get("jute_mr_id", 0))
+                    if not source_mr_id:
+                        st.error("Cannot finalize: source MR ID not found.")
+                    else:
+                        transfer_steps = []
+                        for step in steps:
+                            co_label = step.get("company", "")
+                            if co_label and co_label in co_branch_mapping:
+                                co_id, branch_id = co_branch_mapping[co_label]
+                                transfer_steps.append(TransferStep(
+                                    co_id=co_id,
+                                    branch_id=branch_id,
+                                    mr_date=step.get("mr_date") or date.today(),
+                                    mr_rate=float(step.get("mr_rate", 0)),
+                                    total_amount=float(step.get("total_amount", 0)),
+                                    claim_amount=float(step.get("claim_amount", 0)),
+                                    net_amount=float(step.get("net_amount", 0)),
+                                    mr_no=int(step.get("mr_no") or 0),
+                                ))
+
+                        if len(transfer_steps) < 2:
+                            st.error("Transfer chain must have at least 2 steps.")
+                        elif any(s.mr_no == 0 for s in transfer_steps):
+                            st.error("All transfer steps must have MR numbers assigned.")
+                        else:
+                            result = finalize_transfer_chain(
+                                source_mr_id=source_mr_id,
+                                steps=transfer_steps,
+                                source_co_id=selected_company_id,
+                                source_branch_id=selected_branch_id,
+                                updated_by=1,
+                            )
+                            st.success(
+                                f"Chain finalized! Created {len(result['mr_ids'])} MR(s) "
+                                f"and {len(result['invoice_ids'])} invoice(s)."
+                            )
+                            # Clear transfer state to refresh
+                            for key in [f"transfers_{filter_key}", f"source_df_{filter_key}",
+                                        f"selected_row_{filter_key}"]:
+                                if key in st.session_state:
+                                    del st.session_state[key]
+                except Exception as e:
+                    st.error(f"Finalization failed: {e}")
 
     # Recalculate if anything changed
     if changed:
@@ -465,8 +636,17 @@ def jute_mr_table_page():
 
         # Transfer editor panel for selected row
         selected_rows = event.selection.rows
+        selected_row_key = f"selected_row_{filter_key}"
+
         if selected_rows:
+            st.session_state[selected_row_key] = selected_rows[0]
             row_idx = selected_rows[0]
+        elif selected_row_key in st.session_state:
+            row_idx = st.session_state[selected_row_key]
+        else:
+            row_idx = None
+
+        if row_idx is not None and row_idx < len(source_df):
             row = source_df.iloc[row_idx]
             steps = transfers.get(row_idx, [_empty_transfer_step()])
 
@@ -478,12 +658,14 @@ def jute_mr_table_page():
                 source_co_branch=source_co_branch,
                 co_branch_mapping=co_branch_mapping,
                 filter_key=filter_key,
+                selected_company_id=selected_company_id,
+                selected_branch_id=selected_branch_id,
             )
 
         # Reset button
         st.markdown("---")
         if st.button("Reset All Transfers", use_container_width=True):
-            for key in [transfers_key, source_df_key]:
+            for key in [transfers_key, source_df_key, selected_row_key]:
                 if key in st.session_state:
                     del st.session_state[key]
             st.rerun()
