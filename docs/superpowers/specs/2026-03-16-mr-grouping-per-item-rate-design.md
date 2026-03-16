@@ -12,6 +12,35 @@ This spec covers five interrelated changes to the jute transfer system:
 
 ---
 
+## Rounding Rules and Unit Conventions
+
+### Units
+
+- **Weight**: in KG, rounded to 0 decimal places (integer).
+- **Rate** (`rate` field): in Rs/quintal. When multiplying with weight in KG, divide rate by 100: `weight_kg * rate / 100`.
+- **Claim Rate** (`claim_rate` field): in Rs/quintal, same unit conversion as rate.
+
+### Rounding
+
+| Level | Field | Rounding |
+|---|---|---|
+| Line item | `total_price` | `round(weight * rate / 100, 2)` — 2 decimal places |
+| Line item | claim amount | `round(weight * claim_rate / 100 + water_damage - premium, 2)` — 2 decimal places |
+| Header | `total_amount` | `round(sum(li.total_price), 0)` — integer |
+| Header | `claim_amount` | `round(sum(li.claim_amount), 0)` — integer |
+| Header | `roundoff` | `sum(li.total_price) - total_amount` — captures rounding difference (applies to total_amount only) |
+| Header | `net_total` | `total_amount - claim_amount` |
+
+### Claim behavior
+
+Claim rate and claim amount are **NOT affected** by the % rate increase. They pass through unchanged from the source MR to all transfer steps. Only `rate` (purchase rate) is cascaded.
+
+### actual_rate
+
+The `actual_rate` field on `jute_mr_li` should **NOT** be copied to transferred MRs — set to `NULL`.
+
+---
+
 ## Part 1: MR Grouping + Per-Line-Item Rates
 
 ### Data Layer
@@ -46,11 +75,13 @@ After fetching the raw dataframe:
 
 ### Recalculation (`_recalculate_chain`)
 
-Step 0 uses original rates (first buyer doesn't mark up their purchase). Rate increases from step 1 onward.
+Step 0 uses original rates (first buyer doesn't mark up their purchase). Rate increases from step 1 onward. **Claim is never affected by % increase** — it passes through unchanged.
 
 ```
-prev_rates = [li.original_rate for each line item]
-total_weight = sum(li.weight for each line item)
+prev_rates = [li.original_rate for each line item]    # Rs/quintal
+weights = [round(li.weight, 0) for each line item]    # KG, rounded to integer
+claims = [li.original_claim for each line item]        # unchanged throughout chain
+total_weight = sum(weights)
 
 for each step i:
     if i == 0:
@@ -59,8 +90,15 @@ for each step i:
         pct = step.pct_rate_increase
         rates_i = [r * (1 + pct / 100) for r in prev_rates]
 
-    step.total_amount = sum(weight_j * rates_i[j] / 100 for j in items)
-    step.claim_amount = sum(claim_j for j in items)
+    # Line item level: round amounts to 2 decimal places
+    li_totals = [round(weights[j] * rates_i[j] / 100, 2) for j in items]
+    li_claims = [round(claims[j], 2) for j in items]
+
+    # Header level: round to 0 (integer), store rounding difference
+    raw_total = sum(li_totals)
+    step.total_amount = round(raw_total, 0)
+    step.roundoff = raw_total - step.total_amount       # applies to total_amount only
+    step.claim_amount = round(sum(li_claims), 0)
     step.net_amount = step.total_amount - step.claim_amount
     step.weighted_avg_rate = (step.total_amount / total_weight * 100) if total_weight > 0 else 0.0
 
@@ -93,6 +131,12 @@ Same horizontal card layout:
 |---|---|---|
 | `transfer.py:469` — `po_id` | `source_mr.get("po_id")` | `None` (PO is company-specific) |
 | `transfer.py:521` — `jute_po_li_id` (line items) | `li.get("jute_po_li_id")` | `None` |
+
+### actual_rate (line items)
+
+| Location | Current | Fix |
+|---|---|---|
+| `transfer.py:548` — `actual_rate` | `li.get("actual_rate")` (copied from source) | `None` (not applicable to transferred MRs) |
 
 ### warehouse_id
 
@@ -351,9 +395,10 @@ class TransferStep:
     branch_id: int
     mr_date: date
     mr_rate: float              # weighted avg rate (display/header use)
-    total_amount: float         # aggregate across line items
-    claim_amount: float         # aggregate
-    net_amount: float           # aggregate
+    total_amount: float         # aggregate, rounded to 0
+    claim_amount: float         # aggregate, rounded to 0 (unaffected by %)
+    net_amount: float           # total_amount - claim_amount
+    roundoff: float             # sum(li.total_price) - total_amount
     mr_no: int
     pct_rate_increase: float = 0.0
     warehouse_id: Optional[int] = None
