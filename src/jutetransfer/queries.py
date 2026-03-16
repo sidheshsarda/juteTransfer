@@ -89,12 +89,10 @@ def get_next_mr_number(co_id: int, branch_id: int) -> int:
         """
         SELECT COALESCE(MAX(branch_mr_no), 0) AS max_mr_no
         FROM jute_mr
-        WHERE src_com_id = :co_id
-        AND branch_id = :branch_id
+        WHERE branch_id = :branch_id
         AND jute_mr_date BETWEEN :fy_start AND :fy_end
         """,
         {
-            "co_id": co_id,
             "branch_id": branch_id,
             "fy_start": fy_start.strftime('%Y-%m-%d'),
             "fy_end": fy_end.strftime('%Y-%m-%d')
@@ -125,12 +123,10 @@ def get_next_mr_numbers_batch(co_branch_counts: dict) -> dict:
             """
             SELECT COALESCE(MAX(branch_mr_no), 0) AS max_mr_no
             FROM jute_mr
-            WHERE src_com_id = :co_id
-            AND branch_id = :branch_id
+            WHERE branch_id = :branch_id
             AND jute_mr_date BETWEEN :fy_start AND :fy_end
             """,
             {
-                "co_id": co_id,
                 "branch_id": branch_id,
                 "fy_start": fy_start.strftime('%Y-%m-%d'),
                 "fy_end": fy_end.strftime('%Y-%m-%d')
@@ -161,7 +157,8 @@ def get_jute_mr_with_line_items(
         pd.DataFrame: DataFrame with MR and line item data
     """
     query = """
-        SELECT 
+        SELECT
+            mr.jute_mr_id AS `jute_mr_id`,
             mr.jute_gate_entry_no AS `Jute Gate Entry No`,
             mr.jute_gate_entry_date AS `Jute Gate Entry Date`,
             p.po_no AS `PO.No.`,
@@ -169,7 +166,9 @@ def get_jute_mr_with_line_items(
             mr.branch_mr_no AS `EJM MR No.`,
             mr.jute_gate_entry_no AS `CO_MR_No`,
             mr.jute_mr_date AS `MR DATE`,
-            s.supplier_name AS `Party Name`,
+            s.supplier_name AS `Jute Supplier`,
+            pm.supp_name AS `Party Name`,
+            pb.address AS `Party Branch Address`,
             q.jute_quality AS `Item Quality`,
             li.accepted_weight AS `Weight (KG)`,
             mr.invoice_no AS `Invoice No`,
@@ -186,17 +185,20 @@ def get_jute_mr_with_line_items(
             (COALESCE(li.accepted_weight, 0) * COALESCE(li.claim_rate, 0) + COALESCE(li.water_damage_amount, 0) - COALESCE(li.premium_amount, 0)) AS `Claim Amount`,
             ((COALESCE(li.accepted_weight, 0) * COALESCE(li.rate, 0) / 100) - (COALESCE(li.accepted_weight, 0) * COALESCE(li.claim_rate, 0) + COALESCE(li.water_damage_amount, 0) - COALESCE(li.premium_amount, 0))) AS `Net Total`
         FROM jute_mr mr
+        INNER JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         INNER JOIN jute_mr_li li ON mr.jute_mr_id = li.jute_mr_id
         LEFT JOIN jute_po p ON mr.po_id = p.jute_po_id
         LEFT JOIN jute_supplier_mst s ON mr.jute_supplier_id = s.supplier_id
+        LEFT JOIN party_mst pm ON pm.party_id = mr.party_id AND pm.co_id = bm.co_id
+        LEFT JOIN party_branch_mst pb ON pb.party_id = pm.party_id AND pb.party_mst_branch_id = mr.party_branch_id
         LEFT JOIN jute_quality_mst q ON li.actual_quality = q.jute_qlty_id
-        WHERE YEAR(mr.jute_gate_entry_date) = :year 
+        WHERE YEAR(mr.jute_gate_entry_date) = :year
         AND MONTH(mr.jute_gate_entry_date) = :month
     """
     params = {"year": year, "month": month}
 
     if company_id:
-        query += " AND mr.src_com_id = :co_id"
+        query += " AND bm.co_id = :co_id"
         params["co_id"] = company_id
 
     if branch_id:
@@ -206,3 +208,90 @@ def get_jute_mr_with_line_items(
     query += " ORDER BY mr.jute_gate_entry_date DESC, mr.jute_gate_entry_no"
 
     return DatabaseConnection.execute_query(query, params)
+
+
+def get_source_mr_full(jute_mr_id: int, conn=None) -> Optional[dict]:
+    """Fetch complete jute_mr record + line items for copying during transfer.
+
+    Args:
+        jute_mr_id: Primary key of the source MR
+        conn: Optional existing DB connection (for use inside a transaction)
+
+    Returns:
+        dict with all jute_mr columns and a 'line_items' list of dicts,
+        or None if not found.
+    """
+    from sqlalchemy import text as sa_text
+
+    if conn is not None:
+        mr_row = conn.execute(
+            sa_text("SELECT * FROM jute_mr WHERE jute_mr_id = :id"),
+            {"id": jute_mr_id},
+        ).fetchone()
+        if not mr_row:
+            return None
+        mr_dict = dict(mr_row._mapping)
+
+        li_rows = conn.execute(
+            sa_text("SELECT * FROM jute_mr_li WHERE jute_mr_id = :id"),
+            {"id": jute_mr_id},
+        ).fetchall()
+        mr_dict["line_items"] = [dict(r._mapping) for r in li_rows]
+        return mr_dict
+
+    mr_df = DatabaseConnection.execute_query(
+        "SELECT * FROM jute_mr WHERE jute_mr_id = :id",
+        {"id": jute_mr_id},
+    )
+    if mr_df is None or mr_df.empty:
+        return None
+
+    mr_dict = mr_df.iloc[0].to_dict()
+
+    li_df = DatabaseConnection.execute_query(
+        "SELECT * FROM jute_mr_li WHERE jute_mr_id = :id",
+        {"id": jute_mr_id},
+    )
+    mr_dict["line_items"] = (
+        li_df.to_dict("records") if li_df is not None and not li_df.empty else []
+    )
+    return mr_dict
+
+
+def get_transfer_chain(root_mr_id: int) -> pd.DataFrame:
+    """Fetch all transferred MRs for a given root MR, with company info.
+
+    Returns DataFrame with columns: jute_mr_id, src_com_id, branch_id,
+    jute_mr_date, branch_mr_no, total_amount, claim_amount, net_total,
+    owner_co_id, branch_name, co_name, co_prefix.
+    Ordered by jute_mr_id ASC for chain reconstruction.
+    """
+    return DatabaseConnection.execute_query(
+        """
+        SELECT mr.jute_mr_id, mr.src_com_id, mr.branch_id, mr.jute_mr_date,
+               mr.branch_mr_no, mr.total_amount, mr.claim_amount, mr.net_total,
+               bm.co_id AS owner_co_id, bm.branch_name,
+               cm.co_name, cm.co_prefix
+        FROM jute_mr mr
+        JOIN branch_mst bm ON mr.branch_id = bm.branch_id
+        JOIN co_mst cm ON bm.co_id = cm.co_id
+        WHERE mr.src_jute_mr_id = :root_id
+        ORDER BY mr.jute_mr_id ASC
+        """,
+        {"root_id": root_mr_id},
+    )
+
+
+def get_warehouses_by_branch(branch_id: int) -> dict:
+    """Fetch warehouses for a branch.
+
+    Returns:
+        dict: {warehouse_name: warehouse_id}
+    """
+    df = DatabaseConnection.execute_query(
+        "SELECT warehouse_id, warehouse_name FROM warehouse_mst WHERE branch_id = :bid AND active = 1 ORDER BY warehouse_name",
+        {"bid": branch_id},
+    )
+    if df is not None and not df.empty:
+        return {row["warehouse_name"]: row["warehouse_id"] for _, row in df.iterrows()}
+    return {}
