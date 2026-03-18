@@ -1,0 +1,23 @@
+#!/bin/bash
+# Welcome message for JuteTransfer Codespace
+
+echo ""
+echo "╔═══════════════════════════════════════════════════════════╗"
+echo "║                                                           ║"
+echo "║        Welcome to JuteTransfer Development! 🌾           ║"
+echo "║                                                           ║"
+echo "╚═══════════════════════════════════════════════════════════╝"
+echo ""
+echo "🎯 Quick Start:"
+echo "   1. uv sync                - Install dependencies"
+echo "   2. streamlit run app.py   - Run the application"
+echo ""
+echo "📚 Documentation:"
+echo "   • README.md - Complete setup guide"
+echo ""
+echo "💡 Tip: The app runs on port 8502 (auto-forwarded)"
+echo ""
+echo "🔐 Demo Login Credentials:"
+echo "   • Username: admin | Password: admin123"
+echo "   • Username: user  | Password: user123"
+echo ""

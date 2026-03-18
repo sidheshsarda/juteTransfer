@@ -1,0 +1,783 @@
+"""Jute MR Table page for JuteTransfer application."""
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime, date
+
+from ..queries import (
+    get_companies,
+    get_branches_by_company,
+    get_company_branch_options,
+    get_jute_mr_with_line_items,
+    get_transfer_chain,
+    get_transfer_chains_batch,
+    get_warehouses_by_branch,
+)
+from ..transfer import (
+    save_transfer_step,
+    delete_chain_from_step,
+    TransferStep,
+)
+
+# Maximum number of transfer steps in a chain
+MAX_TRANSFERS = 8
+
+MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+# Columns shown in the compact monthly overview table
+COMPACT_COLUMNS = [
+    "Jute Gate Entry No", "MR DATE", "Jute Supplier", "Party Name",
+    "Party Branch Address", "Item Quality",
+    "Weight (KG)", "MR Rate", "Total Amount", "Claim Amount", "Net Total",
+    "Transfer Chain", "Chain Status",
+]
+
+
+# ---------------------------------------------------------------------------
+# Grouping: collapse per-line-item rows into one row per jute_mr_id
+# ---------------------------------------------------------------------------
+
+def _group_by_mr(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Group raw per-line-item dataframe into one row per jute_mr_id.
+
+    Returns:
+        (grouped_df, line_items_map) where line_items_map is
+        {jute_mr_id: [{weight, original_rate, original_claim}, ...]}
+    """
+    if df is None or df.empty:
+        return df, {}
+
+    line_items_map = {}
+    grouped_rows = []
+
+    for mr_id, group in df.groupby("jute_mr_id"):
+        # Extract per-line-item details
+        items = []
+        for _, row in group.iterrows():
+            items.append({
+                "weight": round(float(row.get("Weight (KG)") or 0), 0),
+                "original_rate": float(row.get("MR Rate") or 0),
+                "original_claim": float(row.get("Claim Amount") or 0),
+            })
+        line_items_map[int(mr_id)] = items
+
+        # Aggregated row
+        first = group.iloc[0].to_dict()
+        total_weight = sum(li["weight"] for li in items)
+        total_amount = sum(float(r.get("Total Amount") or 0) for _, r in group.iterrows())
+        claim_amount = sum(float(r.get("Claim Amount") or 0) for _, r in group.iterrows())
+
+        first["Weight (KG)"] = total_weight
+        first["Total Amount"] = total_amount
+        first["Claim Amount"] = claim_amount
+        first["Net Total"] = total_amount - claim_amount
+        first["MR Rate"] = (total_amount / total_weight * 100) if total_weight > 0 else 0.0
+
+        # Combine qualities
+        qualities = group["Item Quality"].dropna().unique()
+        if len(qualities) > 1:
+            first["Item Quality"] = " / ".join(str(q) for q in qualities)
+
+        grouped_rows.append(first)
+
+    grouped_df = pd.DataFrame(grouped_rows)
+    return grouped_df, line_items_map
+
+
+# ---------------------------------------------------------------------------
+# Chain reconstruction: order MR records by src_com_id linkage
+# ---------------------------------------------------------------------------
+
+def _reconstruct_chain(chain_mrs: list[dict], root_co_id: int) -> list[dict]:
+    """Reconstruct transfer chain order from MR records.
+
+    Args:
+        chain_mrs: List of MR dicts with jute_mr_id, src_com_id, owner_co_id, branch_id.
+                   Must be sorted by jute_mr_id ASC.
+        root_co_id: The root/source company's co_id.
+
+    Returns:
+        Ordered list of MR dicts representing the chain.
+    """
+    if not chain_mrs:
+        return []
+
+    # Ensure sorted by jute_mr_id for tie-breaking
+    sorted_mrs = sorted(chain_mrs, key=lambda m: m["jute_mr_id"])
+
+    visited = set()
+    ordered = []
+    current_co = root_co_id
+
+    while True:
+        # Find unvisited MR where src_com_id == current_co, lowest jute_mr_id first
+        candidate = None
+        for mr in sorted_mrs:
+            if mr["jute_mr_id"] not in visited and mr.get("src_com_id") == current_co:
+                candidate = mr
+                break
+
+        if candidate is None:
+            break
+
+        visited.add(candidate["jute_mr_id"])
+        ordered.append(candidate)
+        # Derive next current_co from this MR's owner
+        current_co = candidate.get("owner_co_id") or candidate.get("co_id")
+
+    return ordered
+
+
+# ---------------------------------------------------------------------------
+# Transfer data helpers
+# ---------------------------------------------------------------------------
+
+def _empty_transfer_step() -> dict:
+    """Return a blank transfer step dict."""
+    return {
+        "company": "",
+        "mr_no": None,
+        "mr_date": None,
+        "pct_rate_increase": 0.0,
+        "mr_rate": 0.0,
+        "total_amount": 0.0,
+        "claim_amount": 0.0,
+        "net_amount": 0.0,
+        "warehouse_id": None,
+    }
+
+
+
+def _build_chain_summary(steps: list) -> str:
+    """Build a human-readable transfer chain summary string."""
+    companies = [s["company"] for s in steps if s["company"]]
+    if not companies:
+        return "No transfers"
+    return " -> ".join(companies)
+
+
+def _get_chain_status(steps: list, source_co_branch: str) -> str:
+    """Determine chain status based on whether it returns to source."""
+    companies = [s["company"] for s in steps if s["company"]]
+    if not companies:
+        return "-"
+    if companies and companies[-1] == source_co_branch:
+        return "Complete"
+    return f"{len(companies)} step(s)"
+
+
+def _recalculate_chain(steps: list, line_items: list) -> list:
+    """Recalculate all derived values in a transfer chain.
+
+    Args:
+        steps: List of transfer step dicts (mutated in place and returned).
+        line_items: List of {weight, original_rate, original_claim} per line item.
+
+    Returns:
+        The steps list with computed aggregates filled in.
+    """
+    weights = [round(float(li.get("weight") or 0), 0) for li in line_items]
+    original_rates = [float(li.get("original_rate") or 0) for li in line_items]
+    claims = [float(li.get("original_claim") or 0) for li in line_items]
+    total_weight = sum(weights)
+
+    prev_rates = list(original_rates)
+
+    for i, step in enumerate(steps):
+        if not step.get("company"):
+            step["total_amount"] = 0
+            step["claim_amount"] = 0
+            step["net_amount"] = 0
+            step["roundoff"] = 0.0
+            step["weighted_avg_rate"] = 0.0
+            continue
+
+        if i == 0:
+            rates_i = list(prev_rates)
+        else:
+            pct = float(step.get("pct_rate_increase", 0) or 0)
+            rates_i = [r * (1 + pct / 100) for r in prev_rates]
+
+        # Line item level: round to 2
+        li_totals = [round(weights[j] * rates_i[j] / 100, 2) for j in range(len(line_items))]
+        li_claims = [round(claims[j], 2) for j in range(len(line_items))]
+
+        # Header level: round to 0
+        raw_total = sum(li_totals)
+        step["total_amount"] = round(raw_total, 0)
+        step["roundoff"] = round(raw_total - step["total_amount"], 2)
+        step["claim_amount"] = round(sum(li_claims), 0)
+        step["net_amount"] = step["total_amount"] - step["claim_amount"]
+        step["weighted_avg_rate"] = (step["total_amount"] / total_weight * 100) if total_weight > 0 else 0.0
+
+        prev_rates = rates_i
+
+    return steps
+
+
+
+# ---------------------------------------------------------------------------
+# Source company matching (by IDs, not string matching)
+# ---------------------------------------------------------------------------
+
+def _find_source_co_branch(selected_company_id, selected_branch_id,
+                           co_branch_mapping: dict) -> str | None:
+    """Find the co_branch label for the selected source company/branch by IDs."""
+    for label, (co_id, branch_id) in co_branch_mapping.items():
+        if co_id == selected_company_id and branch_id == selected_branch_id:
+            return label
+    return None
+
+
+# ---------------------------------------------------------------------------
+# UI: Transfer editor panel
+# ---------------------------------------------------------------------------
+
+def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
+                            line_items: list, co_branch_options: list,
+                            source_co_branch: str, co_branch_mapping: dict,
+                            filter_key: str,
+                            selected_company_id: int = None,
+                            selected_branch_id: int = None):
+    """Render the transfer editor panel for a selected MR.
+
+    Args:
+        mr_id: The jute_mr_id of the selected MR
+        row: The grouped row from the overview table
+        steps: List of transfer step dicts (from session state)
+        line_items: List of {weight, original_rate, original_claim} per line item
+        co_branch_options: List of "CoPrefix-BranchName" labels for dropdowns
+        source_co_branch: The source company-branch label
+        co_branch_mapping: Maps co_branch label to (co_id, branch_id)
+        filter_key: Session state key prefix
+        selected_company_id: Source company ID
+        selected_branch_id: Source branch ID
+    """
+    gate_entry = row["Jute Gate Entry No"]
+    party = row["Party Name"] or "Unknown"
+    quality = row["Item Quality"] or "-"
+    total_weight = sum(float(li.get("weight") or 0) for li in line_items) if line_items else float(row["Weight (KG)"] or 0)
+
+    st.markdown("---")
+    st.subheader(f"Transfer Chain — Gate Entry #{gate_entry}")
+    st.caption(f"**{party}** | Quality: {quality} | Weight: {total_weight:,.0f} KG | Items: {len(line_items)}")
+
+    # Check DB for existing saved chain steps
+    chain_df = get_transfer_chain(mr_id)
+    saved_chain = []
+    if chain_df is not None and not chain_df.empty:
+        chain_mrs = chain_df.to_dict("records")
+        saved_chain = _reconstruct_chain(chain_mrs, selected_company_id or 0)
+
+    # Determine how many steps are already saved vs editable
+    num_saved = len(saved_chain)
+    editable_steps = steps[num_saved:] if len(steps) > num_saved else [_empty_transfer_step()]
+
+    # Ensure steps list reflects saved + editable
+    if num_saved > 0 and len(steps) <= num_saved:
+        steps.clear()
+        for sc in saved_chain:
+            saved_step = _empty_transfer_step()
+            label = f"{sc.get('co_prefix', '')}-{sc.get('branch_name', '')}"
+            saved_step["company"] = label
+            saved_step["mr_no"] = sc.get("branch_mr_no")
+            saved_step["mr_date"] = sc.get("jute_mr_date")
+            saved_step["total_amount"] = float(sc.get("total_amount") or 0)
+            saved_step["claim_amount"] = float(sc.get("claim_amount") or 0)
+            saved_step["net_amount"] = float(sc.get("net_total") or 0)
+            saved_step["saved_mr_id"] = sc.get("jute_mr_id")
+            steps.append(saved_step)
+        steps.append(_empty_transfer_step())
+        editable_steps = steps[num_saved:]
+
+    # Source card + step cards
+    total_steps = len(steps)
+    col_count = 1 + total_steps + (1 if total_steps < MAX_TRANSFERS else 0)
+    cols = st.columns(col_count, gap="small")
+
+    changed = False
+
+    # Source card (read-only)
+    with cols[0]:
+        st.markdown("**Source**")
+        st.markdown(f"**{source_co_branch or 'N/A'}**")
+        orig_total = float(row.get("Total Amount") or 0)
+        orig_claim = float(row.get("Claim Amount") or 0)
+        st.metric("Total Amt", f"{orig_total:,.0f}")
+        st.metric("Claim", f"{orig_claim:,.0f}")
+        st.metric("Net", f"{orig_total - orig_claim:,.0f}")
+
+    # Render each step card
+    for i, step in enumerate(steps):
+        is_saved = i < num_saved
+        with cols[1 + i]:
+            step_num = i + 1
+            if is_saved:
+                st.markdown(f"**Step {step_num}** (saved)")
+            else:
+                st.markdown(f"**Step {step_num}**")
+
+            if is_saved:
+                # Read-only display for saved steps
+                st.text_input("Company", value=step.get("company", ""), disabled=True,
+                              key=f"co_{filter_key}_{mr_id}_{i}")
+                st.text_input("MR Date", value=str(step.get("mr_date") or "-"), disabled=True,
+                              key=f"date_{filter_key}_{mr_id}_{i}")
+                mr_no = step.get("mr_no")
+                st.text_input("MR No", value=str(mr_no or "-"), disabled=True,
+                              key=f"mrno_{filter_key}_{mr_id}_{i}")
+                st.metric("Total Amt", f"{step.get('total_amount', 0):,.0f}")
+                st.metric("Claim", f"{step.get('claim_amount', 0):,.0f}")
+                st.metric("Net", f"{step.get('net_amount', 0):,.0f}")
+            else:
+                # Editable step
+                current_co = step.get("company", "")
+                co_index = 0
+                if current_co in co_branch_options:
+                    co_index = co_branch_options.index(current_co)
+
+                new_co = st.selectbox(
+                    "Company",
+                    options=co_branch_options,
+                    index=co_index,
+                    key=f"co_{filter_key}_{mr_id}_{i}",
+                    label_visibility="collapsed",
+                )
+                if new_co != current_co:
+                    step["company"] = new_co
+                    changed = True
+
+                # MR Date
+                current_date = step.get("mr_date")
+                if current_date and isinstance(current_date, (date, datetime)):
+                    default_date = current_date if isinstance(current_date, date) else current_date.date()
+                else:
+                    default_date = date.today()
+                new_date = st.date_input(
+                    "MR Date",
+                    value=default_date,
+                    key=f"date_{filter_key}_{mr_id}_{i}",
+                )
+                if new_date != current_date:
+                    step["mr_date"] = new_date
+                    changed = True
+
+                # Warehouse selector
+                if new_co and new_co in co_branch_mapping:
+                    _, step_branch_id = co_branch_mapping[new_co]
+                    warehouses = get_warehouses_by_branch(step_branch_id)
+                    wh_names = [""] + list(warehouses.keys()) if warehouses else [""]
+                    current_wh_id = step.get("warehouse_id")
+                    current_wh_name = ""
+                    if warehouses:
+                        for wn, wid in warehouses.items():
+                            if wid == current_wh_id:
+                                current_wh_name = wn
+                                break
+                    wh_index = wh_names.index(current_wh_name) if current_wh_name in wh_names else 0
+                    new_wh = st.selectbox(
+                        "Warehouse",
+                        options=wh_names,
+                        index=wh_index,
+                        key=f"wh_{filter_key}_{mr_id}_{i}",
+                    )
+                    if new_wh and warehouses and new_wh in warehouses:
+                        if warehouses[new_wh] != current_wh_id:
+                            step["warehouse_id"] = warehouses[new_wh]
+                            changed = True
+                    if not warehouses:
+                        st.caption("No warehouses found")
+
+                # % Rate Increase (step 2+)
+                if i >= 1:
+                    current_pct = float(step.get("pct_rate_increase", 0) or 0)
+                    new_pct = st.number_input(
+                        "% Rate Increase",
+                        value=current_pct,
+                        min_value=-100.0,
+                        max_value=1000.0,
+                        step=0.1,
+                        format="%.2f",
+                        key=f"pct_{filter_key}_{mr_id}_{i}",
+                    )
+                    if new_pct != current_pct:
+                        step["pct_rate_increase"] = new_pct
+                        changed = True
+
+                # Calculated fields (read-only display)
+                if step.get("company"):
+                    st.metric("Total Amt", f"{step.get('total_amount', 0):,.0f}")
+                    st.metric("Claim", f"{step.get('claim_amount', 0):,.0f}")
+                    st.metric("Net", f"{step.get('net_amount', 0):,.0f}")
+                    if step.get("roundoff"):
+                        st.caption(f"Roundoff: {step['roundoff']:,.2f}")
+
+    # Add Step button
+    if total_steps < MAX_TRANSFERS:
+        with cols[-1]:
+            st.markdown("&nbsp;")
+            if st.button("+ Add Step", key=f"add_{filter_key}_{mr_id}",
+                         use_container_width=True):
+                steps.append(_empty_transfer_step())
+                changed = True
+
+    # Remove last step (only unsaved steps)
+    if len(steps) > num_saved + 1:
+        if st.button("Remove Last Step", key=f"remove_{filter_key}_{mr_id}"):
+            steps.pop()
+            changed = True
+
+    # Action buttons
+    col_actions = st.columns(3)
+
+    # Save Step button — save the first unsaved step that has a company selected
+    unsaved_with_company = [
+        (i, s) for i, s in enumerate(steps)
+        if i >= num_saved and s.get("company")
+    ]
+    if unsaved_with_company:
+        step_idx, step_to_save = unsaved_with_company[0]
+        with col_actions[0]:
+            if st.button(f"Save Step {step_idx + 1}", key=f"save_step_{filter_key}_{mr_id}",
+                         type="primary"):
+                with st.spinner("Saving transfer step..."):
+                    try:
+                        co_label = step_to_save["company"]
+                        if co_label not in co_branch_mapping:
+                            st.error(f"Invalid company: {co_label}")
+                        else:
+                            co_id, branch_id = co_branch_mapping[co_label]
+
+                            # Compute cumulative rate multiplier
+                            cumulative_multiplier = 1.0
+                            for j in range(1, step_idx + 1):
+                                pct = float(steps[j].get("pct_rate_increase", 0) or 0)
+                                cumulative_multiplier *= (1 + pct / 100)
+
+                            # Determine prev company
+                            if step_idx == 0:
+                                prev_co_id = selected_company_id
+                                prev_branch_id = selected_branch_id
+                            else:
+                                prev_label = steps[step_idx - 1].get("company", "")
+                                if prev_label in co_branch_mapping:
+                                    prev_co_id, prev_branch_id = co_branch_mapping[prev_label]
+                                else:
+                                    st.error("Previous step has no valid company.")
+                                    return
+
+                            # Check if this is the final step (returns to source)
+                            is_final = (co_label == source_co_branch)
+
+                            result = save_transfer_step(
+                                source_mr_id=mr_id,
+                                step=TransferStep(
+                                    co_id=co_id,
+                                    branch_id=branch_id,
+                                    mr_date=step_to_save.get("mr_date") or date.today(),
+                                    mr_rate=float(step_to_save.get("weighted_avg_rate", 0) or 0),
+                                    total_amount=float(step_to_save.get("total_amount", 0)),
+                                    claim_amount=float(step_to_save.get("claim_amount", 0)),
+                                    net_amount=float(step_to_save.get("net_amount", 0)),
+                                    mr_no=0,
+                                    pct_rate_increase=float(step_to_save.get("pct_rate_increase", 0) or 0),
+                                    roundoff=float(step_to_save.get("roundoff", 0) or 0),
+                                    warehouse_id=step_to_save.get("warehouse_id"),
+                                ),
+                                prev_co_id=prev_co_id,
+                                prev_branch_id=prev_branch_id,
+                                source_co_id=selected_company_id,
+                                source_branch_id=selected_branch_id,
+                                root_mr_id=mr_id,
+                                updated_by=1,
+                                rate_multiplier=cumulative_multiplier,
+                                is_first_step=(step_idx == 0),
+                                is_final=is_final,
+                            )
+
+                            if is_final:
+                                st.success("Chain finalized! Original MR updated.")
+                            else:
+                                st.success(f"Step {step_idx + 1} saved! MR #{result.get('mr_id')} created.")
+
+                            # Clear session state to refresh from DB
+                            for key in [f"transfers_{filter_key}", f"source_df_{filter_key}",
+                                        f"line_items_{filter_key}", f"selected_row_{filter_key}"]:
+                                if key in st.session_state:
+                                    del st.session_state[key]
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")
+
+    # Edit from Step X — delete saved steps from a point onward
+    if num_saved > 0:
+        with col_actions[1]:
+            edit_step = st.number_input(
+                "Edit from step",
+                min_value=1, max_value=num_saved, value=num_saved,
+                key=f"edit_from_{filter_key}_{mr_id}",
+            )
+            if st.button(f"Edit from Step {edit_step}", key=f"do_edit_{filter_key}_{mr_id}"):
+                with st.spinner("Deleting steps and refreshing..."):
+                    try:
+                        # Get the MR ID of the step to edit from
+                        from_mr_id = steps[edit_step - 1].get("saved_mr_id")
+                        if from_mr_id:
+                            delete_chain_from_step(
+                                root_mr_id=mr_id,
+                                from_mr_id=from_mr_id,
+                                source_mr=None,
+                                updated_by=1,
+                            )
+                            st.success(f"Deleted steps from step {edit_step} onward.")
+                            for key in [f"transfers_{filter_key}", f"source_df_{filter_key}",
+                                        f"line_items_{filter_key}", f"selected_row_{filter_key}"]:
+                                if key in st.session_state:
+                                    del st.session_state[key]
+                            st.rerun()
+                        else:
+                            st.error("Could not find saved MR ID for that step.")
+                    except Exception as e:
+                        st.error(f"Edit failed: {e}")
+
+    # Recalculate if anything changed
+    if changed:
+        _recalculate_chain(steps, line_items)
+        st.session_state[f"transfers_{filter_key}"][mr_id] = steps
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Main page
+# ---------------------------------------------------------------------------
+
+def jute_mr_table_page():
+    """Display Jute MR table with compact overview and expandable transfer editor."""
+    st.title("Jute MR Table")
+
+    # Inline help
+    with st.expander("How transfers work"):
+        st.markdown(
+            "**Transfer Flow:** Gate entry at Company A creates a pending MR. "
+            "Company B (first buyer) purchases the jute, then may sell to C, C to D, etc. "
+            "The chain continues until jute returns to Company A, at which point "
+            "the MR is finalized.\n\n"
+            "**Rate Cascading:** Each transfer step can apply a % rate increase on top of "
+            "the previous step's rate.\n\n"
+            "**Claim Amount:** Cascades unchanged through all transfer steps.\n\n"
+            "**To edit transfers:** Select a row in the table below, then use the "
+            "transfer editor panel that appears."
+        )
+
+    try:
+        current_year = datetime.now().year
+        current_month = datetime.now().month
+
+        # Fetch companies for dropdown
+        company_options = get_companies()
+
+        # Filters — row 1: Company + Branch
+        col1, col2 = st.columns(2)
+
+        with col1:
+            selected_company_name = st.selectbox(
+                "Select Company",
+                options=list(company_options.keys()),
+                index=0 if company_options else None,
+            )
+            selected_company_id = (
+                company_options.get(selected_company_name)
+                if selected_company_name
+                else None
+            )
+
+        branch_options = (
+            get_branches_by_company(selected_company_id)
+            if selected_company_id
+            else {}
+        )
+
+        with col2:
+            selected_branch_name = st.selectbox(
+                "Select Branch",
+                options=list(branch_options.keys()),
+                index=0 if branch_options else None,
+            )
+            selected_branch_id = (
+                branch_options.get(selected_branch_name)
+                if selected_branch_name
+                else None
+            )
+
+        # Filters — row 2: Year + Month
+        col3, col4 = st.columns(2)
+
+        with col3:
+            selected_year = st.selectbox(
+                "Select Year",
+                options=list(range(current_year, current_year - 10, -1)),
+                index=0,
+            )
+
+        with col4:
+            selected_month = st.selectbox(
+                "Select Month",
+                options=list(range(1, 13)),
+                format_func=lambda x: MONTH_NAMES[x - 1],
+                index=current_month - 1,
+            )
+
+        # Fetch company-branch options for transfer dropdowns
+        co_branch_options, co_branch_mapping = get_company_branch_options()
+
+        # Determine source company-branch label by IDs
+        source_co_branch = _find_source_co_branch(
+            selected_company_id, selected_branch_id, co_branch_mapping
+        )
+
+        # Session state key based on filters
+        filter_key = f"{selected_company_id}_{selected_branch_id}_{selected_year}_{selected_month}"
+
+        # Fetch MR data (cached in session state per filter)
+        raw_df_key = f"raw_df_{filter_key}"
+        if raw_df_key not in st.session_state:
+            st.session_state[raw_df_key] = get_jute_mr_with_line_items(
+                year=selected_year,
+                month=selected_month,
+                company_id=selected_company_id,
+                branch_id=selected_branch_id,
+            )
+        df = st.session_state[raw_df_key]
+
+        if df is None or df.empty:
+            filter_info = f"{MONTH_NAMES[selected_month - 1]} {selected_year}"
+            if selected_company_name:
+                filter_info = f"{selected_company_name} - {filter_info}"
+            if selected_branch_name:
+                filter_info = f"{selected_branch_name} @ {filter_info}"
+            st.warning(f"No data found for {filter_info}")
+            return
+
+        # Group by MR header
+        grouped_df, line_items_map = _group_by_mr(df)
+
+        # Session keys
+        transfers_key = f"transfers_{filter_key}"
+        source_df_key = f"source_df_{filter_key}"
+        line_items_key = f"line_items_{filter_key}"
+
+        if transfers_key not in st.session_state:
+            # Initialize transfer state keyed by jute_mr_id
+            transfers = {}
+            for _, row in grouped_df.iterrows():
+                mid = int(row["jute_mr_id"])
+                step0 = _empty_transfer_step()
+                step0["mr_date"] = row["MR DATE"]
+                transfers[mid] = [step0]
+            st.session_state[transfers_key] = transfers
+            st.session_state[source_df_key] = grouped_df.copy()
+            st.session_state[line_items_key] = line_items_map
+
+        source_df = st.session_state[source_df_key]
+        transfers = st.session_state[transfers_key]
+        line_items_map = st.session_state[line_items_key]
+
+        # Build summary columns — check DB for existing chains
+        chain_summaries = []
+        chain_statuses = []
+        for _, srow in source_df.iterrows():
+            mid = int(srow["jute_mr_id"])
+            chain_df = get_transfer_chain(mid)
+            if chain_df is not None and not chain_df.empty:
+                chain_cos = chain_df["co_prefix"].tolist()
+                chain_summaries.append(" -> ".join(chain_cos))
+                has_mr_no = srow.get("EJM MR No.") is not None
+                chain_statuses.append("Complete" if has_mr_no else f"{len(chain_cos)} step(s)")
+            else:
+                steps = transfers.get(mid, [])
+                chain_summaries.append(_build_chain_summary(steps))
+                chain_statuses.append(_get_chain_status(steps, source_co_branch))
+
+        # Create display dataframe with summary columns
+        display_df = source_df.copy()
+        display_df["Transfer Chain"] = chain_summaries
+        display_df["Chain Status"] = chain_statuses
+
+        # Show only compact columns (filter to those that exist)
+        visible_cols = [c for c in COMPACT_COLUMNS if c in display_df.columns]
+        compact_df = display_df[visible_cols]
+
+        # Header info
+        filter_info = f"{MONTH_NAMES[selected_month - 1]} {selected_year}"
+        if selected_company_name:
+            filter_info = f"{selected_company_name} - {filter_info}"
+        if selected_branch_name:
+            filter_info = f"{selected_branch_name} @ {filter_info}"
+        st.success(f"Loaded {len(compact_df)} records for {filter_info}")
+
+        st.markdown("---")
+        st.subheader("Monthly MR Overview")
+        st.caption("Select a row to edit its transfer chain below.")
+
+        # Interactive dataframe with row selection
+        event = st.dataframe(
+            compact_df,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            height=min(400, 50 + len(compact_df) * 35),
+            column_config={
+                "Weight (KG)": st.column_config.NumberColumn(format="%.2f"),
+                "MR Rate": st.column_config.NumberColumn(format="%.2f"),
+                "Total Amount": st.column_config.NumberColumn(format="%.2f"),
+                "Claim Amount": st.column_config.NumberColumn(format="%.2f"),
+                "Net Total": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+
+        # Transfer editor panel for selected row
+        selected_rows = event.selection.rows
+        selected_row_key = f"selected_row_{filter_key}"
+
+        if selected_rows:
+            st.session_state[selected_row_key] = selected_rows[0]
+            row_idx = selected_rows[0]
+        elif selected_row_key in st.session_state:
+            row_idx = st.session_state[selected_row_key]
+        else:
+            row_idx = None
+
+        if row_idx is not None and row_idx < len(source_df):
+            row = source_df.iloc[row_idx]
+            mid = int(row["jute_mr_id"])
+            steps = transfers.get(mid, [_empty_transfer_step()])
+            li_data = line_items_map.get(mid, [])
+
+            _render_transfer_editor(
+                mr_id=mid,
+                row=row,
+                steps=steps,
+                line_items=li_data,
+                co_branch_options=co_branch_options,
+                source_co_branch=source_co_branch,
+                co_branch_mapping=co_branch_mapping,
+                filter_key=filter_key,
+                selected_company_id=selected_company_id,
+                selected_branch_id=selected_branch_id,
+            )
+
+        # Reset button
+        st.markdown("---")
+        if st.button("Reset All Transfers", use_container_width=True):
+            for key in [transfers_key, source_df_key, line_items_key, selected_row_key]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
+
+    except Exception as e:
+        st.error(f"Error loading Jute MR table: {str(e)}")
+        st.info("Make sure the database is configured and the jute_mr table exists.")
