@@ -43,7 +43,7 @@ def get_companies() -> dict:
     """Return {company_name: company_id} from cached data."""
     df = load_companies()
     if df is not None and not df.empty:
-        return {name: int(cid) for name, cid in zip(df['co_name'], df['co_id'])}
+        return dict(zip(df['co_name'], df['co_id']))
     return {}
 
 
@@ -52,8 +52,8 @@ def get_branches_by_company(company_id: int) -> dict:
     df = load_branches()
     if df is None or df.empty:
         return {}
-    filtered = df[df['co_id'] == int(company_id)]
-    return {name: int(bid) for name, bid in zip(filtered['branch_name'], filtered['branch_id'])}
+    filtered = df[df['co_id'] == company_id]
+    return dict(zip(filtered['branch_name'], filtered['branch_id']))
 
 
 def get_company_branch_options() -> Tuple[list, dict]:

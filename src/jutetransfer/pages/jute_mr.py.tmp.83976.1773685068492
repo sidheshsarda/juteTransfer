@@ -67,8 +67,8 @@ def _group_by_mr(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         # Aggregated row
         first = group.iloc[0].to_dict()
         total_weight = sum(li["weight"] for li in items)
-        total_amount = group["Total Amount"].fillna(0).astype(float).sum()
-        claim_amount = group["Claim Amount"].fillna(0).astype(float).sum()
+        total_amount = sum(float(r.get("Total Amount") or 0) for _, r in group.iterrows())
+        claim_amount = sum(float(r.get("Claim Amount") or 0) for _, r in group.iterrows())
 
         first["Weight (KG)"] = total_weight
         first["Total Amount"] = total_amount
@@ -241,8 +241,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                             source_co_branch: str, co_branch_mapping: dict,
                             filter_key: str,
                             selected_company_id: int = None,
-                            selected_branch_id: int = None,
-                            chains_map: dict = None):
+                            selected_branch_id: int = None):
     """Render the transfer editor panel for a selected MR.
 
     Args:
@@ -266,8 +265,8 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
     st.subheader(f"Transfer Chain — Gate Entry #{gate_entry}")
     st.caption(f"**{party}** | Quality: {quality} | Weight: {total_weight:,.0f} KG | Items: {len(line_items)}")
 
-    # Check for existing saved chain steps (from cached batch data)
-    chain_df = chains_map.get(mr_id) if chains_map else get_transfer_chain(mr_id)
+    # Check DB for existing saved chain steps
+    chain_df = get_transfer_chain(mr_id)
     saved_chain = []
     if chain_df is not None and not chain_df.empty:
         chain_mrs = chain_df.to_dict("records")
@@ -506,8 +505,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
 
                             # Clear session state to refresh from DB
                             for key in [f"transfers_{filter_key}", f"source_df_{filter_key}",
-                                        f"line_items_{filter_key}", f"selected_row_{filter_key}",
-                                        f"raw_df_{filter_key}", f"chains_map_{filter_key}"]:
+                                        f"line_items_{filter_key}", f"selected_row_{filter_key}"]:
                                 if key in st.session_state:
                                     del st.session_state[key]
                             st.rerun()
@@ -536,8 +534,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                             )
                             st.success(f"Deleted steps from step {edit_step} onward.")
                             for key in [f"transfers_{filter_key}", f"source_df_{filter_key}",
-                                        f"line_items_{filter_key}", f"selected_row_{filter_key}",
-                                        f"raw_df_{filter_key}", f"chains_map_{filter_key}"]:
+                                        f"line_items_{filter_key}", f"selected_row_{filter_key}"]:
                                 if key in st.session_state:
                                     del st.session_state[key]
                             st.rerun()
@@ -663,16 +660,15 @@ def jute_mr_table_page():
             st.warning(f"No data found for {filter_info}")
             return
 
+        # Group by MR header
+        grouped_df, line_items_map = _group_by_mr(df)
+
         # Session keys
         transfers_key = f"transfers_{filter_key}"
         source_df_key = f"source_df_{filter_key}"
         line_items_key = f"line_items_{filter_key}"
-        chains_map_key = f"chains_map_{filter_key}"
 
         if transfers_key not in st.session_state:
-            # Group by MR header (only on first load for this filter)
-            grouped_df, line_items_map = _group_by_mr(df)
-
             # Initialize transfer state keyed by jute_mr_id
             transfers = {}
             for _, row in grouped_df.iterrows():
@@ -688,11 +684,9 @@ def jute_mr_table_page():
         transfers = st.session_state[transfers_key]
         line_items_map = st.session_state[line_items_key]
 
-        # Batch-fetch all chains (cached in session state)
-        if chains_map_key not in st.session_state:
-            all_mr_ids = source_df["jute_mr_id"].astype(int).tolist()
-            st.session_state[chains_map_key] = get_transfer_chains_batch(all_mr_ids)
-        chains_map = st.session_state[chains_map_key]
+        # Build summary columns — batch-fetch all chains in one query
+        all_mr_ids = source_df["jute_mr_id"].astype(int).tolist()
+        chains_map = get_transfer_chains_batch(all_mr_ids)
 
         chain_summaries = []
         chain_statuses = []
@@ -776,26 +770,15 @@ def jute_mr_table_page():
                 filter_key=filter_key,
                 selected_company_id=selected_company_id,
                 selected_branch_id=selected_branch_id,
-                chains_map=chains_map,
             )
 
-        # Reset / Refresh button
+        # Reset button
         st.markdown("---")
-        col_reset, col_refresh = st.columns(2)
-        with col_reset:
-            if st.button("Reset All Transfers", use_container_width=True):
-                for key in [transfers_key, source_df_key, line_items_key,
-                            selected_row_key, raw_df_key, chains_map_key]:
-                    if key in st.session_state:
-                        del st.session_state[key]
-                st.rerun()
-        with col_refresh:
-            if st.button("Refresh Data", use_container_width=True):
-                for key in [transfers_key, source_df_key, line_items_key,
-                            selected_row_key, raw_df_key, chains_map_key]:
-                    if key in st.session_state:
-                        del st.session_state[key]
-                st.rerun()
+        if st.button("Reset All Transfers", use_container_width=True):
+            for key in [transfers_key, source_df_key, line_items_key, selected_row_key]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
 
     except Exception as e:
         st.error(f"Error loading Jute MR table: {str(e)}")
