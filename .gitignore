@@ -43,3 +43,9 @@ Thumbs.db
 
 # uv
 uv.lock
+
+# Editor temporary files
+*.tmp.*
+
+# MCP
+.playwright-mcp/

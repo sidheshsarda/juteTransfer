@@ -42,6 +42,30 @@ class TransferStep:
 # Party lookup / creation helpers
 # ---------------------------------------------------------------------------
 
+def _generate_supp_code(conn, co_id: int, prefix: str = "J") -> str:
+    """Generate the next sequential supp_code for a company.
+
+    Finds the highest existing code matching ``<prefix><digits>`` in the
+    company and returns the next one, e.g. J001 → J002.  Falls back to
+    <prefix>001 if none exist yet.
+    """
+    result = conn.execute(
+        text("""
+            SELECT supp_code FROM party_mst
+            WHERE co_id = :co_id
+              AND supp_code REGEXP :pattern
+            ORDER BY CAST(SUBSTRING(supp_code, :offset) AS UNSIGNED) DESC
+            LIMIT 1
+        """),
+        {"co_id": co_id, "pattern": f"^{prefix}[0-9]+$", "offset": len(prefix) + 1},
+    ).fetchone()
+
+    if result and result[0]:
+        last_num = int(result[0][len(prefix):])
+        return f"{prefix}{last_num + 1:03d}"
+    return f"{prefix}001"
+
+
 def _find_party_by_supp_name(conn, supp_name: str, co_id: int) -> Optional[int]:
     """Find an existing party by supplier name in a given company.
 
@@ -169,13 +193,14 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
         return existing, branch_id
 
     # Create party from company master
+    supp_code = _generate_supp_code(conn, in_co_id)
     new_party_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO party_mst (supp_name, prefix, active, co_id,
             supp_email_id, party_pan_no, cin, country_id,
-            updated_by, updated_date_time)
+            supp_code, updated_by, updated_date_time)
         VALUES (:name, :prefix, 1, :co_id,
             :email, :pan, :cin, :country_id,
-            :updated_by, NOW())
+            :supp_code, :updated_by, NOW())
     """, {
         "name": co["co_name"],
         "prefix": co.get("co_prefix"),
@@ -184,6 +209,7 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
         "pan": co.get("co_pan_no"),
         "cin": co.get("co_cin_no"),
         "country_id": co.get("country_id"),
+        "supp_code": supp_code,
         "updated_by": updated_by,
     })
 
@@ -670,10 +696,10 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         conn.execute(text("""
             INSERT INTO sales_invoice_dtl (
                 invoice_id, item_id, hsn_code, quantity, sales_weight,
-                rate, amount_without_tax, total_amount
+                uom_id, rate, amount_without_tax, total_amount
             ) VALUES (
                 :invoice_id, :item_id, :hsn_code, :quantity, :weight,
-                :rate, :amount, :amount
+                :uom_id, :rate, :amount, :amount
             )
         """), {
             "invoice_id": invoice_id,
@@ -681,6 +707,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
             "hsn_code": None,
             "quantity": li.get("actual_qty"),
             "weight": accepted_weight,
+            "uom_id": li.get("uom_id"),
             "rate": new_rate,
             "amount": amount,
         })

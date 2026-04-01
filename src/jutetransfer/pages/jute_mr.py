@@ -169,12 +169,13 @@ def _get_chain_status(steps: list, source_co_branch: str) -> str:
     return f"{len(companies)} step(s)"
 
 
-def _recalculate_chain(steps: list, line_items: list) -> list:
+def _recalculate_chain(steps: list, line_items: list, original_total_amount: float = 0.0) -> list:
     """Recalculate all derived values in a transfer chain.
 
     Args:
         steps: List of transfer step dicts (mutated in place and returned).
         line_items: List of {weight, original_rate, original_claim} per line item.
+        original_total_amount: The original MR total amount (used for Step 1 to avoid rounding drift).
 
     Returns:
         The steps list with computed aggregates filled in.
@@ -197,6 +198,15 @@ def _recalculate_chain(steps: list, line_items: list) -> list:
 
         if i == 0:
             rates_i = list(prev_rates)
+            # For Step 1 with no % increase, use the original amount to avoid rounding drift
+            if original_total_amount > 0:
+                step["total_amount"] = round(original_total_amount, 0)
+                step["roundoff"] = 0.0
+                step["claim_amount"] = round(sum(claims), 0)
+                step["net_amount"] = step["total_amount"] - step["claim_amount"]
+                step["weighted_avg_rate"] = (step["total_amount"] / total_weight * 100) if total_weight > 0 else 0.0
+                prev_rates = rates_i
+                continue
         else:
             pct = float(step.get("pct_rate_increase", 0) or 0)
             rates_i = [r * (1 + pct / 100) for r in prev_rates]
@@ -307,7 +317,8 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
         st.markdown(f"**{source_co_branch or 'N/A'}**")
         orig_total = float(row.get("Total Amount") or 0)
         orig_claim = float(row.get("Claim Amount") or 0)
-        st.metric("Total Amt", f"{orig_total:,.0f}")
+        st.metric("Gate Entry Value", f"{orig_total:,.0f}")
+        st.caption("📦 Initial recorded value when jute entered system")
         st.metric("Claim", f"{orig_claim:,.0f}")
         st.metric("Net", f"{orig_total - orig_claim:,.0f}")
 
@@ -330,7 +341,28 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                 mr_no = step.get("mr_no")
                 st.text_input("MR No", value=str(mr_no or "-"), disabled=True,
                               key=f"mrno_{filter_key}_{mr_id}_{i}")
-                st.metric("Total Amt", f"{step.get('total_amount', 0):,.0f}")
+
+                step_amount = float(step.get('total_amount', 0))
+                st.metric("💰 Purchase Price", f"{step_amount:,.0f}")
+
+                if i == 0:
+                    st.caption("Baseline price (Step 1)")
+                else:
+                    # Subsequent steps - compare to previous company's selling price
+                    prev_amount = float(steps[i-1].get('total_amount', 0))
+                    prev_company = steps[i-1].get("company", "Previous")
+
+                    pct_change = 0.0
+                    if prev_amount > 0:
+                        pct_change = ((step_amount - prev_amount) / prev_amount) * 100
+
+                    if pct_change > 0:
+                        st.caption(f"📈 {pct_change:+.2f}% markup from {prev_company}")
+                    elif pct_change < 0:
+                        st.caption(f"📉 {pct_change:.2f}% discount from {prev_company}")
+                    else:
+                        st.caption(f"= Same as {prev_company}")
+
                 st.metric("Claim", f"{step.get('claim_amount', 0):,.0f}")
                 st.metric("Net", f"{step.get('net_amount', 0):,.0f}")
             else:
@@ -404,13 +436,34 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                         format="%.2f",
                         key=f"pct_{filter_key}_{mr_id}_{i}",
                     )
+                    st.caption("💡 Markup/discount applied to previous step's rate")
                     if new_pct != current_pct:
                         step["pct_rate_increase"] = new_pct
                         changed = True
 
                 # Calculated fields (read-only display)
                 if step.get("company"):
-                    st.metric("Total Amt", f"{step.get('total_amount', 0):,.0f}")
+                    step_amount = float(step.get('total_amount', 0))
+                    st.metric("💰 Purchase Price", f"{step_amount:,.0f}")
+
+                    if i == 0:
+                        st.caption("Baseline price (Step 1)")
+                    else:
+                        # Subsequent steps - compare to previous company's selling price
+                        prev_amount = float(steps[i-1].get('total_amount', 0))
+                        prev_company = steps[i-1].get("company", "Previous")
+
+                        pct_change = 0.0
+                        if prev_amount > 0:
+                            pct_change = ((step_amount - prev_amount) / prev_amount) * 100
+
+                        if pct_change > 0:
+                            st.caption(f"📈 {pct_change:+.2f}% markup from {prev_company}")
+                        elif pct_change < 0:
+                            st.caption(f"📉 {pct_change:.2f}% discount from {prev_company}")
+                        else:
+                            st.caption(f"= Same as {prev_company}")
+
                     st.metric("Claim", f"{step.get('claim_amount', 0):,.0f}")
                     st.metric("Net", f"{step.get('net_amount', 0):,.0f}")
                     if step.get("roundoff"):
@@ -548,7 +601,8 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
 
     # Recalculate if anything changed (no explicit rerun — Streamlit reruns naturally)
     if changed:
-        _recalculate_chain(steps, line_items)
+        orig_total = float(row.get("Total Amount") or 0)
+        _recalculate_chain(steps, line_items, orig_total)
         st.session_state[f"transfers_{filter_key}"][mr_id] = steps
 
 
