@@ -18,10 +18,16 @@ from ..jute_mr_chain_helpers import (
     _group_by_mr,
     _reconstruct_chain,
     _recalculate_chain,
-    _calculate_step_total_amount,
     _empty_transfer_step,
 )
 from ..transfer import save_transfer_step, TransferStep
+
+# Known Limitations:
+# 1. pct_rate_increase is back-calculated from rounded totals (rounding errors possible)
+#    Fix: Add pct_rate_increase DECIMAL(10,4) column to jute_mr table
+# 2. Each step saves individually (no bulk save)
+# 3. Saved steps are read-only (no unlock/edit feature)
+# 4. Line items are non-editable (by design: transfers preserve original items)
 
 # Constants
 COMPACT_COLUMNS = ["Jute Gate Entry No", "Jute Supplier", "Total Amount", "Claim Amount", "Net Total"]
@@ -354,6 +360,7 @@ def _render_chain_editor(filter_key):
         )
 
 
+# TODO: Extract to jute_mr_page_helpers.py (shared with jute_mr.py)
 def _render_step_card(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key):
     """
     Render individual step card with company/date/% inputs, metrics, line items, and action buttons.
@@ -476,6 +483,7 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
         st.divider()
 
 
+# TODO: Extract to jute_mr_page_helpers.py (shared with jute_mr.py)
 def _render_step_line_items(step_index, line_items, all_steps):
     """Render line items table showing original items with calculated amounts for this step.
 
