@@ -1,7 +1,6 @@
 """Database queries for JuteTransfer application."""
 
 import pandas as pd
-import streamlit as st
 from typing import Optional, Tuple
 from datetime import datetime
 from .database import DatabaseConnection
@@ -11,25 +10,22 @@ from .database import DatabaseConnection
 # Cached master data loaders — hit DB once, reuse in-memory
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300)
 def load_companies() -> pd.DataFrame:
-    """Load all companies (cached 5 min)."""
+    """Load all companies (no cache - always fresh from database)."""
     return DatabaseConnection.execute_query(
         "SELECT co_id, co_name, co_prefix FROM co_mst ORDER BY co_name"
     )
 
 
-@st.cache_data(ttl=300)
 def load_branches() -> pd.DataFrame:
-    """Load all branches (cached 5 min)."""
+    """Load all branches (no cache - always fresh from database)."""
     return DatabaseConnection.execute_query(
         "SELECT branch_id, branch_name, co_id FROM branch_mst ORDER BY branch_name"
     )
 
 
-@st.cache_data(ttl=300)
 def load_warehouses() -> pd.DataFrame:
-    """Load all warehouses (cached 5 min)."""
+    """Load all warehouses (no cache - always fresh from database)."""
     return DatabaseConnection.execute_query(
         "SELECT warehouse_id, warehouse_name, branch_id FROM warehouse_mst ORDER BY warehouse_name"
     )

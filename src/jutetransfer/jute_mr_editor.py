@@ -8,6 +8,7 @@ from .jute_mr_chain_helpers import (
     _recalculate_chain,
     _reconstruct_chain,
     _empty_transfer_step,
+    _calculate_step_total_amount,
 )
 from .transfer import (
     save_transfer_step,
@@ -31,7 +32,8 @@ def _render_step_calculation_chart(
     line_items: list,
     step_dict: dict,
     original_total_amount: float,
-    prev_step_rate: float = None
+    prev_step_rate: float = None,
+    steps: list = None
 ) -> None:
     """Render calculation breakdown chart for an unsaved transfer step.
 
@@ -40,10 +42,11 @@ def _render_step_calculation_chart(
 
     Args:
         step_index: Current step number (0-indexed)
-        line_items: List of dicts with 'weight', 'original_rate', 'original_claim' keys
+        line_items: List of dicts with 'weight', 'original_rate', 'original_claim', 'item_quality' keys
         step_dict: Current step's data dict
         original_total_amount: Step 0's total amount (reference)
-        prev_step_rate: Previous step's weighted average rate (for Step 2+ rate calculations)
+        prev_step_rate: Previous step's weighted average rate (unused, for backward compatibility)
+        steps: List of all step dicts for calculating cumulative rate changes
     """
     # Guard: only render for unsaved steps
     if step_dict.get("saved_mr_id"):
@@ -65,15 +68,16 @@ def _render_step_calculation_chart(
         total_qty = 0.0
         total_amount = 0.0
 
-        for idx, line_item in enumerate(line_items, start=1):
+        for line_item in line_items:
             qty = float(line_item.get("weight", 0) or 0)
             rate = round(float(line_item.get("original_rate", 0) or 0), 2)
-            amount = round(qty * rate, 2)
+            amount = round(qty * rate / 100, 2)
 
+            item_name = line_item.get("item_quality", "Item")
             data.append({
-                "Line Item": idx,
+                "Item": item_name,
                 "Qty (KG)": round(qty, 2),
-                "Rate (per quintal)": round(rate, 2),
+                "Rate (per quintal)": rate,
                 "Amount": amount,
             })
 
@@ -82,7 +86,7 @@ def _render_step_calculation_chart(
 
         # Add totals row
         data.append({
-            "Line Item": "TOTAL",
+            "Item": "TOTAL",
             "Qty (KG)": round(total_qty, 2),
             "Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "Amount": round(total_amount, 2),
@@ -93,24 +97,39 @@ def _render_step_calculation_chart(
         df = pd.DataFrame(data)
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        # Step 2+: Apply % increase to previous step's rate
+        # Step 2+: Apply % increase to each item's previous rate
         pct_increase = float(step_dict.get("pct_rate_increase", 0) or 0)
-        prev_rate_per_kg = float(prev_step_rate or 0)
+
+        # Calculate cumulative rate multiplier from previous steps
+        # If this is step 2+, multiply by all % increases from step 2 to step_index-1
+        cumulative_multiplier = 1.0
+        if step_index > 1:
+            # Apply cumulative rate changes from steps 1 through step_index-1
+            # Note: step 1 has no rate increase (pct=0), so we start from step 2
+            for step_i in range(1, step_index):
+                step_pct = float(steps[step_i].get("pct_rate_increase", 0) or 0) if steps and step_i < len(steps) else 0.0
+                cumulative_multiplier *= (1.0 + step_pct / 100.0)
 
         data = []
         total_qty = 0.0
         total_amount = 0.0
 
-        for idx, line_item in enumerate(line_items, start=1):
+        for line_item in line_items:
             qty = float(line_item.get("weight", 0) or 0)
+            original_rate = float(line_item.get("original_rate", 0) or 0)
 
-            # Calculate new rate with % increase applied
-            new_rate = round(prev_rate_per_kg * (1.0 + pct_increase / 100.0), 2)
-            amount = round(qty * new_rate, 2)
+            # Old rate: original rate with cumulative multiplier applied (from previous steps)
+            old_rate = round(original_rate * cumulative_multiplier, 2)
+            # New rate: old rate with current step's % increase applied
+            new_rate = round(old_rate * (1.0 + pct_increase / 100.0), 2)
+            # Amount: qty * new_rate / 100 (convert from per quintal to per kg)
+            amount = round(qty * new_rate / 100, 2)
 
+            item_name = line_item.get("item_quality", "Item")
             data.append({
-                "Line Item": idx,
+                "Item": item_name,
                 "Qty (KG)": round(qty, 2),
+                "Old Rate (per quintal)": old_rate,
                 "% Increase": f"{pct_increase:.2f}%",
                 "New Rate (per quintal)": new_rate,
                 "Amount": amount,
@@ -121,8 +140,9 @@ def _render_step_calculation_chart(
 
         # Add totals row
         data.append({
-            "Line Item": "TOTAL",
+            "Item": "TOTAL",
             "Qty (KG)": round(total_qty, 2),
+            "Old Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "% Increase": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "New Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "Amount": round(total_amount, 2),
@@ -375,6 +395,12 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                             if new_pct != current_pct:
                                 step["pct_rate_increase"] = new_pct
                                 changed = True
+                                # IMMEDIATELY recalculate totals so metrics display correct values
+                                try:
+                                    orig_total = float(row.get("Total Amount", 0))
+                                except (ValueError, TypeError):
+                                    orig_total = 0.0
+                                _recalculate_chain(steps, line_items, orig_total)
                         except ValueError:
                             st.error(f"Invalid percentage in Step {i + 1}")
                             st.session_state[pct_submitted_key] = False
@@ -441,6 +467,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                 step_dict=step,
                 original_total_amount=original_amount,
                 prev_step_rate=prev_step_rate,
+                steps=steps,
             )
             break  # Only show chart for the first unsaved step with company
 
@@ -508,7 +535,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                         if validation_errors:
                             st.error("Cannot save: " + "; ".join(validation_errors))
                         else:
-                            # Recalculate totals with validated pct values
+                            # Recalculate totals with validated pct values using the shared calculation function
                             _recalculate_chain(steps, line_items, orig_total)
                             st.session_state[f"transfers_{filter_key}"][mr_id] = steps
 
@@ -518,9 +545,23 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                             else:
                                 co_id, branch_id = co_branch_mapping[co_label]
 
-                                # Fix 2: Derive cumulative_multiplier from total ratio (consistent with displayed total)
+                                # Use _calculate_step_total_amount to ensure the saved amount matches the chart
+                                # This guarantees consistency between display and database
+                                calculated_total = _calculate_step_total_amount(
+                                    step_index=step_idx,
+                                    line_items=line_items,
+                                    step_dict=step_to_save,
+                                    steps=steps,
+                                    original_total_amount=orig_total
+                                )
+
+                                # Update step_to_save with the calculated amount to ensure consistency
+                                step_to_save["total_amount"] = round(calculated_total, 0)
+                                step_to_save["net_amount"] = round(calculated_total - float(step_to_save.get("claim_amount", 0)), 0)
+
+                                # Derive cumulative_multiplier from the calculated total (same as chart)
                                 if orig_total > 0:
-                                    cumulative_multiplier = float(step_to_save.get("total_amount", orig_total)) / orig_total
+                                    cumulative_multiplier = calculated_total / orig_total
                                 else:
                                     cumulative_multiplier = 1.0
 

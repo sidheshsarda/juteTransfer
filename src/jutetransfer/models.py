@@ -101,7 +101,7 @@ class JuteMR(Base):
     updated_date_time = Column(DateTime)
     po_id = Column(Integer)
     branch_id = Column(Integer)
-    party_id = Column(String(255))
+    party_id = Column(Integer)
     party_branch_id = Column(Integer)
     jute_supplier_id = Column(Integer)
     src_com_id = Column(Integer)
@@ -335,7 +335,7 @@ class SalesInvoice(Base):
 class SalesInvoiceDetail(Base):
     """Sales Invoice detail/line items table (sales_invoice_dtl)."""
     __tablename__ = 'sales_invoice_dtl'
-    
+
     invoice_line_item_id = Column(BigInteger, primary_key=True, autoincrement=True)
     invoice_id = Column(BigInteger, ForeignKey('sales_invoice.invoice_id'))
     item_id = Column(Integer)
@@ -347,6 +347,7 @@ class SalesInvoiceDetail(Base):
     rate = Column(Float)
     amount_without_tax = Column(Float)
     total_amount = Column(Float)
+    remarks = Column(String(255))
 
 
 class SalesInvoiceJute(Base):

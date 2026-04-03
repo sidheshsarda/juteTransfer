@@ -7,6 +7,7 @@ sales invoice generation, and updating the original MR.
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 import logging
 
@@ -79,6 +80,40 @@ def _find_party_by_supp_name(conn, supp_name: str, co_id: int) -> Optional[int]:
     return row[0] if row else None
 
 
+def _ensure_party_types(conn, party_id: int, updated_by: int) -> None:
+    """Ensure a party includes party_type_ids '2,3' (customer and jute supplier).
+
+    Additively adds 2 and 3 to existing party types without removing others.
+    """
+    required_ids = {2, 3}
+
+    result = conn.execute(
+        text("SELECT party_type_id FROM party_mst WHERE party_id = :pid"),
+        {"pid": party_id},
+    )
+    row = result.fetchone()
+    existing_types_str = row[0] if row and row[0] else ""
+
+    # Parse existing IDs
+    existing_ids = set()
+    if existing_types_str:
+        try:
+            existing_ids = set(int(x.strip()) for x in existing_types_str.split(",") if x.strip())
+        except (ValueError, AttributeError):
+            existing_ids = set()
+
+    # Combine existing and required IDs
+    combined_ids = existing_ids | required_ids
+    combined_str = ",".join(str(x) for x in sorted(combined_ids))
+
+    # Only update if changed
+    if combined_str != existing_types_str:
+        conn.execute(
+            text("UPDATE party_mst SET party_type_id = :types, updated_by = :updated_by, updated_date_time = NOW() WHERE party_id = :pid"),
+            {"pid": party_id, "types": combined_str, "updated_by": updated_by},
+        )
+
+
 def _get_party_branch_id(conn, party_id: int) -> Optional[int]:
     """Get the first party_branch for a given party_id."""
     result = conn.execute(
@@ -109,6 +144,7 @@ def _create_party_from_source(conn, source_party_id: int, source_co_id: int,
     party_dict = party_row._mapping
 
     # Insert new party for target company
+    # Hard code party_type_id to "2,3" (customer and jute supplier)
     new_party_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO party_mst (supp_name, prefix, active, co_id, supp_code,
             supp_contact_person, supp_contact_designation, supp_email_id,
@@ -131,7 +167,7 @@ def _create_party_from_source(conn, source_party_id: int, source_co_id: int,
         "cin": party_dict.get("cin"),
         "entity_type_id": party_dict.get("entity_type_id"),
         "country_id": party_dict.get("country_id"),
-        "party_type_id": party_dict.get("party_type_id"),
+        "party_type_id": "2,3",  # Customer (2) and Jute Supplier (3)
         "msme": party_dict.get("msme_certified"),
         "updated_by": updated_by,
     })
@@ -189,6 +225,8 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
     # Check if already exists as party
     existing = _find_party_by_supp_name(conn, co["co_name"], in_co_id)
     if existing:
+        # Ensure existing party has correct party types
+        _ensure_party_types(conn, existing, updated_by)
         branch_id = _get_party_branch_id(conn, existing)
         return existing, branch_id
 
@@ -197,10 +235,10 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
     new_party_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO party_mst (supp_name, prefix, active, co_id,
             supp_email_id, party_pan_no, cin, country_id,
-            supp_code, updated_by, updated_date_time)
+            supp_code, party_type_id, updated_by, updated_date_time)
         VALUES (:name, :prefix, 1, :co_id,
             :email, :pan, :cin, :country_id,
-            :supp_code, :updated_by, NOW())
+            :supp_code, :party_type_id, :updated_by, NOW())
     """, {
         "name": co["co_name"],
         "prefix": co.get("co_prefix"),
@@ -210,6 +248,7 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
         "cin": co.get("co_cin_no"),
         "country_id": co.get("country_id"),
         "supp_code": supp_code,
+        "party_type_id": "2,3",  # Customer (2) and Jute Supplier (3)
         "updated_by": updated_by,
     })
 
@@ -288,6 +327,8 @@ def _ensure_supplier_party(conn, source_mr: dict, target_co_id: int,
     # Check if party already exists in target company
     existing = _find_party_by_supp_name(conn, supp_name, target_co_id)
     if existing:
+        # Ensure existing party has correct party types
+        _ensure_party_types(conn, existing, updated_by)
         branch_id = _get_party_branch_id(conn, existing)
         _ensure_supplier_party_map(conn, jute_supplier_id, target_co_id, existing, updated_by)
         return existing, branch_id
@@ -485,6 +526,9 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
 
     Returns the new jute_mr_id.
     """
+    # Ensure the party has correct party types before creating MR
+    _ensure_party_types(conn, party_id, updated_by)
+
     new_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO jute_mr (
             jute_gate_entry_no, branch_mr_no, jute_gate_entry_date,
@@ -539,7 +583,7 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
         "updated_by": updated_by,
         "po_id": None,  # PO is company-specific
         "branch_id": step.branch_id,
-        "party_id": str(party_id),
+        "party_id": party_id,
         "party_branch_id": party_branch_id,
         "jute_supplier_id": source_mr.get("jute_supplier_id"),
         "src_com_id": prev_co_id,  # received-from company
@@ -556,7 +600,11 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
         accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
         original_rate = float(li.get("rate") or 0)
         new_rate = original_rate * rate_multiplier
-        total_price = round(accepted_weight * new_rate / 100, 2)
+        # Use Decimal for precise calculation to avoid floating-point rounding errors
+        total_price = float(
+            (Decimal(str(accepted_weight)) * Decimal(str(new_rate)) / Decimal('100'))
+            .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        )
 
         # Map items to target company
         target_actual_item_id = li.get("actual_item_id")
@@ -657,6 +705,43 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
     """
     invoice_no = _get_next_invoice_no(conn, seller_step.branch_id)
 
+    # Calculate invoice amounts with precise decimal arithmetic
+    line_amounts = []
+    line_rates_in_kg = []  # Store rates in kg for invoice storage
+    line_weights = []  # Store weights for invoice storage
+    unrounded_sum = Decimal('0')  # Track unrounded total for accurate round_off calculation
+
+    for li in source_mr.get("line_items", []):
+        accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
+        line_weights.append(accepted_weight)
+
+        original_rate = float(li.get("rate") or 0)
+        new_rate = original_rate * rate_multiplier
+
+        # Convert rate from quintals (per 100 kg) to kg (per 1 kg)
+        rate_in_kg = float(
+            (Decimal(str(new_rate)) / Decimal('100'))
+            .quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+        )
+        line_rates_in_kg.append(rate_in_kg)
+
+        # Use Decimal for precise calculation to avoid floating-point rounding errors
+        # Amount = accepted_weight (kg) * rate_in_kg (per kg)
+        unrounded_amount = Decimal(str(accepted_weight)) * Decimal(str(rate_in_kg))
+        unrounded_sum += unrounded_amount
+
+        amount = float(
+            unrounded_amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        )
+        line_amounts.append(amount)
+
+    # Calculate round_off as the difference between unrounded sum and rounded total
+    rounded_total = unrounded_sum.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    round_off = float(unrounded_sum - rounded_total)
+
+    # Invoice amount includes the round_off adjustment to match line item totals
+    invoice_amount = float(rounded_total)
+
     invoice_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO sales_invoice (
             invoice_no, invoice_date, invoice_type, invoice_amount,
@@ -665,26 +750,26 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         ) VALUES (
             :invoice_no, :invoice_date, :invoice_type, :invoice_amount,
             :party_id, :billing_to_id, :shipping_to_id, :branch_id,
-            1, 3, 0, :updated_by, NOW()
+            1, 3, :round_off, :updated_by, NOW()
         )
     """, {
         "invoice_no": invoice_no,
         "invoice_date": seller_step.mr_date,
         "invoice_type": RAW_JUTE_INVOICE_TYPE,
-        "invoice_amount": seller_step.total_amount,
+        "invoice_amount": invoice_amount,
         "party_id": buyer_party_id,
         "billing_to_id": buyer_party_branch_id,
         "shipping_to_id": buyer_party_branch_id,
         "branch_id": seller_step.branch_id,
+        "round_off": round_off,
         "updated_by": updated_by,
     })
 
     # Line items from source MR with per-item rates
-    for li in source_mr.get("line_items", []):
-        accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
-        original_rate = float(li.get("rate") or 0)
-        new_rate = original_rate * rate_multiplier
-        amount = round(accepted_weight * new_rate / 100, 2)
+    for idx, li in enumerate(source_mr.get("line_items", [])):
+        amount = line_amounts[idx]
+        rate_in_kg = line_rates_in_kg[idx]
+        accepted_weight = line_weights[idx]
 
         # Map item to seller's company
         target_item_id = li.get("actual_item_id")
@@ -693,23 +778,29 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
                 conn, int(target_item_id), seller_step.co_id, updated_by
             )
 
+        # Construct line item remarks: "Raw Jute - {qty} {unit_conversion}"
+        actual_qty = li.get("actual_qty") or ""
+        unit_conv = li.get("unit_conversion") or ""
+        remarks = f"Raw Jute - {actual_qty} {unit_conv}".strip()
+
         conn.execute(text("""
             INSERT INTO sales_invoice_dtl (
                 invoice_id, item_id, hsn_code, quantity, sales_weight,
-                uom_id, rate, amount_without_tax, total_amount
+                uom_id, rate, amount_without_tax, total_amount, remarks
             ) VALUES (
                 :invoice_id, :item_id, :hsn_code, :quantity, :weight,
-                :uom_id, :rate, :amount, :amount
+                :uom_id, :rate, :amount, :amount, :remarks
             )
         """), {
             "invoice_id": invoice_id,
             "item_id": target_item_id,
             "hsn_code": None,
-            "quantity": li.get("actual_qty"),
+            "quantity": accepted_weight,
             "weight": accepted_weight,
-            "uom_id": li.get("uom_id"),
-            "rate": new_rate,
+            "uom_id": 163,
+            "rate": rate_in_kg,
             "amount": amount,
+            "remarks": remarks,
         })
 
     # Jute-specific invoice data
@@ -742,6 +833,9 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
                          source_mr: dict, branch_id: int,
                          mr_date: date, updated_by: int) -> None:
     """Update the original MR with final rate/party and assign branch_mr_no."""
+    # Ensure the final party has correct party types before updating MR
+    _ensure_party_types(conn, final_party_id, updated_by)
+
     # Assign branch_mr_no
     new_mr_no = _get_next_mr_number_in_txn(conn, branch_id)
 
@@ -751,7 +845,11 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
         original_rate = float(li.get("rate") or 0)
         new_rate = original_rate * rate_multiplier
         accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
-        new_total_price = round(accepted_weight * new_rate / 100, 2)
+        # Use Decimal for precise calculation to avoid floating-point rounding errors
+        new_total_price = float(
+            (Decimal(str(accepted_weight)) * Decimal(str(new_rate)) / Decimal('100'))
+            .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        )
 
         conn.execute(text("""
             UPDATE jute_mr_li SET
@@ -796,7 +894,11 @@ def revert_original_mr(conn, jute_mr_id: int, source_mr: dict, updated_by: int) 
         li_id = li["jute_mr_li_id"]
         original_rate = float(li.get("rate") or 0)
         accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
-        original_total = round(accepted_weight * original_rate / 100, 2)
+        # Use Decimal for precise calculation to avoid floating-point rounding errors
+        original_total = float(
+            (Decimal(str(accepted_weight)) * Decimal(str(original_rate)) / Decimal('100'))
+            .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        )
 
         conn.execute(text("""
             UPDATE jute_mr_li SET
@@ -939,20 +1041,57 @@ def save_transfer_step(
 
 
 def delete_transfer_step(jute_mr_id: int, updated_by: int) -> None:
-    """Delete a transfer MR and its associated invoice.
+    """Delete a transfer MR and its associated invoices.
 
-    Finds the invoice via sales_invoice_jute.mr_id linkage,
-    then deletes invoice records and the MR + line items.
+    Invoices created for this step are linked to the PREVIOUS step's MR,
+    so this deletes:
+    1. Invoices directly linked to this MR
+    2. Invoices linked to the previous MR (created as input to this step)
     """
     with DatabaseConnection.get_transaction() as conn:
-        # Find linked invoice(s) via sales_invoice_jute
+        # Get info about the MR being deleted
+        mr_info = conn.execute(
+            text("SELECT src_jute_mr_id, branch_id FROM jute_mr WHERE jute_mr_id = :id"),
+            {"id": jute_mr_id},
+        ).fetchone()
+
+        if not mr_info:
+            return
+
+        root_mr_id, current_branch_id = mr_info
+
+        # Find the previous MR in the chain (same root, different branch, most recent)
+        prev_mr_result = conn.execute(
+            text("""SELECT jute_mr_id FROM jute_mr
+                    WHERE src_jute_mr_id = :root AND branch_id != :bid
+                    ORDER BY jute_mr_id DESC LIMIT 1"""),
+            {"root": root_mr_id, "bid": current_branch_id},
+        )
+        prev_mr_row = prev_mr_result.fetchone()
+        prev_mr_id = prev_mr_row[0] if prev_mr_row else None
+
+        # Collect all invoices to delete
+        invoice_ids_to_delete = set()
+
+        # Find invoices linked to the current MR
         inv_rows = conn.execute(
             text("SELECT invoice_id FROM sales_invoice_jute WHERE mr_id = :mr_id"),
             {"mr_id": jute_mr_id},
         ).fetchall()
-
         for inv_row in inv_rows:
-            inv_id = inv_row[0]
+            invoice_ids_to_delete.add(inv_row[0])
+
+        # Find invoices linked to the previous MR (sale invoices created as input to this step)
+        if prev_mr_id:
+            prev_inv_rows = conn.execute(
+                text("SELECT invoice_id FROM sales_invoice_jute WHERE mr_id = :mr_id"),
+                {"mr_id": prev_mr_id},
+            ).fetchall()
+            for inv_row in prev_inv_rows:
+                invoice_ids_to_delete.add(inv_row[0])
+
+        # Delete all invoices
+        for inv_id in invoice_ids_to_delete:
             conn.execute(text("DELETE FROM sales_invoice_jute WHERE invoice_id = :id"), {"id": inv_id})
             conn.execute(text("DELETE FROM sales_invoice_dtl WHERE invoice_id = :id"), {"id": inv_id})
             conn.execute(text("DELETE FROM sales_invoice WHERE invoice_id = :id"), {"id": inv_id})
@@ -977,7 +1116,7 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int,
         return
 
     # Reconstruct ordered chain
-    from .pages.jute_mr import _reconstruct_chain
+    from .jute_mr_chain_helpers import _reconstruct_chain
     chain_mrs = chain_df.to_dict("records")
     # Derive root co_id
     root_mr = get_source_mr_full(root_mr_id)
