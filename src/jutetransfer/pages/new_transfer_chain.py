@@ -91,7 +91,11 @@ def _render_filters():
     col1, col2 = st.columns(2)
 
     # Fetch companies for dropdown
-    company_options = get_companies()
+    try:
+        company_options = get_companies()
+    except Exception as e:
+        st.error(f"Failed to load companies: {str(e)}")
+        company_options = {}
 
     with col1:
         selected_company_name = st.selectbox(
@@ -110,11 +114,15 @@ def _render_filters():
     st.session_state["selected_company_id"] = selected_company_id
 
     # Get branches for selected company
-    branch_options = (
-        get_branches_by_company(selected_company_id)
-        if selected_company_id
-        else {}
-    )
+    try:
+        branch_options = (
+            get_branches_by_company(selected_company_id)
+            if selected_company_id
+            else {}
+        )
+    except Exception as e:
+        st.error(f"Failed to load branches: {str(e)}")
+        branch_options = {}
 
     with col2:
         selected_branch_name = st.selectbox(
@@ -214,6 +222,10 @@ def _render_mr_table(filter_key):
     grouped_df = st.session_state[f"source_df_{filter_key}"]
 
     # Display table with row selection
+    if grouped_df.empty:
+        st.info("No MR records to display")
+        return
+
     st.write(f"**{len(grouped_df)} records found**")
 
     visible_cols = [c for c in COMPACT_COLUMNS if c in grouped_df.columns]
@@ -224,7 +236,10 @@ def _render_mr_table(filter_key):
         selection_mode="single-row"
     )
 
-    # Store selected row index
+    # Store selected row index — guard against missing .selection or .rows attribute
+    if not hasattr(event, "selection") or not hasattr(event.selection, "rows"):
+        return
+
     if event.selection.rows:
         st.session_state[f"selected_row_{filter_key}"] = event.selection.rows[0]
     else:
@@ -255,6 +270,21 @@ def _render_chain_editor(filter_key):
     line_items_map = st.session_state[f"line_items_{filter_key}"]
     chains_map = st.session_state[f"chains_map_{filter_key}"]
 
+    # Safely read Total Amount (could be None/NaN)
+    raw_total = row.get("Total Amount")
+    if raw_total is None or (isinstance(raw_total, float) and pd.isna(raw_total)):
+        raw_total = 0.0
+    else:
+        try:
+            raw_total = float(raw_total)
+        except (ValueError, TypeError):
+            raw_total = 0.0
+
+    # Safely read MR DATE
+    raw_mr_date = row.get("MR DATE") if "MR DATE" in row.index else None
+    if raw_mr_date is None or (isinstance(raw_mr_date, float) and pd.isna(raw_mr_date)):
+        raw_mr_date = date.today()
+
     # Initialize transfers session state if needed
     transfers_key = f"transfers_{filter_key}"
     if transfers_key not in st.session_state:
@@ -265,7 +295,7 @@ def _render_chain_editor(filter_key):
     # First time loading this MR: initialize from DB chain
     if mr_id not in transfers:
         step0 = _empty_transfer_step()
-        step0["mr_date"] = row["MR DATE"] if "MR DATE" in row else date.today()
+        step0["mr_date"] = raw_mr_date
         transfers[mr_id] = [step0]
 
         # Load saved chain if exists
@@ -276,7 +306,7 @@ def _render_chain_editor(filter_key):
                 saved_chain = _reconstruct_chain(chain_mrs, selected_company_id=st.session_state["selected_company_id"])
 
                 # Populate steps from saved chain
-                prev_total = float(row["Total Amount"])
+                prev_total = raw_total
                 for sc in saved_chain:
                     step = _empty_transfer_step()
                     step["company"] = f"{sc.get('co_prefix', 'N/A')}-{sc.get('branch_name', 'N/A')}"
@@ -304,7 +334,7 @@ def _render_chain_editor(filter_key):
 
     steps = transfers[mr_id]
     li_data = line_items_map.get(mr_id, [])
-    orig_total = float(row["Total Amount"])
+    orig_total = raw_total
 
     # Render chain header
     st.divider()
@@ -527,6 +557,14 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
     Save step to database via save_transfer_step().
     Clear cache to force reload, then rerun.
     """
+    # Validate required fields before saving
+    if not step.get("company"):
+        st.error("Company is required before saving.")
+        return
+    if not step.get("mr_date"):
+        st.error("Date is required before saving.")
+        return
+
     try:
         # Get source row for context
         source_df = st.session_state[f"source_df_{filter_key}"]
