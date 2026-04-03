@@ -234,8 +234,94 @@ def _render_mr_table(filter_key):
 
 
 def _render_chain_editor(filter_key):
-    """Main editor logic: load chain, reconstruct, render step cards."""
-    pass
+    """
+    Load transfer chain for selected MR, reconstruct order, render step cards.
+
+    Session state keys:
+    - transfers_{filter_key} — {mr_id: [steps]} for editing
+    """
+    selected_row_key = f"selected_row_{filter_key}"
+    if selected_row_key not in st.session_state:
+        return  # No row selected
+
+    row_idx = st.session_state[selected_row_key]
+    grouped_df = st.session_state[f"source_df_{filter_key}"]
+
+    if row_idx >= len(grouped_df):
+        return
+
+    row = grouped_df.iloc[row_idx]
+    mr_id = int(row["jute_mr_id"])
+    line_items_map = st.session_state[f"line_items_{filter_key}"]
+    chains_map = st.session_state[f"chains_map_{filter_key}"]
+
+    # Initialize transfers session state if needed
+    transfers_key = f"transfers_{filter_key}"
+    if transfers_key not in st.session_state:
+        st.session_state[transfers_key] = {}
+
+    transfers = st.session_state[transfers_key]
+
+    # First time loading this MR: initialize from DB chain
+    if mr_id not in transfers:
+        step0 = _empty_transfer_step()
+        step0["mr_date"] = row["MR DATE"] if "MR DATE" in row else date.today()
+        transfers[mr_id] = [step0]
+
+        # Load saved chain if exists
+        chain_data = chains_map.get(mr_id)
+        if chain_data is not None and not chain_data.empty:
+            try:
+                chain_mrs = chain_data.to_dict("records") if hasattr(chain_data, 'to_dict') else chain_data
+                saved_chain = _reconstruct_chain(chain_mrs, selected_company_id=st.session_state["selected_company_id"])
+
+                # Populate steps from saved chain
+                prev_total = float(row["Total Amount"])
+                for sc in saved_chain:
+                    step = _empty_transfer_step()
+                    step["company"] = f"{sc.get('co_prefix', 'N/A')}-{sc.get('branch_name', 'N/A')}"
+                    step["mr_no"] = sc.get("branch_mr_no", "")
+                    step["mr_date"] = sc.get("jute_mr_date", date.today())
+                    step["total_amount"] = float(sc.get("total_amount", 0))
+                    step["claim_amount"] = float(sc.get("claim_amount", 0))
+                    step["net_amount"] = float(sc.get("net_total", 0))
+                    step["saved_mr_id"] = sc.get("jute_mr_id")
+
+                    # Back-calculate % rate increase (TODO: use DB column after migration)
+                    current_total = float(sc.get("total_amount", 0))
+                    if prev_total > 0:
+                        step["pct_rate_increase"] = ((current_total - prev_total) / prev_total) * 100
+                    else:
+                        step["pct_rate_increase"] = 0.0
+
+                    transfers[mr_id].append(step)
+                    prev_total = current_total
+            except Exception as e:
+                st.error(f"Error reconstructing chain: {str(e)}")
+
+        # Add blank step for editing
+        transfers[mr_id].append(_empty_transfer_step())
+
+    steps = transfers[mr_id]
+    li_data = line_items_map.get(mr_id, [])
+    orig_total = float(row["Total Amount"])
+
+    # Render chain header
+    st.divider()
+    st.subheader(f"Transfer Chain — {row.get('Jute Gate Entry No', 'N/A')} ({row.get('Jute Supplier', 'N/A')})")
+    st.write(f"**Original Total:** ₹{orig_total:,.0f}")
+
+    # Render all steps
+    for i, step in enumerate(steps):
+        _render_step_card(
+            step_index=i,
+            step=step,
+            all_steps=steps,
+            line_items=li_data,
+            original_total_amount=orig_total,
+            mr_id=mr_id,
+            filter_key=filter_key
+        )
 
 
 def _render_step_card(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key):
