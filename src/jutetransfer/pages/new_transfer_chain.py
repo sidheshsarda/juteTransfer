@@ -70,8 +70,94 @@ def transfer_chain_page():
 
 
 def _render_filters():
-    """Render dropdown filters for company, branch, year, month."""
-    pass
+    """
+    Render dropdown filters for company, branch, year, month.
+
+    Populates session state keys:
+    - selected_company_id
+    - selected_branch_id
+    - selected_year
+    - selected_month
+    """
+    current_year = datetime.now().year
+    current_month = datetime.now().month
+
+    # Month name mapping for display
+    month_names = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    ]
+
+    # Row 1: Company + Branch
+    col1, col2 = st.columns(2)
+
+    # Fetch companies for dropdown
+    company_options = get_companies()
+
+    with col1:
+        selected_company_name = st.selectbox(
+            "Select Company",
+            options=list(company_options.keys()),
+            index=0 if company_options else None,
+            key="company_select",
+        )
+        selected_company_id = (
+            company_options.get(selected_company_name)
+            if selected_company_name
+            else None
+        )
+
+    # Store in session state
+    st.session_state["selected_company_id"] = selected_company_id
+
+    # Get branches for selected company
+    branch_options = (
+        get_branches_by_company(selected_company_id)
+        if selected_company_id
+        else {}
+    )
+
+    with col2:
+        selected_branch_name = st.selectbox(
+            "Select Branch",
+            options=list(branch_options.keys()),
+            index=0 if branch_options else None,
+            key="branch_select",
+        )
+        selected_branch_id = (
+            branch_options.get(selected_branch_name)
+            if selected_branch_name
+            else None
+        )
+
+    # Store in session state
+    st.session_state["selected_branch_id"] = selected_branch_id
+
+    # Row 2: Year + Month
+    col3, col4 = st.columns(2)
+
+    with col3:
+        selected_year = st.selectbox(
+            "Select Year",
+            options=list(range(current_year, current_year - 10, -1)),
+            index=0,
+            key="year_select",
+        )
+
+    # Store in session state
+    st.session_state["selected_year"] = selected_year
+
+    with col4:
+        selected_month = st.selectbox(
+            "Select Month",
+            options=list(range(1, 13)),
+            format_func=lambda x: month_names[x - 1],
+            index=current_month - 1,
+            key="month_select",
+        )
+
+    # Store in session state
+    st.session_state["selected_month"] = selected_month
 
 
 def _render_mr_table(filter_key):
