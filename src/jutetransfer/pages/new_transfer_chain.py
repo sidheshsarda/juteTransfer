@@ -523,5 +523,104 @@ def _render_step_line_items(step_index, line_items, all_steps):
 
 
 def _save_step(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key):
-    """Save step to database and reload chain."""
-    pass
+    """
+    Save step to database via save_transfer_step().
+    Clear cache to force reload, then rerun.
+    """
+    try:
+        # Get source row for context
+        source_df = st.session_state[f"source_df_{filter_key}"]
+        row_idx = st.session_state[f"selected_row_{filter_key}"]
+        source_row = source_df.iloc[row_idx]
+
+        # Resolve company label to (co_id, branch_id) via mapping
+        company_label = step.get("company", "")
+        _, co_branch_mapping = get_company_branch_options()
+        if company_label not in co_branch_mapping:
+            st.error(f"Unknown company selection: {company_label}")
+            return
+        step_co_id, step_branch_id = co_branch_mapping[company_label]
+
+        # Determine previous step's co_id and branch_id
+        if step_index > 0 and step_index - 1 < len(all_steps):
+            prev_step = all_steps[step_index - 1]
+            prev_label = prev_step.get("company", "")
+            if prev_label in co_branch_mapping:
+                prev_co_id, prev_branch_id = co_branch_mapping[prev_label]
+            else:
+                # Fallback to source company/branch
+                prev_co_id = st.session_state.get("selected_company_id", 1)
+                prev_branch_id = st.session_state.get("selected_branch_id", 1)
+        else:
+            prev_co_id = st.session_state.get("selected_company_id", 1)
+            prev_branch_id = st.session_state.get("selected_branch_id", 1)
+
+        source_co_id = st.session_state.get("selected_company_id", 1)
+        source_branch_id = st.session_state.get("selected_branch_id", 1)
+
+        # Calculate cumulative rate multiplier from step 1 to current step
+        rate_multiplier = 1.0
+        for i in range(1, step_index + 1):
+            if i < len(all_steps):
+                pct = float(all_steps[i].get("pct_rate_increase", 0) or 0)
+                rate_multiplier *= (1.0 + pct / 100.0)
+
+        # Parse step values
+        pct_rate = float(step.get("pct_rate_increase", 0) or 0)
+        total_amt = float(step.get("total_amount", 0) or 0)
+        claim_amt = float(step.get("claim_amount", 0) or 0)
+        net_amt = float(step.get("net_amount", 0) or 0)
+        mr_rate = float(step.get("mr_rate", 0) or 0)
+        mr_date_val = step.get("mr_date", date.today())
+
+        # Prepare TransferStep dataclass
+        transfer_step = TransferStep(
+            co_id=step_co_id,
+            branch_id=step_branch_id,
+            mr_date=mr_date_val,
+            mr_rate=mr_rate,
+            pct_rate_increase=pct_rate,
+            total_amount=total_amt,
+            claim_amount=claim_amt,
+            net_amount=net_amt,
+            warehouse_id=None,
+            mr_no=0,  # Assigned inside save_transfer_step transaction
+        )
+
+        # Determine if this is the final step (returns to source company)
+        is_final = (step_co_id == source_co_id and step_branch_id == source_branch_id)
+
+        # Call save_transfer_step from transfer.py
+        result = save_transfer_step(
+            source_mr_id=mr_id,
+            step=transfer_step,
+            prev_co_id=prev_co_id,
+            prev_branch_id=prev_branch_id,
+            source_co_id=source_co_id,
+            source_branch_id=source_branch_id,
+            root_mr_id=mr_id,
+            updated_by=st.session_state.get("user_id", 1),
+            rate_multiplier=rate_multiplier,
+            is_first_step=(step_index == 0),
+            is_final=is_final,
+        )
+
+        # Clear cache to force reload on next render
+        cache_keys_to_clear = [
+            f"raw_df_{filter_key}",
+            f"source_df_{filter_key}",
+            f"line_items_{filter_key}",
+            f"transfers_{filter_key}",
+            f"chains_map_{filter_key}",
+        ]
+        for key in cache_keys_to_clear:
+            if key in st.session_state:
+                del st.session_state[key]
+
+        st.success(f"Step {step_index + 1} saved!")
+        st.rerun()
+
+    except Exception as e:
+        st.error(f"Error saving step: {str(e)}")
+        import traceback
+        st.write(traceback.format_exc())
