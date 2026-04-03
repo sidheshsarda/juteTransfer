@@ -447,8 +447,79 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
 
 
 def _render_step_line_items(step_index, line_items, all_steps):
-    """Render line items table within step card."""
-    pass
+    """Render line items table showing original items with calculated amounts for this step.
+
+    Args:
+        step_index: Position in chain (0 = source, 1+ = transfer steps)
+        line_items: List of original line items, each with:
+                    - weight (float): item weight in KG
+                    - original_rate (float): original rate per quintal
+                    - item_quality (str): item quality/description
+        all_steps: Full chain for cumulative multiplier calculation
+
+    Display logic:
+        - Source step (0): amount = weight × original_rate / 100
+        - Transfer steps (1+): amount = weight × original_rate × cumulative_multiplier / 100
+        - Cumulative multiplier is product of all (1 + pct/100) from steps 1 to current
+    """
+    if not line_items:
+        st.write("*(No line items)*")
+        return
+
+    # Build table rows
+    rows = []
+    total_amount = 0.0
+
+    for li in line_items:
+        try:
+            weight = float(li.get("weight", 0) or 0)
+            orig_rate = float(li.get("original_rate", 0) or 0)
+            quality = li.get("item_quality", "Item")
+
+            # Calculate amount for this step using cumulative multiplier
+            if step_index == 0:
+                # Source step: just weight × original rate / 100 (convert per quintal to per kg)
+                amount = weight * orig_rate / 100
+            else:
+                # Transfer step: apply cumulative % increases from step 1 to current step
+                multiplier = 1.0
+                for i in range(1, step_index + 1):
+                    if i < len(all_steps):
+                        pct = float(all_steps[i].get("pct_rate_increase", 0) or 0)
+                        multiplier *= (1.0 + pct / 100.0)
+
+                # Amount = weight × original_rate × multiplier / 100
+                amount = weight * orig_rate * multiplier / 100
+
+            rows.append({
+                "Quality": quality,
+                "Weight (KG)": int(weight),
+                "Original Rate (per quintal)": f"₹{orig_rate:.2f}",
+                "Amount": f"₹{amount:,.0f}"
+            })
+            total_amount += amount
+
+        except (ValueError, TypeError) as e:
+            st.warning(f"Error processing line item: {str(e)}")
+            continue
+
+    # Add total row
+    try:
+        total_weight = sum(int(float(li.get("weight", 0) or 0)) for li in line_items)
+    except (ValueError, TypeError):
+        total_weight = 0
+
+    rows.append({
+        "Quality": "**TOTAL**",
+        "Weight (KG)": total_weight,
+        "Original Rate (per quintal)": "—",
+        "Amount": f"**₹{total_amount:,.0f}**"
+    })
+
+    # Display table
+    st.markdown("**Line Items**")
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def _save_step(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key):
