@@ -12,8 +12,7 @@ from ..queries import (
     get_branches_by_company,
     get_company_branch_options,
     get_jute_mr_with_line_items,
-    get_transfer_chains_batch,
-    get_transfer_chain
+    get_transfer_chain,
 )
 from ..jute_mr_chain_helpers import (
     _group_by_mr,
@@ -217,8 +216,9 @@ def _render_mr_table(filter_key):
     # Display table with row selection
     st.write(f"**{len(grouped_df)} records found**")
 
+    visible_cols = [c for c in COMPACT_COLUMNS if c in grouped_df.columns]
     event = st.dataframe(
-        grouped_df[COMPACT_COLUMNS] if COMPACT_COLUMNS else grouped_df,
+        grouped_df[visible_cols] if visible_cols else grouped_df,
         use_container_width=True,
         on_select="rerun",
         selection_mode="single-row"
