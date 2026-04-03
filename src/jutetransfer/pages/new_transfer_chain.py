@@ -161,8 +161,76 @@ def _render_filters():
 
 
 def _render_mr_table(filter_key):
-    """Render monthly MR table with row selection."""
-    pass
+    """
+    Load monthly MRs via filters, display in interactive table, handle row selection.
+
+    Caches data in session state by filter_key to avoid re-querying on reruns.
+
+    Session state keys:
+    - raw_df_{filter_key} — original query result
+    - source_df_{filter_key} — grouped by MR header
+    - line_items_{filter_key} — {mr_id: [line_items]}
+    - chains_map_{filter_key} — {mr_id: chain_df}
+    - selected_row_{filter_key} — selected row index
+    """
+    st.subheader("Monthly MR Overview")
+
+    # Load data if not cached
+    raw_df_key = f"raw_df_{filter_key}"
+    if raw_df_key not in st.session_state:
+        try:
+            raw_df = get_jute_mr_with_line_items(
+                year=st.session_state["selected_year"],
+                month=st.session_state["selected_month"],
+                company_id=st.session_state["selected_company_id"],
+                branch_id=st.session_state["selected_branch_id"]
+            )
+
+            if raw_df.empty:
+                st.info("No MRs found for selected filters")
+                return
+
+            # Group by MR header
+            grouped_df, line_items_map = _group_by_mr(raw_df)
+
+            # Cache all data
+            st.session_state[raw_df_key] = raw_df
+            st.session_state[f"source_df_{filter_key}"] = grouped_df
+            st.session_state[f"line_items_{filter_key}"] = line_items_map
+
+            # Batch-load all chains
+            all_mr_ids = grouped_df["jute_mr_id"].astype(int).tolist()
+            chains_dict = {}
+            for mr_id in all_mr_ids:
+                chain_data = get_transfer_chain(mr_id)
+                if chain_data is not None:
+                    chains_dict[mr_id] = chain_data
+            st.session_state[f"chains_map_{filter_key}"] = chains_dict
+
+        except Exception as e:
+            st.error(f"Error loading MRs: {str(e)}")
+            return
+
+    # Get cached data
+    grouped_df = st.session_state[f"source_df_{filter_key}"]
+
+    # Display table with row selection
+    st.write(f"**{len(grouped_df)} records found**")
+
+    event = st.dataframe(
+        grouped_df[COMPACT_COLUMNS] if COMPACT_COLUMNS else grouped_df,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="single-row"
+    )
+
+    # Store selected row index
+    if event.selection.rows:
+        st.session_state[f"selected_row_{filter_key}"] = event.selection.rows[0]
+    else:
+        # Clear selection if user deselects
+        if f"selected_row_{filter_key}" in st.session_state:
+            del st.session_state[f"selected_row_{filter_key}"]
 
 
 def _render_chain_editor(filter_key):
