@@ -325,8 +325,125 @@ def _render_chain_editor(filter_key):
 
 
 def _render_step_card(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key):
-    """Render individual step card with inputs and action buttons."""
-    pass
+    """
+    Render individual step card with company/date/% inputs, metrics, line items, and action buttons.
+
+    Inputs:
+    - step_index: position in chain (0 = source)
+    - step: step dict
+    - all_steps: full steps list (for recalculation context)
+    - line_items: original line items
+    - original_total_amount: source MR total
+    - mr_id: parent MR ID
+    - filter_key: for session state
+    """
+    is_saved = "saved_mr_id" in step and step.get("saved_mr_id") is not None
+    is_empty = not step.get("company")
+
+    # Card styling
+    with st.container(border=True):
+        st.markdown(f"### Step {step_index + 1}")
+
+        col1, col2, col3 = st.columns([2, 1, 1])
+
+        # Company selection
+        with col1:
+            if is_saved:
+                st.write(f"**Company:** {step['company']}")
+            else:
+                co_options, _ = get_company_branch_options()
+                co_list = [co["co_id"] for co in co_options] if co_options else []
+                step["company"] = st.selectbox(
+                    "Company",
+                    options=co_list if co_list else [""],
+                    key=f"company_{mr_id}_{step_index}",
+                    disabled=is_saved
+                )
+
+        # Date input
+        with col2:
+            current_date = step.get("mr_date", date.today())
+            if isinstance(current_date, str):
+                try:
+                    current_date = datetime.strptime(current_date, "%Y-%m-%d").date()
+                except:
+                    current_date = date.today()
+
+            if is_saved:
+                st.write(f"**Date:** {current_date}")
+            else:
+                step["mr_date"] = st.date_input(
+                    "Date",
+                    value=current_date,
+                    key=f"date_{mr_id}_{step_index}",
+                    disabled=is_saved
+                )
+
+        # Status badge
+        with col3:
+            if is_saved:
+                st.write("✓ **Saved**")
+            else:
+                st.write("● **Editing**")
+
+        # % Rate Increase input (for step 2+, unsaved only)
+        if step_index > 0 and not is_saved and step.get("company"):
+            pct_key = f"pct_{mr_id}_{step_index}"
+            if pct_key not in st.session_state:
+                st.session_state[pct_key] = float(step.get("pct_rate_increase", 0) or 0)
+
+            col_pct, col_space = st.columns([1, 3])
+            with col_pct:
+                new_pct = st.number_input(
+                    "% Rate Increase",
+                    value=st.session_state[pct_key],
+                    step=0.01,
+                    min_value=0.0,
+                    max_value=100.0,
+                    key=f"pct_input_{mr_id}_{step_index}"
+                )
+
+                # On change: trigger recalculation
+                if abs(new_pct - st.session_state[pct_key]) > 0.0001:
+                    all_steps[step_index]["pct_rate_increase"] = new_pct
+                    st.session_state[pct_key] = new_pct
+
+                    # Recalculate chain downstream
+                    _recalculate_chain(all_steps, line_items, original_total_amount)
+                    st.rerun()
+
+        # Summary metrics
+        rate = step.get("mr_rate", 0)
+        total = step.get("total_amount", 0)
+        claim = step.get("claim_amount", 0)
+        net = step.get("net_amount", 0)
+
+        st.markdown(f"""
+        **Rate:** ₹{rate:.2f} | **Total:** ₹{total:,.0f} | **Claim:** ₹{claim:,.0f} | **Net:** ₹{net:,.0f}
+        """)
+
+        # Line items table
+        _render_step_line_items(step_index, line_items, all_steps)
+
+        # Action buttons (only for unsaved steps with company set)
+        if not is_saved and step.get("company"):
+            col_save, col_clear, col_delete = st.columns(3)
+
+            with col_save:
+                if st.button("Save Step", key=f"save_{mr_id}_{step_index}"):
+                    _save_step(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key)
+
+            with col_clear:
+                if st.button("Clear", key=f"clear_{mr_id}_{step_index}"):
+                    all_steps[step_index] = _empty_transfer_step()
+                    st.rerun()
+
+            with col_delete:
+                if st.button("Delete", key=f"delete_{mr_id}_{step_index}"):
+                    all_steps.pop(step_index)
+                    st.rerun()
+
+        st.divider()
 
 
 def _render_step_line_items(step_index, line_items, all_steps):
