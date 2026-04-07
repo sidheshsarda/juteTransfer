@@ -1,0 +1,251 @@
+<h2>Vertical Transfer Chain — With Line Item Breakdowns</h2>
+<p class="subtitle">Choose layout: Card-based (A) or Table-based (B). Both show line items for calculation verification.</p>
+
+<div class="cards">
+
+  <div class="card" data-choice="A-cards" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div style="font-family:monospace;font-size:11px;padding:10px;background:#1a1a2e;border-radius:6px;color:#e0e0e0;max-height:500px;overflow-y:auto">
+        <!-- Step 1 card with line items -->
+        <div style="background:#2a2a45;border-radius:4px;padding:8px;margin-bottom:6px;border-left:4px solid #5a7fff">
+          <div style="color:#7ec8e3;font-size:10px;font-weight:bold;margin-bottom:4px">STEP 1 — COMPANY A (Source) | Date: 12-Mar | % Inc: 0%</div>
+
+          <!-- Step summary row -->
+          <div style="background:#1f1f38;padding:4px 6px;border-radius:3px;margin-bottom:4px;font-size:9px">
+            <span style="color:#aaa">Rate: <span style="color:#fff">₹68.50</span> | Total: <span style="color:#fff">₹34,250</span> | Claim: <span style="color:#aaa">₹500</span> | Net: <span style="color:#fff">₹33,750</span></span>
+          </div>
+
+          <!-- Line items mini-table -->
+          <div style="font-size:9px;overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;color:#ccc">
+              <thead>
+                <tr style="background:#1f1f38;color:#7ec8e3;border-bottom:1px solid #3a3a5c">
+                  <th style="padding:2px 4px;text-align:left">Quality</th>
+                  <th style="padding:2px 4px;text-align:right">Weight(KG)</th>
+                  <th style="padding:2px 4px;text-align:right">Orig Rate</th>
+                  <th style="padding:2px 4px;text-align:right">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Fine</td>
+                  <td style="padding:2px 4px;text-align:right">3000</td>
+                  <td style="padding:2px 4px;text-align:right">68.50</td>
+                  <td style="padding:2px 4px;text-align:right">₹2,055</td>
+                </tr>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Medium</td>
+                  <td style="padding:2px 4px;text-align:right">2000</td>
+                  <td style="padding:2px 4px;text-align:right">68.50</td>
+                  <td style="padding:2px 4px;text-align:right">₹1,370</td>
+                </tr>
+                <tr style="background:#1f1f38;border-top:1px solid #5a7fff">
+                  <td style="padding:2px 4px;font-weight:bold;color:#7ec8e3">Total</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold">5000</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold;color:#fff">₹34,250</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Step 2 card (saved) with line items -->
+        <div style="background:#2a2520;border-radius:4px;padding:8px;margin-bottom:6px;border-left:4px solid #f0a500">
+          <div style="color:#f0a500;font-size:10px;font-weight:bold;margin-bottom:4px">STEP 2 — COMPANY B (Saved) | Date: 15-Mar | % Inc: 1.00% <span style="background:#f0a500;color:#1a1a2e;padding:1px 4px;border-radius:10px;font-size:8px;margin-left:4px">✓</span></div>
+
+          <div style="background:#1f1f38;padding:4px 6px;border-radius:3px;margin-bottom:4px;font-size:9px">
+            <span style="color:#aaa">Rate: <span style="color:#fff">₹69.19</span> | Total: <span style="color:#fff">₹34,595</span> | Claim: <span style="color:#aaa">₹500</span> | Net: <span style="color:#fff">₹34,095</span></span>
+          </div>
+
+          <div style="font-size:9px;overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;color:#ccc">
+              <thead>
+                <tr style="background:#1f1f38;color:#f0a500;border-bottom:1px solid #3a3a5c">
+                  <th style="padding:2px 4px;text-align:left">Quality</th>
+                  <th style="padding:2px 4px;text-align:right">Wt(KG)</th>
+                  <th style="padding:2px 4px;text-align:right">Orig Rate</th>
+                  <th style="padding:2px 4px;text-align:right">New Rate</th>
+                  <th style="padding:2px 4px;text-align:right">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Fine</td>
+                  <td style="padding:2px 4px;text-align:right">3000</td>
+                  <td style="padding:2px 4px;text-align:right">68.50</td>
+                  <td style="padding:2px 4px;text-align:right;color:#f0a500">69.19</td>
+                  <td style="padding:2px 4px;text-align:right">₹2,075.7</td>
+                </tr>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Medium</td>
+                  <td style="padding:2px 4px;text-align:right">2000</td>
+                  <td style="padding:2px 4px;text-align:right">68.50</td>
+                  <td style="padding:2px 4px;text-align:right;color:#f0a500">69.19</td>
+                  <td style="padding:2px 4px;text-align:right">₹1,383.8</td>
+                </tr>
+                <tr style="background:#1f1f38;border-top:1px solid #f0a500">
+                  <td style="padding:2px 4px;font-weight:bold;color:#f0a500">Total</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold">5000</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold;color:#fff">₹34,595</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Step 3 card (editing) with line items and % input -->
+        <div style="background:#1e3a2a;border-radius:4px;padding:8px;border:1px solid #4caf50;border-left:4px solid #4caf50">
+          <div style="color:#4caf50;font-size:10px;font-weight:bold;margin-bottom:4px">STEP 3 — COMPANY C (Editing) | Date: 18-Mar | % Inc: <input style="background:#2d2d44;color:#4caf50;border:1px solid #4caf50;width:35px;padding:1px 3px;border-radius:2px;font-size:9px" value="1.00"/></div>
+
+          <div style="background:#1f1f38;padding:4px 6px;border-radius:3px;margin-bottom:4px;font-size:9px">
+            <span style="color:#aaa">Rate: <span style="color:#7ec8e3">₹69.88</span> | Total: <span style="color:#7ec8e3">₹34,940</span> | Claim: <span style="color:#aaa">₹500</span> | Net: <span style="color:#7ec8e3">₹34,440</span></span>
+          </div>
+
+          <div style="font-size:9px;overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;color:#ccc">
+              <thead>
+                <tr style="background:#1f1f38;color:#4caf50;border-bottom:1px solid #3a3a5c">
+                  <th style="padding:2px 4px;text-align:left">Quality</th>
+                  <th style="padding:2px 4px;text-align:right">Wt(KG)</th>
+                  <th style="padding:2px 4px;text-align:right">Orig Rate</th>
+                  <th style="padding:2px 4px;text-align:right">New Rate</th>
+                  <th style="padding:2px 4px;text-align:right">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Fine</td>
+                  <td style="padding:2px 4px;text-align:right">3000</td>
+                  <td style="padding:2px 4px;text-align:right">68.50</td>
+                  <td style="padding:2px 4px;text-align:right;color:#7ec8e3">69.88</td>
+                  <td style="padding:2px 4px;text-align:right;color:#7ec8e3">₹2,096.4</td>
+                </tr>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Medium</td>
+                  <td style="padding:2px 4px;text-align:right">2000</td>
+                  <td style="padding:2px 4px;text-align:right">68.50</td>
+                  <td style="padding:2px 4px;text-align:right;color:#7ec8e3">69.88</td>
+                  <td style="padding:2px 4px;text-align:right;color:#7ec8e3">₹1,397.6</td>
+                </tr>
+                <tr style="background:#1f1f38;border-top:1px solid #4caf50">
+                  <td style="padding:2px 4px;font-weight:bold;color:#4caf50">Total</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold">5000</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold;color:#7ec8e3">₹34,940</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div style="margin-top:6px;display:flex;gap:4px">
+            <button style="background:#4caf50;color:#fff;border:none;padding:2px 8px;border-radius:3px;font-size:9px;cursor:pointer">Save Step</button>
+            <button style="background:#888;color:#fff;border:none;padding:2px 8px;border-radius:3px;font-size:9px;cursor:pointer">Clear</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A — Expandable Cards with Line Items</h3>
+      <p><strong>Each step is a card showing:</strong></p>
+      <ul style="margin:6px 0;padding-left:16px;font-size:14px">
+        <li>Step header (company, date, % rate increase input)</li>
+        <li>Summary (rate, total, claim, net)</li>
+        <li>Line items table (quality, weight, orig rate, new rate, amount)</li>
+        <li>Total row showing sum</li>
+        <li>Save/Clear buttons</li>
+      </ul>
+      <p style="margin-top:8px"><strong>Pros:</strong> Clear breakdown per step, easy to verify calculations, self-contained. <strong>Cons:</strong> Takes vertical space for long chains.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="B-table" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div style="font-family:monospace;font-size:10px;padding:10px;background:#1a1a2e;border-radius:6px;color:#e0e0e0;max-height:500px;overflow-y:auto">
+        <!-- Accordion: Step 1 expanded -->
+        <div style="background:#2a2a45;border-radius:4px;margin-bottom:4px">
+          <div style="background:#1f1f38;padding:6px;border-radius:3px 3px 0 0;cursor:pointer;color:#7ec8e3;font-weight:bold;font-size:10px">
+            ▼ STEP 1: Company A | 12-Mar | 0% | Rate: ₹68.50 | Total: ₹34,250 | Claim: ₹500 | Net: ₹33,750
+          </div>
+          <table style="width:100%;border-collapse:collapse;color:#ccc">
+            <tr style="background:#252540;border-bottom:1px solid #3a3a5c;font-size:9px">
+              <th style="padding:2px 4px;text-align:left;color:#7ec8e3">Item</th>
+              <th style="padding:2px 4px;text-align:right;color:#7ec8e3">Quality</th>
+              <th style="padding:2px 4px;text-align:right;color:#7ec8e3">Weight</th>
+              <th style="padding:2px 4px;text-align:right;color:#7ec8e3">Orig Rate</th>
+              <th style="padding:2px 4px;text-align:right;color:#7ec8e3">Amount</th>
+            </tr>
+            <tr style="background:#252540;border-bottom:1px solid #3a3a5c;font-size:9px">
+              <td style="padding:2px 4px">1</td>
+              <td style="padding:2px 4px">Fine</td>
+              <td style="padding:2px 4px;text-align:right">3000</td>
+              <td style="padding:2px 4px;text-align:right">68.50</td>
+              <td style="padding:2px 4px;text-align:right">₹2,055</td>
+            </tr>
+            <tr style="background:#252540;font-size:9px">
+              <td style="padding:2px 4px">2</td>
+              <td style="padding:2px 4px">Medium</td>
+              <td style="padding:2px 4px;text-align:right">2000</td>
+              <td style="padding:2px 4px;text-align:right">68.50</td>
+              <td style="padding:2px 4px;text-align:right">₹1,370</td>
+            </tr>
+          </table>
+        </div>
+
+        <!-- Accordion: Step 2 expanded -->
+        <div style="background:#2a2520;border-radius:4px;margin-bottom:4px">
+          <div style="background:#1f1f38;padding:6px;border-radius:3px 3px 0 0;cursor:pointer;color:#f0a500;font-weight:bold;font-size:10px">
+            ▼ STEP 2: Company B | 15-Mar | 1.00% | Rate: ₹69.19 | Total: ₹34,595 | ✓ Saved
+          </div>
+          <table style="width:100%;border-collapse:collapse;color:#ccc">
+            <tr style="background:#252540;border-bottom:1px solid #3a3a5c;font-size:9px">
+              <th style="padding:2px 4px;text-align:left;color:#f0a500">Item</th>
+              <th style="padding:2px 4px;text-align:right;color:#f0a500">Quality</th>
+              <th style="padding:2px 4px;text-align:right;color:#f0a500">Weight</th>
+              <th style="padding:2px 4px;text-align:right;color:#f0a500">Orig Rate</th>
+              <th style="padding:2px 4px;text-align:right;color:#f0a500">New Rate</th>
+              <th style="padding:2px 4px;text-align:right;color:#f0a500">Amount</th>
+            </tr>
+            <tr style="background:#252540;border-bottom:1px solid #3a3a5c;font-size:9px">
+              <td style="padding:2px 4px">1</td>
+              <td style="padding:2px 4px">Fine</td>
+              <td style="padding:2px 4px;text-align:right">3000</td>
+              <td style="padding:2px 4px;text-align:right">68.50</td>
+              <td style="padding:2px 4px;text-align:right;color:#f0a500">69.19</td>
+              <td style="padding:2px 4px;text-align:right">₹2,075.7</td>
+            </tr>
+            <tr style="background:#252540;font-size:9px">
+              <td style="padding:2px 4px">2</td>
+              <td style="padding:2px 4px">Medium</td>
+              <td style="padding:2px 4px;text-align:right">2000</td>
+              <td style="padding:2px 4px;text-align:right">68.50</td>
+              <td style="padding:2px 4px;text-align:right;color:#f0a500">69.19</td>
+              <td style="padding:2px 4px;text-align:right">₹1,383.8</td>
+            </tr>
+          </table>
+        </div>
+
+        <!-- Accordion: Step 3 collapsed -->
+        <div style="background:#1e3a2a;border-radius:4px;border:1px solid #4caf50;margin-bottom:4px">
+          <div style="background:#1f1f38;padding:6px;border-radius:3px;cursor:pointer;color:#4caf50;font-weight:bold;font-size:10px;border-bottom:1px solid #4caf50">
+            ▶ STEP 3: Company C | 18-Mar | % Inc: <input style="background:#2d2d44;color:#4caf50;border:1px solid #4caf50;width:30px;padding:1px 3px;border-radius:2px;font-size:9px" value="1.00"/> | [Edit] [Save]
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B — Accordion Table with Collapsible Details</h3>
+      <p><strong>Steps shown as collapsible rows:</strong></p>
+      <ul style="margin:6px 0;padding-left:16px;font-size:14px">
+        <li>Collapsed: summary line (company, date, % increase, rate, total, status)</li>
+        <li>Expanded: line items table nested below the summary</li>
+        <li>Saved steps are read-only, current editing step has inline % input</li>
+      </ul>
+      <p style="margin-top:8px"><strong>Pros:</strong> Compact (collapsed by default), all steps visible at once, save space. <strong>Cons:</strong> More clicks to expand and verify details.</p>
+    </div>
+  </div>
+
+</div>

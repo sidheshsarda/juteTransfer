@@ -1,7 +1,6 @@
 """Database queries for JuteTransfer application."""
 
 import pandas as pd
-import streamlit as st
 from typing import Optional, Tuple
 from datetime import datetime
 from .database import DatabaseConnection
@@ -11,25 +10,22 @@ from .database import DatabaseConnection
 # Cached master data loaders — hit DB once, reuse in-memory
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300)
 def load_companies() -> pd.DataFrame:
-    """Load all companies (cached 5 min)."""
+    """Load all companies (no cache - always fresh from database)."""
     return DatabaseConnection.execute_query(
         "SELECT co_id, co_name, co_prefix FROM co_mst ORDER BY co_name"
     )
 
 
-@st.cache_data(ttl=300)
 def load_branches() -> pd.DataFrame:
-    """Load all branches (cached 5 min)."""
+    """Load all branches (no cache - always fresh from database)."""
     return DatabaseConnection.execute_query(
         "SELECT branch_id, branch_name, co_id FROM branch_mst ORDER BY branch_name"
     )
 
 
-@st.cache_data(ttl=300)
 def load_warehouses() -> pd.DataFrame:
-    """Load all warehouses (cached 5 min)."""
+    """Load all warehouses (no cache - always fresh from database)."""
     return DatabaseConnection.execute_query(
         "SELECT warehouse_id, warehouse_name, branch_id FROM warehouse_mst ORDER BY warehouse_name"
     )
@@ -177,7 +173,7 @@ def get_jute_mr_with_line_items(
             s.supplier_name AS `Jute Supplier`,
             pm.supp_name AS `Party Name`,
             pb.address AS `Party Branch Address`,
-            q.jute_quality AS `Item Quality`,
+            im.item_name AS `Item Quality`,
             li.accepted_weight AS `Weight (KG)`,
             mr.invoice_no AS `Invoice No`,
             DATE(mr.invoice_date) AS `Invoice Date`,
@@ -191,7 +187,9 @@ def get_jute_mr_with_line_items(
             (COALESCE(li.accepted_weight, 0) * COALESCE(li.rate, 0) / 100) AS `Total Amount`,
             li.claim_rate AS `Claim Rate`,
             (COALESCE(li.accepted_weight, 0) * COALESCE(li.claim_rate, 0) / 100 + COALESCE(li.water_damage_amount, 0) - COALESCE(li.premium_amount, 0)) AS `Claim Amount`,
-            ((COALESCE(li.accepted_weight, 0) * COALESCE(li.rate, 0) / 100) - (COALESCE(li.accepted_weight, 0) * COALESCE(li.claim_rate, 0) / 100 + COALESCE(li.water_damage_amount, 0) - COALESCE(li.premium_amount, 0))) AS `Net Total`
+            ((COALESCE(li.accepted_weight, 0) * COALESCE(li.rate, 0) / 100) - (COALESCE(li.accepted_weight, 0) * COALESCE(li.claim_rate, 0) / 100 + COALESCE(li.water_damage_amount, 0) - COALESCE(li.premium_amount, 0))) AS `Net Total`,
+            mr.challan_date AS `Challan Date`,
+            wh.warehouse_name AS `Warehouse`
         FROM jute_mr mr
         INNER JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         INNER JOIN jute_mr_li li ON mr.jute_mr_id = li.jute_mr_id
@@ -199,7 +197,8 @@ def get_jute_mr_with_line_items(
         LEFT JOIN jute_supplier_mst s ON mr.jute_supplier_id = s.supplier_id
         LEFT JOIN party_mst pm ON pm.party_id = mr.party_id AND pm.co_id = bm.co_id
         LEFT JOIN party_branch_mst pb ON pb.party_id = pm.party_id AND pb.party_mst_branch_id = mr.party_branch_id
-        LEFT JOIN jute_quality_mst q ON li.actual_quality = q.jute_qlty_id
+        LEFT JOIN item_mst im ON li.actual_item_id = im.item_id
+        LEFT JOIN warehouse_mst wh ON li.warehouse_id = wh.warehouse_id
         WHERE YEAR(mr.jute_gate_entry_date) = :year
         AND MONTH(mr.jute_gate_entry_date) = :month
     """
@@ -270,14 +269,14 @@ def get_transfer_chain(root_mr_id: int) -> pd.DataFrame:
     """Fetch all transferred MRs for a given root MR, with company info.
 
     Returns DataFrame with columns: jute_mr_id, src_com_id, branch_id,
-    jute_mr_date, branch_mr_no, total_amount, claim_amount, net_total,
+    jute_mr_date, challan_date, branch_mr_no, total_amount, claim_amount, net_total,
     owner_co_id, branch_name, co_name, co_prefix.
     Ordered by jute_mr_id ASC for chain reconstruction.
     """
     return DatabaseConnection.execute_query(
         """
         SELECT mr.jute_mr_id, mr.src_com_id, mr.branch_id, mr.jute_mr_date,
-               mr.branch_mr_no, mr.total_amount, mr.claim_amount, mr.net_total,
+               mr.challan_date, mr.branch_mr_no, mr.total_amount, mr.claim_amount, mr.net_total,
                bm.co_id AS owner_co_id, bm.branch_name,
                cm.co_name, cm.co_prefix
         FROM jute_mr mr
@@ -302,7 +301,7 @@ def get_transfer_chains_batch(mr_ids: list) -> dict:
     placeholders = ",".join(str(int(mid)) for mid in mr_ids)
     df = DatabaseConnection.execute_query(f"""
         SELECT mr.jute_mr_id, mr.src_jute_mr_id, mr.src_com_id, mr.branch_id,
-               mr.jute_mr_date, mr.branch_mr_no, mr.total_amount, mr.claim_amount, mr.net_total,
+               mr.jute_mr_date, mr.challan_date, mr.branch_mr_no, mr.total_amount, mr.claim_amount, mr.net_total,
                bm.co_id AS owner_co_id, bm.branch_name,
                cm.co_name, cm.co_prefix
         FROM jute_mr mr
@@ -324,3 +323,23 @@ def get_warehouses_by_branch(branch_id: int) -> dict:
     # Explicit int cast to avoid numpy/pandas dtype mismatch from iterrows()
     filtered = df[df['branch_id'] == int(branch_id)]
     return dict(zip(filtered['warehouse_name'], filtered['warehouse_id']))
+
+
+def get_invoice_details_by_mr_id(mr_id: int) -> Optional[dict]:
+    """Fetch LC/contract fields from sales_invoice linked to an MR via sales_invoice_jute.
+
+    Returns dict with consignment_no, consignment_date, contract_no, contract_date
+    or None if no invoice found.
+    """
+    df = DatabaseConnection.execute_query(
+        """SELECT si.consignment_no, si.consignment_date,
+                  si.contract_no, si.contract_date
+           FROM sales_invoice si
+           JOIN sales_invoice_jute sij ON si.invoice_id = sij.invoice_id
+           WHERE sij.mr_id = :mr_id
+           LIMIT 1""",
+        {"mr_id": mr_id},
+    )
+    if df is not None and not df.empty:
+        return df.iloc[0].to_dict()
+    return None

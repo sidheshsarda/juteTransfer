@@ -1,0 +1,261 @@
+<h2>New Transfer Chain Page — Full 3-Level Layout (Option A)</h2>
+<p class="subtitle">Level 1: Filters + MR Table | Level 2: Transfer step cards (selected row) | Level 3: Line items within each card</p>
+
+<div class="mockup">
+  <div class="mockup-header">New Vertical Transfer Chain Editor</div>
+  <div class="mockup-body" style="font-family:monospace;font-size:11px;background:#1a1a2e;color:#e0e0e0;padding:12px">
+
+    <!-- LEVEL 1: FILTERS -->
+    <div style="background:#2d2d44;padding:8px;border-radius:4px;margin-bottom:8px">
+      <div style="color:#7ec8e3;font-size:10px;font-weight:bold;margin-bottom:6px">📊 FILTERS</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:6px;font-size:10px">
+        <div>
+          <label style="color:#aaa">Company</label><br/>
+          <select style="width:100%;background:#1f1f38;color:#fff;border:1px solid #3a3a5c;padding:3px;border-radius:3px;font-size:9px">
+            <option>Select Company</option>
+            <option selected>Company A</option>
+          </select>
+        </div>
+        <div>
+          <label style="color:#aaa">Branch</label><br/>
+          <select style="width:100%;background:#1f1f38;color:#fff;border:1px solid #3a3a5c;padding:3px;border-radius:3px;font-size:9px">
+            <option selected>Head Office</option>
+          </select>
+        </div>
+        <div>
+          <label style="color:#aaa">Year</label><br/>
+          <select style="width:100%;background:#1f1f38;color:#fff;border:1px solid #3a3a5c;padding:3px;border-radius:3px;font-size:9px">
+            <option selected>2025</option>
+          </select>
+        </div>
+        <div>
+          <label style="color:#aaa">Month</label><br/>
+          <select style="width:100%;background:#1f1f38;color:#fff;border:1px solid #3a3a5c;padding:3px;border-radius:3px;font-size:9px">
+            <option selected>March</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <!-- LEVEL 1: MONTHLY MR TABLE -->
+    <div style="background:#252540;border-radius:4px;padding:6px;margin-bottom:8px">
+      <div style="color:#7ec8e3;font-size:10px;font-weight:bold;margin-bottom:6px">📋 MONTHLY MR TABLE — 12 records loaded for Mar 2025, Company A, Head Office</div>
+      <div style="font-size:9px;overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;color:#ccc">
+          <thead>
+            <tr style="background:#1f1f38;color:#7ec8e3;border-bottom:1px solid #3a3a5c">
+              <th style="padding:3px 5px;text-align:left">Gate#</th>
+              <th style="padding:3px 5px;text-align:left">MR Date</th>
+              <th style="padding:3px 5px;text-align:left">Supplier</th>
+              <th style="padding:3px 5px;text-align:right">Weight(KG)</th>
+              <th style="padding:3px 5px;text-align:right">MR Rate</th>
+              <th style="padding:3px 5px;text-align:right">Total</th>
+              <th style="padding:3px 5px;text-align:right">Claim</th>
+              <th style="padding:3px 5px;text-align:left">Transfer Chain</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="background:#252540;border-bottom:1px solid #3a3a5c;font-size:9px">
+              <td style="padding:3px 5px">JGE-001</td>
+              <td style="padding:3px 5px">12-Mar</td>
+              <td style="padding:3px 5px">ABC Suppliers</td>
+              <td style="padding:3px 5px;text-align:right">5000</td>
+              <td style="padding:3px 5px;text-align:right">₹68.50</td>
+              <td style="padding:3px 5px;text-align:right">₹34,250</td>
+              <td style="padding:3px 5px;text-align:right">₹500</td>
+              <td style="padding:3px 5px;color:#5a7fff">A → B → C</td>
+            </tr>
+            <tr style="background:#1e3a2a;border:1px solid #4caf50;font-size:9px" title="Selected row">
+              <td style="padding:3px 5px">JGE-002</td>
+              <td style="padding:3px 5px">15-Mar</td>
+              <td style="padding:3px 5px">XYZ Trading</td>
+              <td style="padding:3px 5px;text-align:right">3500</td>
+              <td style="padding:3px 5px;text-align:right">₹72.00</td>
+              <td style="padding:3px 5px;text-align:right">₹25,200</td>
+              <td style="padding:3px 5px;text-align:right">₹300</td>
+              <td style="padding:3px 5px;color:#4caf50">A → B → C (selected ●)</td>
+            </tr>
+            <tr style="background:#252540;border-bottom:1px solid #3a3a5c;font-size:9px">
+              <td style="padding:3px 5px">JGE-003</td>
+              <td style="padding:3px 5px">18-Mar</td>
+              <td style="padding:3px 5px">Global Imports</td>
+              <td style="padding:3px 5px;text-align:right">4200</td>
+              <td style="padding:3px 5px;text-align:right">₹65.00</td>
+              <td style="padding:3px 5px;text-align:right">₹27,300</td>
+              <td style="padding:3px 5px;text-align:right">₹400</td>
+              <td style="padding:3px 5px;color:#5a7fff">A → B</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div style="margin-top:4px;color:#aaa;font-size:9px">Click a row to edit its transfer chain below ↓</div>
+    </div>
+
+    <!-- LEVEL 2 & 3: TRANSFER CHAIN EDITOR (for selected row JGE-002) -->
+    <div style="background:#252540;border-radius:4px;padding:6px;border-top:2px solid #4caf50">
+      <div style="color:#4caf50;font-size:10px;font-weight:bold;margin-bottom:6px">⛓️ TRANSFER CHAIN EDITOR — JGE-002 (XYZ Trading, 15-Mar)</div>
+      <div style="color:#aaa;font-size:9px;margin-bottom:6px">Gate Entry: ₹25,200 | Claim: ₹300 | View and edit transfer steps below</div>
+
+      <!-- LEVEL 2: TRANSFER STEP CARDS (with LEVEL 3: line items inside) -->
+      <div style="border-left:3px solid #5a7fff;padding-left:8px">
+
+        <!-- STEP 1 CARD -->
+        <div style="background:#2a2a45;border-radius:4px;padding:8px;margin-bottom:6px;border-left:4px solid #5a7fff">
+          <div style="color:#7ec8e3;font-size:10px;font-weight:bold;margin-bottom:4px">🏢 STEP 1 — COMPANY A (Gate Entry) | Date: 15-Mar | % Inc: 0% (fixed)</div>
+
+          <div style="background:#1f1f38;padding:4px 6px;border-radius:3px;margin-bottom:4px;font-size:9px">
+            <span style="color:#aaa">Warehouse: <span style="color:#fff">Main</span> | Rate: <span style="color:#fff">₹72.00</span> | Total: <span style="color:#fff">₹25,200</span> | Claim: <span style="color:#aaa">₹300</span> | Net: <span style="color:#fff">₹24,900</span></span>
+          </div>
+
+          <!-- LEVEL 3: LINE ITEMS TABLE -->
+          <div style="font-size:9px;overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;color:#ccc">
+              <thead>
+                <tr style="background:#1f1f38;color:#7ec8e3;border-bottom:1px solid #3a3a5c;font-size:8px">
+                  <th style="padding:2px 4px;text-align:left">Quality</th>
+                  <th style="padding:2px 4px;text-align:right">Weight(KG)</th>
+                  <th style="padding:2px 4px;text-align:right">Orig Rate</th>
+                  <th style="padding:2px 4px;text-align:right">Amount</th>
+                </tr>
+              </thead>
+              <tbody style="font-size:8px">
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Fine Grade</td>
+                  <td style="padding:2px 4px;text-align:right">2000</td>
+                  <td style="padding:2px 4px;text-align:right">72.00</td>
+                  <td style="padding:2px 4px;text-align:right">₹14,400</td>
+                </tr>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Medium Grade</td>
+                  <td style="padding:2px 4px;text-align:right">1500</td>
+                  <td style="padding:2px 4px;text-align:right">72.00</td>
+                  <td style="padding:2px 4px;text-align:right">₹10,800</td>
+                </tr>
+                <tr style="background:#1f1f38;border-top:1px solid #5a7fff;font-size:8px">
+                  <td style="padding:2px 4px;font-weight:bold;color:#7ec8e3">TOTAL</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold">3500</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold;color:#fff">₹25,200</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- STEP 2 CARD -->
+        <div style="background:#2a2520;border-radius:4px;padding:8px;margin-bottom:6px;border-left:4px solid #f0a500">
+          <div style="color:#f0a500;font-size:10px;font-weight:bold;margin-bottom:4px">🏢 STEP 2 — COMPANY B | Date: 17-Mar | % Inc: 1.50% <span style="background:#f0a500;color:#1a1a2e;padding:1px 4px;border-radius:10px;font-size:8px;margin-left:4px">✓ SAVED</span></div>
+
+          <div style="background:#1f1f38;padding:4px 6px;border-radius:3px;margin-bottom:4px;font-size:9px">
+            <span style="color:#aaa">Warehouse: <span style="color:#fff">Branch 1</span> | Rate: <span style="color:#fff">₹73.08</span> | Total: <span style="color:#fff">₹25,578</span> | Claim: <span style="color:#aaa">₹300</span> | Net: <span style="color:#fff">₹25,278</span></span>
+          </div>
+
+          <!-- LEVEL 3: LINE ITEMS TABLE -->
+          <div style="font-size:9px;overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;color:#ccc">
+              <thead>
+                <tr style="background:#1f1f38;color:#f0a500;border-bottom:1px solid #3a3a5c;font-size:8px">
+                  <th style="padding:2px 4px;text-align:left">Quality</th>
+                  <th style="padding:2px 4px;text-align:right">Weight(KG)</th>
+                  <th style="padding:2px 4px;text-align:right">Orig Rate</th>
+                  <th style="padding:2px 4px;text-align:right">New Rate</th>
+                  <th style="padding:2px 4px;text-align:right">Amount</th>
+                </tr>
+              </thead>
+              <tbody style="font-size:8px">
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Fine Grade</td>
+                  <td style="padding:2px 4px;text-align:right">2000</td>
+                  <td style="padding:2px 4px;text-align:right">72.00</td>
+                  <td style="padding:2px 4px;text-align:right;color:#f0a500">73.08</td>
+                  <td style="padding:2px 4px;text-align:right">₹14,616</td>
+                </tr>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Medium Grade</td>
+                  <td style="padding:2px 4px;text-align:right">1500</td>
+                  <td style="padding:2px 4px;text-align:right">72.00</td>
+                  <td style="padding:2px 4px;text-align:right;color:#f0a500">73.08</td>
+                  <td style="padding:2px 4px;text-align:right">₹10,962</td>
+                </tr>
+                <tr style="background:#1f1f38;border-top:1px solid #f0a500;font-size:8px">
+                  <td style="padding:2px 4px;font-weight:bold;color:#f0a500">TOTAL</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold">3500</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold;color:#fff">₹25,578</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- STEP 3 CARD (EDITING) -->
+        <div style="background:#1e3a2a;border-radius:4px;padding:8px;border:1px solid #4caf50;border-left:4px solid #4caf50">
+          <div style="color:#4caf50;font-size:10px;font-weight:bold;margin-bottom:4px">🏢 STEP 3 — COMPANY C | Date: <input style="background:#2d2d44;color:#fff;border:1px solid #4caf50;width:60px;padding:2px 3px;border-radius:2px;font-size:9px" value="19-Mar"/> | % Inc: <input style="background:#2d2d44;color:#4caf50;border:1px solid #4caf50;width:40px;padding:2px 3px;border-radius:2px;font-size:9px" value="2.00"/></div>
+
+          <div style="background:#1f1f38;padding:4px 6px;border-radius:3px;margin-bottom:4px;font-size:9px">
+            <span style="color:#aaa">Warehouse: <select style="background:#2d2d44;color:#fff;border:1px solid #4caf50;padding:1px 3px;border-radius:2px;font-size:8px"><option>Main</option><option selected>Branch 2</option></select> | Rate: <span style="color:#7ec8e3">₹74.55</span> | Total: <span style="color:#7ec8e3">₹26,093</span> | Claim: <span style="color:#aaa">₹300</span> | Net: <span style="color:#7ec8e3">₹25,793</span></span>
+          </div>
+
+          <!-- LEVEL 3: LINE ITEMS TABLE -->
+          <div style="font-size:9px;overflow-x:auto">
+            <table style="width:100%;border-collapse:collapse;color:#ccc">
+              <thead>
+                <tr style="background:#1f1f38;color:#4caf50;border-bottom:1px solid #3a3a5c;font-size:8px">
+                  <th style="padding:2px 4px;text-align:left">Quality</th>
+                  <th style="padding:2px 4px;text-align:right">Weight(KG)</th>
+                  <th style="padding:2px 4px;text-align:right">Orig Rate</th>
+                  <th style="padding:2px 4px;text-align:right">New Rate</th>
+                  <th style="padding:2px 4px;text-align:right">Amount</th>
+                </tr>
+              </thead>
+              <tbody style="font-size:8px">
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Fine Grade</td>
+                  <td style="padding:2px 4px;text-align:right">2000</td>
+                  <td style="padding:2px 4px;text-align:right">72.00</td>
+                  <td style="padding:2px 4px;text-align:right;color:#7ec8e3">74.55</td>
+                  <td style="padding:2px 4px;text-align:right;color:#7ec8e3">₹14,910</td>
+                </tr>
+                <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+                  <td style="padding:2px 4px">Medium Grade</td>
+                  <td style="padding:2px 4px;text-align:right">1500</td>
+                  <td style="padding:2px 4px;text-align:right">72.00</td>
+                  <td style="padding:2px 4px;text-align:right;color:#7ec8e3">74.55</td>
+                  <td style="padding:2px 4px;text-align:right;color:#7ec8e3">₹11,183</td>
+                </tr>
+                <tr style="background:#1f1f38;border-top:1px solid #4caf50;font-size:8px">
+                  <td style="padding:2px 4px;font-weight:bold;color:#4caf50">TOTAL</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold">3500</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;color:#aaa">—</td>
+                  <td style="padding:2px 4px;text-align:right;font-weight:bold;color:#7ec8e3">₹26,093</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div style="margin-top:6px;display:flex;gap:4px">
+            <button style="background:#4caf50;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:9px;cursor:pointer;font-weight:bold">Save Step 3</button>
+            <button style="background:#888;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:9px;cursor:pointer">Clear</button>
+            <button style="background:#555;color:#fff;border:none;padding:3px 10px;border-radius:3px;font-size:9px;cursor:pointer">Delete</button>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+  </div>
+</div>
+
+<div class="section" style="margin-top:16px">
+  <h3>Page Structure Summary</h3>
+  <ul style="margin:8px 0;padding-left:20px">
+    <li><strong>Level 1 — Filters:</strong> Company, Branch, Year, Month dropdowns</li>
+    <li><strong>Level 1 — Monthly MR Table:</strong> All MRs for the selected filters. Click a row to load its transfer chain.</li>
+    <li><strong>Level 2 — Transfer Chain Cards:</strong> Vertical stack of step cards (Step 1 = gate entry, Step 2+ = transfers). Each card shows company, date, % rate increase input, warehouse, summary stats.</li>
+    <li><strong>Level 3 — Line Items Table:</strong> Inside each card, a table showing item quality, weight, original rate, new rate (calculated), and line amount. Totals row at bottom.</li>
+    <li><strong>Actions:</strong> Save/Clear/Delete buttons on the editing step card.</li>
+  </ul>
+</div>
