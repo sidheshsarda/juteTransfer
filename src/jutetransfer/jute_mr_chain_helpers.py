@@ -79,7 +79,7 @@ def _group_by_mr(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     Returns:
         (grouped_df, line_items_map) where line_items_map is
-        {jute_mr_id: [{weight, original_rate, original_claim}, ...]}
+        {jute_mr_id: [{weight, original_rate, original_claim, original_claim_rate, item_quality}, ...]}
     """
     if df is None or df.empty:
         return df, {}
@@ -109,6 +109,7 @@ def _group_by_mr(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
                 "weight": round(w, 0) if w is not None else None,
                 "original_rate": _opt_num(row.get("MR Rate")),
                 "original_claim": _opt_num(row.get("Claim Amount")),
+                "original_claim_rate": _opt_num(row.get("Claim Rate")),
                 "item_quality": row.get("Item Quality") or "Item",
             })
         line_items_map[int(mr_id)] = items

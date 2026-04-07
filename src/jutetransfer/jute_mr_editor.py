@@ -42,7 +42,8 @@ def _render_step_calculation_chart(
 
     Args:
         step_index: Current step number (0-indexed)
-        line_items: List of dicts with 'weight', 'original_rate', 'original_claim', 'item_quality' keys
+        line_items: List of dicts with 'weight', 'original_rate', 'original_claim',
+                    'original_claim_rate', 'item_quality' keys
         step_dict: Current step's data dict
         original_total_amount: Step 0's total amount (reference)
         prev_step_rate: Previous step's weighted average rate (unused, for backward compatibility)
@@ -67,11 +68,14 @@ def _render_step_calculation_chart(
         data = []
         total_qty = 0.0
         total_amount = 0.0
+        total_claim_amount = 0.0
 
         for line_item in line_items:
             qty = float(line_item.get("weight", 0) or 0)
             rate = round(float(line_item.get("original_rate", 0) or 0), 2)
             amount = round(qty * rate / 100, 2)
+            claim_rate = round(float(line_item.get("original_claim_rate", 0) or 0), 2)
+            claim_amount = round(float(line_item.get("original_claim", 0) or 0), 2)
 
             item_name = line_item.get("item_quality", "Item")
             data.append({
@@ -79,10 +83,13 @@ def _render_step_calculation_chart(
                 "Qty (KG)": round(qty, 2),
                 "Rate (per quintal)": rate,
                 "Amount": amount,
+                "Claim Rate (per quintal)": claim_rate,
+                "Claim Amount": claim_amount,
             })
 
             total_qty += qty
             total_amount += amount
+            total_claim_amount += claim_amount
 
         # Add totals row
         data.append({
@@ -90,6 +97,8 @@ def _render_step_calculation_chart(
             "Qty (KG)": round(total_qty, 2),
             "Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "Amount": round(total_amount, 2),
+            "Claim Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
+            "Claim Amount": round(total_claim_amount, 2),
         })
 
         # Display chart
@@ -113,6 +122,7 @@ def _render_step_calculation_chart(
         data = []
         total_qty = 0.0
         total_amount = 0.0
+        total_claim_amount = 0.0
 
         for line_item in line_items:
             qty = float(line_item.get("weight", 0) or 0)
@@ -125,6 +135,10 @@ def _render_step_calculation_chart(
             # Amount: qty * new_rate / 100 (convert from per quintal to per kg)
             amount = round(qty * new_rate / 100, 2)
 
+            # Claim is unaffected by % rate increase — copies straight from source LI
+            claim_rate = round(float(line_item.get("original_claim_rate", 0) or 0), 2)
+            claim_amount = round(float(line_item.get("original_claim", 0) or 0), 2)
+
             item_name = line_item.get("item_quality", "Item")
             data.append({
                 "Item": item_name,
@@ -133,10 +147,13 @@ def _render_step_calculation_chart(
                 "% Change": f"{pct_increase:.2f}%",
                 "New Rate (per quintal)": new_rate,
                 "Amount": amount,
+                "Claim Rate (per quintal)": claim_rate,
+                "Claim Amount": claim_amount,
             })
 
             total_qty += qty
             total_amount += amount
+            total_claim_amount += claim_amount
 
         # Add totals row
         data.append({
@@ -146,6 +163,8 @@ def _render_step_calculation_chart(
             "% Change": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "New Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "Amount": round(total_amount, 2),
+            "Claim Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
+            "Claim Amount": round(total_claim_amount, 2),
         })
 
         # Display chart
