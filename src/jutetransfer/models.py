@@ -148,7 +148,7 @@ class JuteMRLineItem(Base):
     claim_rate = Column(Float, nullable=False, default=0)
     water_damage_amount = Column(Numeric(10, 2), default=0.00)
     premium_amount = Column(Numeric(10, 2), default=0.00)
-    total_price = Column(Numeric(10, 0))
+    total_price = Column(Float)
     claim_quality = Column(String(255))
     warehouse_id = Column(BigInteger)
     remarks = Column(String(255))

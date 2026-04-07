@@ -1,0 +1,148 @@
+<h2>Vertical Transfer Chain — Layout Approach</h2>
+<p class="subtitle">Which structure feels right for showing each transfer step?</p>
+
+<div class="cards">
+
+  <div class="card" data-choice="A" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div style="font-family:monospace;font-size:12px;padding:12px;background:#1a1a2e;border-radius:6px;color:#e0e0e0">
+        <!-- Page header -->
+        <div style="background:#2d2d44;padding:6px 10px;border-radius:4px;margin-bottom:8px;color:#aaa;font-size:11px">
+          [Company ▼] [Branch ▼] [Year ▼] [Month ▼]
+        </div>
+        <!-- MR table -->
+        <div style="background:#252540;padding:6px 10px;border-radius:4px;margin-bottom:8px;font-size:11px">
+          <div style="color:#7ec8e3;margin-bottom:4px">▼ MONTHLY MR TABLE (row selected ●)</div>
+          <div style="color:#ccc">Gate# | Date | Supplier | Weight | Rate | Total | Chain</div>
+          <div style="background:#3a3a5c;padding:2px 6px;border-radius:2px;color:#fff;margin-top:2px">JGE-001 | 12-Mar | ABC Ltd | 5000 KG | 68.50 | ₹34,250 | A→B→C</div>
+        </div>
+        <!-- Vertical card chain -->
+        <div style="color:#7ec8e3;font-size:11px;margin-bottom:4px">▼ TRANSFER CHAIN — JGE-001</div>
+        <div style="border-left:3px solid #5a7fff;padding-left:8px">
+          <!-- Step 1 card -->
+          <div style="background:#2a2a45;border-radius:4px;padding:8px;margin-bottom:4px">
+            <div style="color:#7ec8e3;font-size:10px;font-weight:bold">STEP 1 — COMPANY A (Source)</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:4px;font-size:10px">
+              <span style="color:#aaa">Date: <span style="color:#fff">12-Mar-25</span></span>
+              <span style="color:#aaa">Rate: <span style="color:#fff">₹68.50</span></span>
+              <span style="color:#aaa">Total: <span style="color:#fff">₹34,250</span></span>
+              <span style="color:#aaa">Claim: <span style="color:#fff">₹500</span></span>
+              <span style="color:#aaa">Net: <span style="color:#fff">₹33,750</span></span>
+              <span style="color:#aaa">% Inc: <span style="color:#7ec8e3">0%</span></span>
+            </div>
+          </div>
+          <!-- connector -->
+          <div style="text-align:left;padding-left:8px;color:#5a7fff;font-size:11px;line-height:1">↓</div>
+          <!-- Step 2 card -->
+          <div style="background:#2a2a45;border-radius:4px;padding:8px;margin-bottom:4px">
+            <div style="color:#f0a500;font-size:10px;font-weight:bold">STEP 2 — COMPANY B <span style="background:#5a7fff;color:#fff;padding:1px 5px;border-radius:10px;font-size:9px">SAVED</span></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:4px;font-size:10px">
+              <span style="color:#aaa">Date: <span style="color:#fff">15-Mar-25</span></span>
+              <span style="color:#aaa">Rate: <span style="color:#fff">₹69.19</span></span>
+              <span style="color:#aaa">Total: <span style="color:#fff">₹34,595</span></span>
+              <span style="color:#aaa">Claim: <span style="color:#fff">₹500</span></span>
+              <span style="color:#aaa">Net: <span style="color:#fff">₹34,095</span></span>
+              <span style="color:#aaa">% Inc: <span style="color:#f0a500">1.00%</span></span>
+            </div>
+          </div>
+          <!-- connector -->
+          <div style="text-align:left;padding-left:8px;color:#5a7fff;font-size:11px;line-height:1">↓</div>
+          <!-- Step 3 card — active editing -->
+          <div style="background:#1e3a2a;border:1px solid #4caf50;border-radius:4px;padding:8px">
+            <div style="color:#4caf50;font-size:10px;font-weight:bold">STEP 3 — COMPANY C <span style="background:#4caf50;color:#fff;padding:1px 5px;border-radius:10px;font-size:9px">EDITING</span></div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:4px;font-size:10px">
+              <span style="color:#aaa">Date: <span style="background:#2d2d44;padding:0 3px;border-radius:2px;color:#fff">18-Mar-25</span></span>
+              <span style="color:#aaa">Rate: <span style="color:#7ec8e3">₹69.88</span></span>
+              <span style="color:#aaa">Total: <span style="color:#7ec8e3">₹34,940</span></span>
+              <span style="color:#aaa">Claim: <span style="color:#fff">₹500</span></span>
+              <span style="color:#aaa">Net: <span style="color:#7ec8e3">₹34,440</span></span>
+              <span style="color:#aaa">% Inc: <span style="background:#2d2d44;padding:0 3px;border-radius:2px;border:1px solid #4caf50;color:#fff">[ 1.00% ]</span></span>
+            </div>
+            <div style="margin-top:6px;display:flex;gap:4px">
+              <button style="background:#4caf50;color:#fff;border:none;padding:2px 8px;border-radius:3px;font-size:9px">Save Step</button>
+              <button style="background:#888;color:#fff;border:none;padding:2px 8px;border-radius:3px;font-size:9px">Clear</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A — Vertical Cards</h3>
+      <p>Each step is a collapsible card. Fields laid out in a grid inside the card. Editing happens inline within the card. Easy to see one step at a time. Good when chains are long.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="B" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div style="font-family:monospace;font-size:12px;padding:12px;background:#1a1a2e;border-radius:6px;color:#e0e0e0">
+        <!-- Page header -->
+        <div style="background:#2d2d44;padding:6px 10px;border-radius:4px;margin-bottom:8px;color:#aaa;font-size:11px">
+          [Company ▼] [Branch ▼] [Year ▼] [Month ▼]
+        </div>
+        <!-- MR table -->
+        <div style="background:#252540;padding:6px 10px;border-radius:4px;margin-bottom:8px;font-size:11px">
+          <div style="color:#7ec8e3;margin-bottom:4px">▼ MONTHLY MR TABLE (row selected ●)</div>
+          <div style="color:#ccc">Gate# | Date | Supplier | Weight | Rate | Total | Chain</div>
+          <div style="background:#3a3a5c;padding:2px 6px;border-radius:2px;color:#fff;margin-top:2px">JGE-001 | 12-Mar | ABC Ltd | 5000 KG | 68.50 | ₹34,250 | A→B→C</div>
+        </div>
+        <!-- Vertical table chain -->
+        <div style="color:#7ec8e3;font-size:11px;margin-bottom:4px">▼ TRANSFER CHAIN — JGE-001</div>
+        <table style="width:100%;border-collapse:collapse;font-size:10px">
+          <thead>
+            <tr style="background:#2d2d44;color:#aaa;text-align:left">
+              <th style="padding:3px 5px">Step</th>
+              <th style="padding:3px 5px">Company</th>
+              <th style="padding:3px 5px">Date</th>
+              <th style="padding:3px 5px">% Inc</th>
+              <th style="padding:3px 5px">Rate</th>
+              <th style="padding:3px 5px">Total</th>
+              <th style="padding:3px 5px">Claim</th>
+              <th style="padding:3px 5px">Net</th>
+              <th style="padding:3px 5px">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr style="background:#252540;border-bottom:1px solid #3a3a5c">
+              <td style="padding:3px 5px;color:#7ec8e3">1</td>
+              <td style="padding:3px 5px;color:#fff">Company A</td>
+              <td style="padding:3px 5px;color:#ccc">12-Mar</td>
+              <td style="padding:3px 5px;color:#ccc">0%</td>
+              <td style="padding:3px 5px;color:#fff">₹68.50</td>
+              <td style="padding:3px 5px;color:#fff">₹34,250</td>
+              <td style="padding:3px 5px;color:#ccc">₹500</td>
+              <td style="padding:3px 5px;color:#fff">₹33,750</td>
+              <td style="padding:3px 5px;color:#5a7fff">Source</td>
+            </tr>
+            <tr style="background:#2a2520;border-bottom:1px solid #3a3a5c">
+              <td style="padding:3px 5px;color:#f0a500">2</td>
+              <td style="padding:3px 5px;color:#fff">Company B</td>
+              <td style="padding:3px 5px;color:#ccc">15-Mar</td>
+              <td style="padding:3px 5px;color:#f0a500">1.00%</td>
+              <td style="padding:3px 5px;color:#fff">₹69.19</td>
+              <td style="padding:3px 5px;color:#fff">₹34,595</td>
+              <td style="padding:3px 5px;color:#ccc">₹500</td>
+              <td style="padding:3px 5px;color:#fff">₹34,095</td>
+              <td style="padding:3px 5px;color:#5a7fff">✓ Saved</td>
+            </tr>
+            <tr style="background:#1e3a2a;border:1px solid #4caf50">
+              <td style="padding:3px 5px;color:#4caf50">3</td>
+              <td style="padding:3px 5px"><select style="background:#2d2d44;color:#fff;border:none;font-size:9px;width:70px"><option>Company C</option></select></td>
+              <td style="padding:3px 5px"><input style="background:#2d2d44;color:#fff;border:none;font-size:9px;width:50px" value="18-Mar"/></td>
+              <td style="padding:3px 5px"><input style="background:#2d2d44;color:#4caf50;border:1px solid #4caf50;font-size:9px;width:35px" value="1.00"/></td>
+              <td style="padding:3px 5px;color:#7ec8e3">₹69.88</td>
+              <td style="padding:3px 5px;color:#7ec8e3">₹34,940</td>
+              <td style="padding:3px 5px;color:#ccc">₹500</td>
+              <td style="padding:3px 5px;color:#7ec8e3">₹34,440</td>
+              <td style="padding:3px 5px"><button style="background:#4caf50;color:#fff;border:none;padding:2px 5px;border-radius:2px;font-size:9px">Save</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B — Vertical Table</h3>
+      <p>All steps as rows in a table, columns are fields. Saved rows are read-only, current editing row has inline inputs. Very compact. Easy to compare steps side-by-side vertically.</p>
+    </div>
+  </div>
+
+</div>

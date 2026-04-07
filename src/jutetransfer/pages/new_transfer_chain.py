@@ -13,14 +13,18 @@ from ..queries import (
     get_company_branch_options,
     get_jute_mr_with_line_items,
     get_transfer_chain,
+    get_warehouses_by_branch,
+    get_invoice_details_by_mr_id,
 )
 from ..jute_mr_chain_helpers import (
     _group_by_mr,
     _reconstruct_chain,
     _recalculate_chain,
     _empty_transfer_step,
+    _cascade_rate,
+    _calculate_line_item_amount,
 )
-from ..transfer import save_transfer_step, TransferStep
+from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
 
 # Known Limitations:
 # 1. pct_rate_increase is back-calculated from rounded totals (rounding errors possible)
@@ -254,6 +258,33 @@ def _render_mr_table(filter_key):
             del st.session_state[f"selected_row_{filter_key}"]
 
 
+def _fetch_step_line_items(jute_mr_id: int) -> list:
+    """Fetch line items for a specific MR, joined with item_mst for quality names."""
+    from ..database import DatabaseConnection
+    df = DatabaseConnection.execute_query(
+        """
+        SELECT li.accepted_weight, li.rate, li.claim_rate, li.warehouse_id,
+               COALESCE(im.item_name, CONCAT('Item-', li.actual_item_id)) AS item_quality
+        FROM jute_mr_li li
+        LEFT JOIN item_mst im ON li.actual_item_id = im.item_id
+        WHERE li.jute_mr_id = :mr_id
+        """,
+        {"mr_id": jute_mr_id},
+    )
+    if df is None or df.empty:
+        return []
+    return [
+        {
+            "weight": float(row.get("accepted_weight", 0) or 0),
+            "original_rate": float(row.get("rate", 0) or 0),
+            "original_claim": float(row.get("claim_rate", 0) or 0),
+            "item_quality": row.get("item_quality", "Item"),
+            "warehouse_id": row.get("warehouse_id"),
+        }
+        for _, row in df.iterrows()
+    ]
+
+
 def _render_chain_editor(filter_key):
     """
     Load transfer chain for selected MR, reconstruct order, render step cards.
@@ -300,16 +331,14 @@ def _render_chain_editor(filter_key):
 
     # First time loading this MR: initialize from DB chain
     if mr_id not in transfers:
-        step0 = _empty_transfer_step()
-        step0["mr_date"] = raw_mr_date
-        transfers[mr_id] = [step0]
+        transfers[mr_id] = []
 
         # Load saved chain if exists
         chain_data = chains_map.get(mr_id)
         if chain_data is not None and not chain_data.empty:
             try:
                 chain_mrs = chain_data.to_dict("records") if hasattr(chain_data, 'to_dict') else chain_data
-                saved_chain = _reconstruct_chain(chain_mrs, selected_company_id=st.session_state["selected_company_id"])
+                saved_chain = _reconstruct_chain(chain_mrs, st.session_state["selected_company_id"])
 
                 # Populate steps from saved chain
                 prev_total = raw_total
@@ -330,38 +359,100 @@ def _render_chain_editor(filter_key):
                     else:
                         step["pct_rate_increase"] = 0.0
 
+                    # Load invoice details (LC/contract) for saved steps
+                    saved_mr_id = sc.get("jute_mr_id")
+                    if saved_mr_id:
+                        inv_details = get_invoice_details_by_mr_id(saved_mr_id)
+                        if inv_details:
+                            step["lc_reference_no"] = inv_details.get("consignment_no") or ""
+                            step["lc_date"] = inv_details.get("consignment_date")
+                            step["po_no_for_lc"] = str(inv_details.get("contract_no") or "")
+                            step["order_date_for_lc"] = inv_details.get("contract_date")
+
                     transfers[mr_id].append(step)
                     prev_total = current_total
             except Exception as e:
                 st.error(f"Error reconstructing chain: {str(e)}")
 
-        # Add blank step for editing
-        transfers[mr_id].append(_empty_transfer_step())
+        # Fetch line items for each saved step's MR (with item names)
+        step_line_items_key = f"step_line_items_{filter_key}_{mr_id}"
+        if step_line_items_key not in st.session_state:
+            step_li_map = {}
+            for idx, s in enumerate(transfers[mr_id]):
+                saved_id = s.get("saved_mr_id")
+                if saved_id:
+                    step_li = _fetch_step_line_items(saved_id)
+                    if step_li:
+                        step_li_map[idx] = step_li
+            st.session_state[step_line_items_key] = step_li_map
+
+        # Populate warehouse_id on each saved step from its line items
+        step_li_map_local = st.session_state.get(step_line_items_key, {})
+        for idx, s in enumerate(transfers[mr_id]):
+            if s.get("saved_mr_id") and not s.get("warehouse_id"):
+                li_list = step_li_map_local.get(idx, [])
+                if li_list:
+                    s["warehouse_id"] = li_list[0].get("warehouse_id")
+
+        # Add blank step for new entry
+        new_step = _empty_transfer_step()
+        new_step["mr_date"] = raw_mr_date
+        transfers[mr_id].append(new_step)
 
     steps = transfers[mr_id]
     li_data = line_items_map.get(mr_id, [])
+    step_li_map = st.session_state.get(f"step_line_items_{filter_key}_{mr_id}", {})
     orig_total = raw_total
+
+    # Ensure all step totals are up-to-date before rendering.
+    # _recalculate_chain skips saved steps (uses DB total) and fills in unsaved steps.
+    _recalculate_chain(steps, li_data, orig_total, use_new_rounding=True)
 
     # Render chain header
     st.divider()
     st.subheader(f"Transfer Chain — {row.get('Jute Gate Entry No', 'N/A')} ({row.get('Jute Supplier', 'N/A')})")
     st.write(f"**Original Total:** ₹{orig_total:,.0f}")
+    # DEBUG: show step_li_map keys and saved_mr_ids
+    _debug_saved_ids = {i: s.get("saved_mr_id") for i, s in enumerate(steps) if s.get("saved_mr_id")}
+    _debug_li_map_keys = list(step_li_map.keys())
+    st.caption(f"[DEBUG] saved_mr_ids: {_debug_saved_ids} | step_li_map keys: {_debug_li_map_keys}")
 
     # Render all steps
     for i, step in enumerate(steps):
+        if step.get("saved_mr_id") and i in step_li_map:
+            # Saved step: use its own line items (rates are authoritative)
+            step_line_items = step_li_map[i]
+            base_step_index = 0  # not used for saved steps
+            _li_source_debug = f"own MR #{step['saved_mr_id']} (in step_li_map)"
+        else:
+            # Unsaved step: use the nearest preceding saved step's line items
+            # so that displayed rates reflect the previous step's actual rates,
+            # not the original source MR rates.
+            step_line_items = li_data
+            base_step_index = 0
+            _li_source_debug = f"root MR #{mr_id} (fallback to li_data)"
+            for j in range(i - 1, -1, -1):
+                if steps[j].get("saved_mr_id") and j in step_li_map:
+                    step_line_items = step_li_map[j]
+                    base_step_index = j
+                    _li_source_debug = f"step {j+1} MR #{steps[j]['saved_mr_id']} (prev saved)"
+                    break
         _render_step_card(
             step_index=i,
             step=step,
             all_steps=steps,
-            line_items=li_data,
+            line_items=step_line_items,
             original_total_amount=orig_total,
             mr_id=mr_id,
-            filter_key=filter_key
+            filter_key=filter_key,
+            source_row=row,
+            base_step_index=base_step_index,
+            li_source_debug=_li_source_debug,
         )
 
 
 # TODO: Extract to jute_mr_page_helpers.py (shared with jute_mr.py)
-def _render_step_card(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key):
+def _render_step_card(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key, source_row=None, base_step_index=0, li_source_debug=""):
     """
     Render individual step card with company/date/% inputs, metrics, line items, and action buttons.
 
@@ -369,10 +460,14 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
     - step_index: position in chain (0 = source)
     - step: step dict
     - all_steps: full steps list (for recalculation context)
-    - line_items: original line items
+    - line_items: line items for rate display (may be from a saved predecessor)
     - original_total_amount: source MR total
     - mr_id: parent MR ID
     - filter_key: for session state
+    - source_row: source MR row (for challan_date, PO no. display)
+    - base_step_index: index of the step whose line items are being used as base
+                       (for unsaved steps following a saved step)
+    - li_source_debug: debug string showing which MR's line items are used
     """
     is_saved = "saved_mr_id" in step and step.get("saved_mr_id") is not None
     is_empty = not step.get("company")
@@ -380,6 +475,9 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
     # Card styling
     with st.container(border=True):
         st.markdown(f"### Step {step_index + 1}")
+        # DEBUG: show which MR's line items are being used for rate display
+        if li_source_debug:
+            st.caption(f"[DEBUG] Line items from: {li_source_debug}")
 
         col1, col2, col3 = st.columns([2, 1, 1])
 
@@ -389,10 +487,9 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 st.write(f"**Company:** {step['company']}")
             else:
                 co_options, _ = get_company_branch_options()
-                co_list = [co["co_id"] for co in co_options] if co_options else []
                 step["company"] = st.selectbox(
                     "Company",
-                    options=co_list if co_list else [""],
+                    options=co_options,
                     key=f"company_{mr_id}_{step_index}",
                     disabled=is_saved
                 )
@@ -416,12 +513,145 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                     disabled=is_saved
                 )
 
-        # Status badge
+        # Status badge + % rate increase
         with col3:
             if is_saved:
-                st.write("✓ **Saved**")
+                pct = step.get("pct_rate_increase", 0)
+                if pct and abs(pct) > 0.001:
+                    st.write(f"✓ **Saved** — ↑ {pct:.2f}%")
+                else:
+                    st.write("✓ **Saved**")
             else:
                 st.write("● **Editing**")
+
+        # Row A: Challan Date, PO No., Warehouse, Transport toggle
+        col_ch, col_po, col_wh, col_tr = st.columns(4)
+
+        with col_ch:
+            challan_dt = source_row.get("Challan Date") if source_row is not None else None
+            if challan_dt is not None and not (isinstance(challan_dt, float) and pd.isna(challan_dt)):
+                st.write(f"**Challan Date:** {challan_dt}")
+            else:
+                st.write("**Challan Date:** —")
+
+        with col_po:
+            po_no = source_row.get("PO.No.") if source_row is not None else None
+            if po_no is not None and not (isinstance(po_no, float) and pd.isna(po_no)):
+                st.write(f"**PO No.:** {po_no}")
+            else:
+                st.write("**PO No.:** —")
+
+        with col_wh:
+            if is_saved:
+                # Display warehouse name for saved steps (look up from warehouse_id)
+                wh_id = step.get("warehouse_id")
+                if wh_id:
+                    # Resolve company label to branch_id for warehouse lookup
+                    _, co_branch_mapping = get_company_branch_options()
+                    company_label = step.get("company", "")
+                    if company_label in co_branch_mapping:
+                        _, step_branch_id = co_branch_mapping[company_label]
+                        warehouses = get_warehouses_by_branch(step_branch_id)
+                        wh_name = next((n for n, wid in warehouses.items() if wid == wh_id), str(wh_id))
+                        st.write(f"**Warehouse:** {wh_name}")
+                    else:
+                        st.write(f"**Warehouse:** ID {wh_id}")
+                else:
+                    st.write("**Warehouse:** —")
+            else:
+                # Editable warehouse selectbox (same pattern as jute_mr_editor.py:327-349)
+                company_label = step.get("company", "")
+                _, co_branch_mapping = get_company_branch_options()
+                if company_label and company_label in co_branch_mapping:
+                    _, step_branch_id = co_branch_mapping[company_label]
+                    warehouses = get_warehouses_by_branch(step_branch_id)
+                    wh_names = [""] + list(warehouses.keys()) if warehouses else [""]
+                    current_wh_id = step.get("warehouse_id")
+                    current_wh_name = ""
+                    if warehouses:
+                        for wn, wid in warehouses.items():
+                            if wid == current_wh_id:
+                                current_wh_name = wn
+                                break
+                    wh_index = wh_names.index(current_wh_name) if current_wh_name in wh_names else 0
+                    new_wh = st.selectbox(
+                        "Warehouse",
+                        options=wh_names,
+                        index=wh_index,
+                        key=f"wh_{mr_id}_{step_index}",
+                    )
+                    if new_wh and warehouses and new_wh in warehouses:
+                        step["warehouse_id"] = warehouses[new_wh]
+                else:
+                    st.write("**Warehouse:** —")
+
+        with col_tr:
+            if is_saved:
+                st.write("**Transport:** Copied" if step.get("transfer_transport", True) else "**Transport:** Hand cart")
+            else:
+                transport_key = f"transport_{mr_id}_{step_index}"
+                step["transfer_transport"] = st.checkbox(
+                    "Transfer transport details",
+                    value=step.get("transfer_transport", True),
+                    key=transport_key,
+                )
+
+        # Row B: LC/Contract inputs (step 2+ only, since step 0 has no invoice)
+        if step_index > 0:
+            if is_saved:
+                # Display read-only LC/contract values
+                lc_ref = step.get("lc_reference_no", "")
+                lc_dt = step.get("lc_date")
+                po_lc = step.get("po_no_for_lc", "")
+                od_lc = step.get("order_date_for_lc")
+                col_lc1, col_lc2, col_lc3, col_lc4 = st.columns(4)
+                with col_lc1:
+                    st.write(f"**LC Ref No.:** {lc_ref or '—'}")
+                with col_lc2:
+                    st.write(f"**LC Date:** {lc_dt or '—'}")
+                with col_lc3:
+                    st.write(f"**PO No. (LC):** {po_lc or '—'}")
+                with col_lc4:
+                    st.write(f"**Order Date (LC):** {od_lc or '—'}")
+            elif step.get("company"):
+                # Editable LC/contract inputs
+                col_lc1, col_lc2, col_lc3, col_lc4 = st.columns(4)
+                with col_lc1:
+                    step["lc_reference_no"] = st.text_input(
+                        "LC Reference No.",
+                        value=step.get("lc_reference_no", ""),
+                        key=f"lc_ref_{mr_id}_{step_index}",
+                    )
+                with col_lc2:
+                    lc_date_val = step.get("lc_date")
+                    if isinstance(lc_date_val, str):
+                        try:
+                            lc_date_val = datetime.strptime(lc_date_val, "%Y-%m-%d").date()
+                        except:
+                            lc_date_val = None
+                    step["lc_date"] = st.date_input(
+                        "LC Date",
+                        value=lc_date_val,
+                        key=f"lc_date_{mr_id}_{step_index}",
+                    )
+                with col_lc3:
+                    step["po_no_for_lc"] = st.text_input(
+                        "PO No. for LC",
+                        value=step.get("po_no_for_lc", ""),
+                        key=f"po_lc_{mr_id}_{step_index}",
+                    )
+                with col_lc4:
+                    od_val = step.get("order_date_for_lc")
+                    if isinstance(od_val, str):
+                        try:
+                            od_val = datetime.strptime(od_val, "%Y-%m-%d").date()
+                        except:
+                            od_val = None
+                    step["order_date_for_lc"] = st.date_input(
+                        "Order Date for LC",
+                        value=od_val,
+                        key=f"od_lc_{mr_id}_{step_index}",
+                    )
 
         # % Rate Increase input (for step 2+, unsaved only)
         if step_index > 0 and not is_saved and step.get("company"):
@@ -435,7 +665,7 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                     "% Rate Increase",
                     value=st.session_state[pct_key],
                     step=0.01,
-                    min_value=0.0,
+                    min_value=-100.0,
                     max_value=100.0,
                     key=f"pct_input_{mr_id}_{step_index}"
                 )
@@ -446,24 +676,60 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                     st.session_state[pct_key] = new_pct
 
                     # Recalculate chain downstream
-                    _recalculate_chain(all_steps, line_items, original_total_amount)
+                    _recalculate_chain(all_steps, line_items, original_total_amount, use_new_rounding=True)
                     st.rerun()
 
-        # Summary metrics
-        rate = step.get("mr_rate", 0)
+        # Summary metrics — use step dict values (from _recalculate_chain for unsaved,
+        # from DB header for saved). Recomputing from per-item rates diverges due to
+        # intermediate rounding at each step.
         total = step.get("total_amount", 0)
         claim = step.get("claim_amount", 0)
         net = step.get("net_amount", 0)
 
         st.markdown(f"""
-        **Rate:** ₹{rate:.2f} | **Total:** ₹{total:,.0f} | **Claim:** ₹{claim:,.0f} | **Net:** ₹{net:,.0f}
+        **Total:** ₹{total:,.0f} | **Claim:** ₹{claim:,.0f} | **Net:** ₹{net:,.0f}
         """)
 
-        # Line items table
-        _render_step_line_items(step_index, line_items, all_steps)
+        # Line items table — saved steps with own line items use rates directly
+        _render_step_line_items(step_index, line_items, all_steps, is_saved=is_saved, base_step_index=base_step_index)
 
-        # Action buttons (only for unsaved steps with company set)
-        if not is_saved and step.get("company"):
+        # Action buttons
+        if is_saved:
+            # Saved steps: offer "Delete from here" (deletes this step and all subsequent)
+            if st.button(
+                f"Delete from Step {step_index + 1} onward",
+                key=f"delete_saved_{mr_id}_{step_index}",
+            ):
+                saved_mr_id = step.get("saved_mr_id")
+                if saved_mr_id:
+                    with st.spinner("Deleting steps and refreshing..."):
+                        try:
+                            delete_chain_from_step(
+                                root_mr_id=mr_id,
+                                from_mr_id=saved_mr_id,
+                                source_mr=None,
+                                updated_by=st.session_state.get("user_id", 1),
+                            )
+                            st.success(f"Deleted steps from step {step_index + 1} onward.")
+                            for key in [
+                                f"transfers_{filter_key}",
+                                f"source_df_{filter_key}",
+                                f"line_items_{filter_key}",
+                                f"selected_row_{filter_key}",
+                                f"raw_df_{filter_key}",
+                                f"chains_map_{filter_key}",
+                                f"step_line_items_{filter_key}_{mr_id}",
+                            ]:
+                                if key in st.session_state:
+                                    del st.session_state[key]
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
+                else:
+                    st.error("Could not find saved MR ID for this step.")
+
+        elif step.get("company"):
+            # Unsaved steps with company set: save, clear, or remove
             col_save, col_clear, col_delete = st.columns(3)
 
             with col_save:
@@ -484,21 +750,25 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
 
 
 # TODO: Extract to jute_mr_page_helpers.py (shared with jute_mr.py)
-def _render_step_line_items(step_index, line_items, all_steps):
-    """Render line items table showing original items with calculated amounts for this step.
+def _render_step_line_items(step_index, line_items, all_steps, is_saved=False, base_step_index=0):
+    """Render line items table showing items with rates for this step.
 
     Args:
         step_index: Position in chain (0 = source, 1+ = transfer steps)
-        line_items: List of original line items, each with:
-                    - weight (float): item weight in KG
-                    - original_rate (float): original rate per quintal
-                    - item_quality (str): item quality/description
+        line_items: Line items for this step. For saved steps these come from
+                    that step's own jute_mr_li (rates are the purchase price).
+                    For unsaved steps these come from the nearest preceding
+                    saved step (or source MR if no saved predecessor).
         all_steps: Full chain for cumulative multiplier calculation
+        is_saved: True when line_items come from this step's own MR (use rates directly)
+        base_step_index: Index of the step whose line items are being used as
+                         base rates. The cumulative multiplier only accumulates
+                         from steps AFTER this index.
 
     Display logic:
-        - Source step (0): amount = weight × original_rate / 100
-        - Transfer steps (1+): amount = weight × original_rate × cumulative_multiplier / 100
-        - Cumulative multiplier is product of all (1 + pct/100) from steps 1 to current
+        - Saved steps or source step (0): amount = weight × rate / 100 (rate used as-is)
+        - Unsaved transfer steps (1+): amount = weight × base_rate × multiplier / 100
+          where multiplier only includes pcts from (base_step_index+1) to step_index
     """
     if not line_items:
         st.write("*(No line items)*")
@@ -508,50 +778,68 @@ def _render_step_line_items(step_index, line_items, all_steps):
     rows = []
     total_amount = 0.0
 
+    def _is_missing(v):
+        """True for None or NaN."""
+        return v is None or (isinstance(v, float) and v != v)
+
     for li in line_items:
         try:
-            weight = float(li.get("weight", 0) or 0)
-            orig_rate = float(li.get("original_rate", 0) or 0)
+            raw_weight = li.get("weight")
+            raw_rate = li.get("original_rate")
             quality = li.get("item_quality", "Item")
 
-            # Calculate amount for this step using cumulative multiplier
-            if step_index == 0:
-                # Source step: just weight × original rate / 100 (convert per quintal to per kg)
-                amount = weight * orig_rate / 100
+            weight_missing = _is_missing(raw_weight)
+            rate_missing = _is_missing(raw_rate)
+
+            # Coerce to numbers for math (None/NaN -> 0)
+            weight = 0.0 if weight_missing else round(float(raw_weight), 0)
+            orig_rate = 0.0 if rate_missing else float(raw_rate)
+
+            # Use shared _cascade_rate for round-then-cascade consistency
+            if is_saved or step_index == 0:
+                effective_rate = orig_rate
             else:
-                # Transfer step: apply cumulative % increases from step 1 to current step
-                multiplier = 1.0
-                for i in range(1, step_index + 1):
+                # Build a sub-chain from base_step_index to step_index
+                # _cascade_rate expects steps[1..up_to_index] to have pct_rate_increase
+                sub_steps = [{}]  # dummy step 0
+                start = max(1, base_step_index + 1)
+                for i in range(start, step_index + 1):
                     if i < len(all_steps):
-                        pct = float(all_steps[i].get("pct_rate_increase", 0) or 0)
-                        multiplier *= (1.0 + pct / 100.0)
+                        sub_steps.append(all_steps[i])
+                effective_rate = _cascade_rate(orig_rate, sub_steps, len(sub_steps) - 1)
 
-                # Amount = weight × original_rate × multiplier / 100
-                amount = weight * orig_rate * multiplier / 100
+            # Calculate amount (only meaningful when both weight and rate are present)
+            amount_known = not (weight_missing or rate_missing)
+            amount = _calculate_line_item_amount(weight, effective_rate) if amount_known else 0.0
 
+            warehouse_name = li.get("warehouse_name") or li.get("Warehouse") or "—"
             rows.append({
                 "Quality": quality,
-                "Weight (KG)": int(weight),
-                "Original Rate (per quintal)": f"₹{orig_rate:.2f}",
-                "Amount": f"₹{amount:,.0f}"
+                "Weight (KG)": "—" if weight_missing else int(weight),
+                "Warehouse": warehouse_name,
+                "Rate (per quintal)": "—" if rate_missing else f"₹{effective_rate:,.0f}",
+                "Amount": "—" if not amount_known else f"₹{amount:,.2f}",
             })
-            total_amount += amount
+            if amount_known:
+                total_amount += amount
 
         except (ValueError, TypeError) as e:
             st.warning(f"Error processing line item: {str(e)}")
             continue
 
-    # Add total row
-    try:
-        total_weight = sum(int(float(li.get("weight", 0) or 0)) for li in line_items)
-    except (ValueError, TypeError):
-        total_weight = 0
+    # Add total row (skip missing weights so '—' rows don't poison the sum)
+    valid_weights = [
+        int(float(li.get("weight"))) for li in line_items
+        if not _is_missing(li.get("weight"))
+    ]
+    total_weight = sum(valid_weights) if valid_weights else 0
 
     rows.append({
         "Quality": "**TOTAL**",
-        "Weight (KG)": total_weight,
-        "Original Rate (per quintal)": "—",
-        "Amount": f"**₹{total_amount:,.0f}**"
+        "Weight (KG)": total_weight if valid_weights else "—",
+        "Warehouse": "—",
+        "Rate (per quintal)": "—",
+        "Amount": f"**₹{total_amount:,.2f}**" if total_amount > 0 else "—",
     })
 
     # Display table
@@ -604,12 +892,18 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
         source_co_id = st.session_state.get("selected_company_id", 1)
         source_branch_id = st.session_state.get("selected_branch_id", 1)
 
-        # Calculate cumulative rate multiplier from step 1 to current step
-        rate_multiplier = 1.0
-        for i in range(1, step_index + 1):
-            if i < len(all_steps):
-                pct = float(all_steps[i].get("pct_rate_increase", 0) or 0)
-                rate_multiplier *= (1.0 + pct / 100.0)
+        # Single-step rate multiplier: only this step's pct increase.
+        # The source MR (set below) already has the previous step's rates baked in.
+        pct_rate = float(step.get("pct_rate_increase", 0) or 0)
+        rate_multiplier = 1.0 + pct_rate / 100.0
+
+        # Use previous step's saved MR as rate base (matches display path).
+        # For step 0, use root MR (no previous step).
+        effective_source_mr_id = mr_id
+        if step_index > 0:
+            prev_saved_id = all_steps[step_index - 1].get("saved_mr_id")
+            if prev_saved_id:
+                effective_source_mr_id = prev_saved_id
 
         # Parse step values
         pct_rate = float(step.get("pct_rate_increase", 0) or 0)
@@ -629,16 +923,30 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             total_amount=total_amt,
             claim_amount=claim_amt,
             net_amount=net_amt,
-            warehouse_id=None,
+            warehouse_id=step.get("warehouse_id"),
             mr_no=0,  # Assigned inside save_transfer_step transaction
+            lc_reference_no=step.get("lc_reference_no", ""),
+            lc_date=step.get("lc_date"),
+            po_no_for_lc=step.get("po_no_for_lc", ""),
+            order_date_for_lc=step.get("order_date_for_lc"),
+            transfer_transport=step.get("transfer_transport", True),
         )
 
         # Determine if this is the final step (returns to source company)
         is_final = (step_co_id == source_co_id and step_branch_id == source_branch_id)
 
+        # Debug log to file (Streamlit swallows stdout)
+        import os
+        _log_path = os.path.join(os.path.dirname(__file__), "..", "..", "debug_transfer.log")
+        with open(_log_path, "a") as _f:
+            _f.write(f"[{datetime.now().isoformat()}] _save_step: step_index={step_index}, "
+                     f"step_co_id={step_co_id}, step_branch_id={step_branch_id}, "
+                     f"source_co_id={source_co_id}, source_branch_id={source_branch_id}, "
+                     f"is_final={is_final}, is_first_step={step_index == 0}\n")
+
         # Call save_transfer_step from transfer.py
         result = save_transfer_step(
-            source_mr_id=mr_id,
+            source_mr_id=effective_source_mr_id,
             step=transfer_step,
             prev_co_id=prev_co_id,
             prev_branch_id=prev_branch_id,
@@ -649,6 +957,8 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             rate_multiplier=rate_multiplier,
             is_first_step=(step_index == 0),
             is_final=is_final,
+            original_source_mr_id=mr_id,
+            use_new_rounding=True,
         )
 
         # Clear cache to force reload on next render
@@ -658,6 +968,7 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             f"line_items_{filter_key}",
             f"transfers_{filter_key}",
             f"chains_map_{filter_key}",
+            f"step_line_items_{filter_key}_{mr_id}",
         ]
         for key in cache_keys_to_clear:
             if key in st.session_state:

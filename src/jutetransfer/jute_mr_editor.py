@@ -130,7 +130,7 @@ def _render_step_calculation_chart(
                 "Item": item_name,
                 "Qty (KG)": round(qty, 2),
                 "Old Rate (per quintal)": old_rate,
-                "% Increase": f"{pct_increase:.2f}%",
+                "% Change": f"{pct_increase:.2f}%",
                 "New Rate (per quintal)": new_rate,
                 "Amount": amount,
             })
@@ -143,7 +143,7 @@ def _render_step_calculation_chart(
             "Item": "TOTAL",
             "Qty (KG)": round(total_qty, 2),
             "Old Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
-            "% Increase": CALCULATION_CHART_TOTALS_PLACEHOLDER,
+            "% Change": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "New Rate (per quintal)": CALCULATION_CHART_TOTALS_PLACEHOLDER,
             "Amount": round(total_amount, 2),
         })
@@ -205,6 +205,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
             saved_step["company"] = label
             saved_step["mr_no"] = sc.get("branch_mr_no")
             saved_step["mr_date"] = sc.get("jute_mr_date")
+            saved_step["challan_date"] = sc.get("challan_date")
             current_total = float(sc.get("total_amount") or 0)
             saved_step["total_amount"] = current_total
             saved_step["claim_amount"] = float(sc.get("claim_amount") or 0)
@@ -264,6 +265,8 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                               key=f"co_{filter_key}_{mr_id}_{i}")
                 st.text_input("MR Date", value=str(step.get("mr_date") or "-"), disabled=True,
                               key=f"date_{filter_key}_{mr_id}_{i}")
+                st.text_input("Challan Date", value=str(step.get("challan_date") or "-"), disabled=True,
+                              key=f"challan_date_{filter_key}_{mr_id}_{i}")
                 mr_no = step.get("mr_no")
                 st.text_input("MR No", value=str(mr_no or "-"), disabled=True,
                               key=f"mrno_{filter_key}_{mr_id}_{i}")
@@ -324,6 +327,34 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                     step["mr_date"] = new_date
                     changed = True
 
+                # Challan Date — defaults to previous step's MR date (or source MR date for step 1)
+                current_challan = step.get("challan_date")
+                if current_challan and isinstance(current_challan, (date, datetime)):
+                    default_challan = current_challan if isinstance(current_challan, date) else current_challan.date()
+                else:
+                    # Default: previous step's mr_date, or source MR date for step 1
+                    if i > 0:
+                        prev_mr_date = steps[i - 1].get("mr_date")
+                        if prev_mr_date and isinstance(prev_mr_date, (date, datetime)):
+                            default_challan = prev_mr_date if isinstance(prev_mr_date, date) else prev_mr_date.date()
+                        else:
+                            default_challan = new_date
+                    else:
+                        # Step 1: use source MR date from the row
+                        src_mr_date = row.get("MR DATE")
+                        if src_mr_date and isinstance(src_mr_date, (date, datetime)):
+                            default_challan = src_mr_date if isinstance(src_mr_date, date) else src_mr_date.date()
+                        else:
+                            default_challan = new_date
+                new_challan = st.date_input(
+                    "Challan Date",
+                    value=default_challan,
+                    key=f"challan_date_{filter_key}_{mr_id}_{i}",
+                )
+                if new_challan != current_challan:
+                    step["challan_date"] = new_challan
+                    changed = True
+
                 # Warehouse selector
                 if new_co and new_co in co_branch_mapping:
                     _, step_branch_id = co_branch_mapping[new_co]
@@ -357,7 +388,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                     if new_co:
                         st.warning(f"⚠️ Company-branch mapping issue for '{new_co}'")
 
-                # % Rate Increase (step 2+) — ENTER-KEY SUBMISSION REQUIRED
+                # % Rate Change (step 2+) — ENTER-KEY SUBMISSION REQUIRED
                 if i >= 1:
                     pct_key = f"pct_{filter_key}_{mr_id}_{i}"
                     pct_submitted_key = f"pct_submitted_{filter_key}_{mr_id}_{i}"
@@ -379,12 +410,12 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                             st.session_state[pct_submitted_key] = False
 
                     st.text_input(
-                        "% Rate Increase",
+                        "% Rate Change",
                         value=st.session_state[pct_key],
                         key=pct_key,
                         on_change=on_pct_enter,
-                        help="Enter value and press Enter to apply",
-                        placeholder="0.00",
+                        help="Enter positive for increase, negative for decrease (e.g. -5.00). Press Enter to apply.",
+                        placeholder="e.g. 5.00 or -3.50",
                     )
 
                     # Process if submitted via Enter/focus-loss
@@ -405,7 +436,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                             st.error(f"Invalid percentage in Step {i + 1}")
                             st.session_state[pct_submitted_key] = False
                     else:
-                        st.caption("⚠️ Press Enter to apply % Rate Increase")
+                        st.caption("⚠️ Press Enter to apply % Rate Change")
 
                 # Calculated fields (read-only display)
                 if step.get("company"):
@@ -514,7 +545,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
             save_btn = st.button(f"Save Step {step_idx + 1}", key=f"save_step_{filter_key}_{mr_id}",
                                  type="primary", disabled=not all_pct_submitted)
             if not all_pct_submitted and step_idx >= 1:
-                st.caption("⚠️ Confirm % Rate Increase (press Enter) before saving")
+                st.caption("⚠️ Confirm % Rate Change (press Enter) before saving")
 
             if save_btn:
                 with st.spinner("Saving transfer step..."):
@@ -559,11 +590,17 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                                 step_to_save["total_amount"] = round(calculated_total, 0)
                                 step_to_save["net_amount"] = round(calculated_total - float(step_to_save.get("claim_amount", 0)), 0)
 
-                                # Derive cumulative_multiplier from the calculated total (same as chart)
-                                if orig_total > 0:
-                                    cumulative_multiplier = calculated_total / orig_total
-                                else:
-                                    cumulative_multiplier = 1.0
+                                # Single-step multiplier: only this step's pct.
+                                # The source MR (prev step) already has correct rates.
+                                pct_rate = float(step_to_save.get("pct_rate_increase", 0) or 0)
+                                single_step_multiplier = 1.0 + pct_rate / 100.0
+
+                                # Use previous step's saved MR as rate base
+                                effective_source_mr_id = mr_id
+                                if step_idx > 0:
+                                    prev_saved_id = steps[step_idx - 1].get("saved_mr_id")
+                                    if prev_saved_id:
+                                        effective_source_mr_id = prev_saved_id
 
                                 # Determine prev company
                                 if step_idx == 0:
@@ -581,7 +618,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                                 is_final = (co_label == source_co_branch)
 
                                 result = save_transfer_step(
-                                    source_mr_id=mr_id,
+                                    source_mr_id=effective_source_mr_id,
                                     step=TransferStep(
                                         co_id=co_id,
                                         branch_id=branch_id,
@@ -591,8 +628,9 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                                         claim_amount=float(step_to_save.get("claim_amount", 0)),
                                         net_amount=float(step_to_save.get("net_amount", 0)),
                                         mr_no=0,
-                                        pct_rate_increase=float(step_to_save.get("pct_rate_increase", 0) or 0),
+                                        pct_rate_increase=pct_rate,
                                         roundoff=float(step_to_save.get("roundoff", 0) or 0),
+                                        challan_date=step_to_save.get("challan_date"),
                                         warehouse_id=step_to_save.get("warehouse_id"),
                                     ),
                                     prev_co_id=prev_co_id,
@@ -601,9 +639,10 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                                     source_branch_id=selected_branch_id,
                                     root_mr_id=mr_id,
                                     updated_by=1,
-                                    rate_multiplier=cumulative_multiplier,
+                                    rate_multiplier=single_step_multiplier,
                                     is_first_step=(step_idx == 0),
                                     is_final=is_final,
+                                    original_source_mr_id=mr_id,
                                 )
 
                                 if is_final:
