@@ -924,7 +924,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         unit_conv = li.get("unit_conversion") or ""
         remarks = f"Raw Jute - {actual_qty} {unit_conv}".strip()
 
-        conn.execute(text("""
+        invoice_dtl_id = DatabaseConnection.execute_insert_returning_id(conn, """
             INSERT INTO sales_invoice_dtl (
                 invoice_id, item_id, hsn_code, quantity, sales_weight,
                 uom_id, rate, amount_without_tax, total_amount, remarks
@@ -932,7 +932,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
                 :invoice_id, :item_id, :hsn_code, :quantity, :weight,
                 :uom_id, :rate, :amount, :amount, :remarks
             )
-        """), {
+        """, {
             "invoice_id": invoice_id,
             "item_id": target_item_id,
             "hsn_code": None,
@@ -942,6 +942,39 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
             "rate": rate_in_kg,
             "amount": amount,
             "remarks": remarks,
+        })
+
+        # Persist per-line claim breakdown into sales_invoice_jute_dtl.
+        # Formula matches get_jute_mr_with_line_items SQL (queries.py:189) so the
+        # editor display and the saved invoice rows always agree.
+        # Claim does NOT scale by rate_multiplier — it copies forward unchanged.
+        li_claim_rate = float(li.get("claim_rate") or 0)
+        li_water_damage = float(li.get("water_damage_amount") or 0)
+        li_premium = float(li.get("premium_amount") or 0)
+        claim_amount_dtl = round(
+            (accepted_weight * li_claim_rate / 100.0) + li_water_damage - li_premium,
+            2,
+        )
+        try:
+            qty_unit_conv = int(float(li.get("actual_qty") or 0))
+        except (TypeError, ValueError):
+            qty_unit_conv = 0
+
+        conn.execute(text("""
+            INSERT INTO sales_invoice_jute_dtl (
+                invoice_line_item_id, claim_desc, claim_rate,
+                claim_amount_dtl, unit_conversion, qty_untit_conversion
+            ) VALUES (
+                :invoice_line_item_id, :claim_desc, :claim_rate,
+                :claim_amount_dtl, :unit_conversion, :qty_untit_conversion
+            )
+        """), {
+            "invoice_line_item_id": invoice_dtl_id,
+            "claim_desc": li.get("claim_quality"),
+            "claim_rate": li_claim_rate,
+            "claim_amount_dtl": claim_amount_dtl,
+            "unit_conversion": li.get("unit_conversion"),
+            "qty_untit_conversion": qty_unit_conv,
         })
 
     # Jute-specific invoice data
