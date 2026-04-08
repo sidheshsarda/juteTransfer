@@ -1302,6 +1302,9 @@ def save_transfer_step(
             party_id, party_branch_id = _ensure_supplier_party(
                 conn, source_mr, step.co_id, updated_by
             )
+            # No seller_invoice: first-step is a supplier delivery, not a
+            # company-to-company sale — no inbound sales_invoice exists yet,
+            # so invoice_no/invoice_date/invoice_amount remain NULL on this MR.
             mr_id = _create_mr(
                 conn, source_mr, step, party_id, party_branch_id,
                 updated_by, rate_multiplier, prev_co_id, root_mr_id,
