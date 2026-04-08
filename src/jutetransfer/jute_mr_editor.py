@@ -225,7 +225,11 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
     # Determine if the source MR has been finalized (returned to origin).
     # When finalized, the return-to-origin step is NOT a separate jute_mr row —
     # it's the in-place updated source MR. We must always know this state.
-    is_finalized = row.get("EJM MR No.") is not None
+    # NOTE: pandas surfaces NULL Integer columns as NaN; `NaN is not None` is
+    # True, so guard with pd.notna to avoid false-positive finalization on
+    # fresh MRs.
+    _raw_ejm = row.get("EJM MR No.")
+    is_finalized = pd.notna(_raw_ejm) and bool(_raw_ejm)
     if is_finalized:
         # Parse "CoPrefix-BranchName" from source_co_branch
         if source_co_branch and "-" in source_co_branch:

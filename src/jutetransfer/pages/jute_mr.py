@@ -1,6 +1,7 @@
 """Jute MR Table page for JuteTransfer application."""
 
 import streamlit as st
+import pandas as pd
 from datetime import datetime
 
 from ..queries import (
@@ -172,7 +173,11 @@ def jute_mr_table_page():
             if chain_df is not None and not chain_df.empty:
                 chain_cos = chain_df["co_prefix"].tolist()
                 chain_summaries.append(" -> ".join(chain_cos))
-                has_mr_no = srow.get("EJM MR No.") is not None
+                # pandas surfaces NULL Integer columns as NaN; `NaN is not None`
+                # is True, so guard with pd.notna to avoid mislabeling fresh /
+                # in-progress MRs as "Complete".
+                _raw_ejm = srow.get("EJM MR No.")
+                has_mr_no = pd.notna(_raw_ejm) and bool(_raw_ejm)
                 chain_statuses.append("Complete" if has_mr_no else f"{len(chain_cos)} step(s)")
             else:
                 steps = transfers.get(mid, [])

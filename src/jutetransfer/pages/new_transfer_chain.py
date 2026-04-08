@@ -333,7 +333,10 @@ def _render_chain_editor(filter_key):
     # return-to-origin step is the in-place updated source MR — there is no
     # separate jute_mr row for it, so we synthesize one. Always initialize this
     # so downstream code can rely on it.
-    is_finalized = bool(row.get("EJM MR No."))
+    # NOTE: `branch_mr_no` is an Integer column; pandas surfaces DB NULL as
+    # float('nan'), and bool(NaN) is True in Python — hence the pd.notna guard.
+    _raw_ejm = row.get("EJM MR No.")
+    is_finalized = pd.notna(_raw_ejm) and bool(_raw_ejm)
 
     # First time loading this MR: initialize from DB chain
     if mr_id not in transfers:
