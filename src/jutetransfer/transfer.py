@@ -803,7 +803,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
                            buyer_party_id: int, buyer_party_branch_id: Optional[int],
                            mr_id: int, source_mr: dict,
                            updated_by: int, rate_multiplier: float,
-                           use_new_rounding: bool = False) -> tuple[int, date, str]:
+                           use_new_rounding: bool = False) -> dict:
     """Create a sales invoice from the seller to the buyer.
 
     Inserts into sales_invoice, sales_invoice_dtl, and sales_invoice_jute.
@@ -811,7 +811,13 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
     When use_new_rounding=True, rounds rates at kg level (2 decimals),
     line item amounts to 2 decimals, and uses roundoff instead of largest-item adjustment.
 
-    Returns tuple of (invoice_id, challan_date, challan_no).
+    Returns dict with keys:
+        invoice_id (int): Newly created sales_invoice.invoice_id
+        invoice_no (int): Sequential invoice number for the seller's branch in the FY
+        invoice_date (date): Invoice date (= seller_step.mr_date)
+        invoice_amount (float): Header invoice amount
+        challan_date (date): Challan date (= seller_step.mr_date)
+        challan_no (str): Generated challan number
     """
     invoice_no = _get_next_invoice_no(conn, seller_step.branch_id)
     challan_no = _get_next_challan_no(conn, seller_step.branch_id, seller_step.mr_date)
@@ -995,7 +1001,14 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         "unit_conversion": source_mr.get("unit_conversion"),
     })
 
-    return invoice_id, seller_step.mr_date, challan_no
+    return {
+        "invoice_id": invoice_id,
+        "invoice_no": invoice_no,            # int (BigInteger from sales_invoice)
+        "invoice_date": seller_step.mr_date, # date
+        "invoice_amount": invoice_amount,    # float
+        "challan_date": seller_step.mr_date,
+        "challan_no": challan_no,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1311,12 +1324,15 @@ def save_transfer_step(
             prev_mr_row = prev_mr_result.fetchone()
             prev_mr_id = prev_mr_row[0] if prev_mr_row else source_mr_id
 
-            invoice_id, inv_challan_date, inv_challan_no = _create_sales_invoice(
+            seller_invoice = _create_sales_invoice(
                 conn, prev_step_for_invoice, buyer_party_id,
                 buyer_party_branch_id, prev_mr_id, source_mr,
                 updated_by, rate_multiplier,
                 use_new_rounding=use_new_rounding,
             )
+            invoice_id = seller_invoice["invoice_id"]
+            inv_challan_date = seller_invoice["challan_date"]
+            inv_challan_no = seller_invoice["challan_no"]
 
             if is_final:
                 # Final step: update original MR, don't create new MR.
