@@ -555,6 +555,7 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
                prev_co_id: int, root_mr_id: int,
                challan_date: Optional[date] = None,
                challan_no: Optional[str] = None,
+               seller_invoice: Optional[dict] = None,
                use_new_rounding: bool = False) -> int:
     """Create a new jute_mr + jute_mr_li records for a transfer step.
 
@@ -563,6 +564,11 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
 
     When use_new_rounding=True, rounds rates at kg level (2 decimals) then *100,
     and rounds line item amounts to 2 decimals (no largest-item adjustment).
+
+    If seller_invoice is provided (intermediate buyer step), writes
+    invoice_no/invoice_date/invoice_amount onto the new MR row from the
+    just-created sales_invoice. When None (first-step / supplier delivery),
+    those columns are written as NULL.
 
     Returns the new jute_mr_id.
     """
@@ -585,7 +591,8 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
             updated_by, updated_date_time, po_id, branch_id, party_id,
             party_branch_id, jute_supplier_id, src_com_id,
             total_amount, claim_amount, roundoff, net_total, tds_amount,
-            src_jute_mr_id, bill_pass_no, bill_pass_date
+            src_jute_mr_id, bill_pass_no, bill_pass_date,
+            invoice_no, invoice_date, invoice_amount
         ) VALUES (
             :gate_entry_no, :branch_mr_no, :gate_entry_date,
             :mr_date, :challan_date, :challan_no, :challan_weight,
@@ -596,7 +603,8 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
             :updated_by, NOW(), :po_id, :branch_id, :party_id,
             :party_branch_id, :jute_supplier_id, :src_com_id,
             :total_amount, :claim_amount, :roundoff, :net_total, :tds_amount,
-            :src_jute_mr_id, :bill_pass_no, :bill_pass_date
+            :src_jute_mr_id, :bill_pass_no, :bill_pass_date,
+            :invoice_no, :invoice_date, :invoice_amount
         )
     """, {
         "gate_entry_no": _get_next_gate_entry_no(conn, step.branch_id),
@@ -640,6 +648,9 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
         "src_jute_mr_id": root_mr_id,  # always root
         "bill_pass_no": new_bill_pass_no,
         "bill_pass_date": step.mr_date,
+        "invoice_no": str(seller_invoice["invoice_no"]) if seller_invoice else None,
+        "invoice_date": seller_invoice["invoice_date"] if seller_invoice else None,
+        "invoice_amount": seller_invoice["invoice_amount"] if seller_invoice else None,
     })
 
     # Copy line items with per-item rate via rate_multiplier.
@@ -1380,6 +1391,7 @@ def save_transfer_step(
                     updated_by, rate_multiplier, prev_co_id, root_mr_id,
                     challan_date=step.challan_date or inv_challan_date,
                     challan_no=inv_challan_no,
+                    seller_invoice=seller_invoice,
                     use_new_rounding=use_new_rounding,
                 )
 
