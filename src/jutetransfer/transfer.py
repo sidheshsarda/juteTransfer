@@ -1034,7 +1034,8 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
                          rate_source_line_items: Optional[list] = None,
                          use_new_rounding: bool = False,
                          challan_no: Optional[str] = None,
-                         challan_date: Optional[date] = None) -> None:
+                         challan_date: Optional[date] = None,
+                         seller_invoice: Optional[dict] = None) -> None:
     """Update the original MR with final rate/party and assign branch_mr_no.
 
     Args:
@@ -1048,6 +1049,11 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             the previous hop's sales invoice). If None, column is left alone.
         challan_date: If provided, set on the source MR. If None, column is
             left alone. mukam_id is never touched.
+        seller_invoice: Dict from _create_sales_invoice (the last-hop invoice
+            for the final step). When provided, invoice_no/invoice_date/
+            invoice_amount on the root MR are set from these values
+            (via the same conditional SQL machinery as challan_no/challan_date).
+            When None, those columns are left untouched.
     """
     # Ensure the final party has correct party types before updating MR
     _ensure_party_types(conn, final_party_id, updated_by)
@@ -1106,9 +1112,10 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
         """), {"rate": d["new_rate"], "total_price": d["total_price"], "li_id": d["li_id"]})
 
     # Recompute header totals from line items; assign bill_pass_no and bill_pass_date.
-    # challan_no / challan_date are only written when the caller passes them —
-    # this keeps the "mukam_id untouched" and "leave columns alone when None"
-    # invariants explicit. mukam_id is never in this UPDATE.
+    # challan_no / challan_date / invoice_no / invoice_date / invoice_amount are
+    # only written when the caller passes them — this keeps the "mukam_id
+    # untouched" and "leave columns alone when None" invariants explicit.
+    # mukam_id is never in this UPDATE.
     optional_assignments = []
     optional_params: dict = {}
     if challan_no is not None:
@@ -1117,6 +1124,13 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
     if challan_date is not None:
         optional_assignments.append("challan_date = :challan_date")
         optional_params["challan_date"] = challan_date
+    if seller_invoice is not None:
+        optional_assignments.append("invoice_no = :invoice_no")
+        optional_params["invoice_no"] = str(seller_invoice["invoice_no"])
+        optional_assignments.append("invoice_date = :invoice_date")
+        optional_params["invoice_date"] = seller_invoice["invoice_date"]
+        optional_assignments.append("invoice_amount = :invoice_amount")
+        optional_params["invoice_amount"] = seller_invoice["invoice_amount"]
 
     optional_sql = (", " + ", ".join(optional_assignments)) if optional_assignments else ""
 
@@ -1379,6 +1393,7 @@ def save_transfer_step(
                     use_new_rounding=use_new_rounding,
                     challan_no=inv_challan_no,
                     challan_date=step.challan_date or inv_challan_date,
+                    seller_invoice=seller_invoice,
                 )
             else:
                 # Create MR for buyer
