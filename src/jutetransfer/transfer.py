@@ -1008,7 +1008,9 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
                          mr_date: date, updated_by: int,
                          target_total: Optional[float] = None,
                          rate_source_line_items: Optional[list] = None,
-                         use_new_rounding: bool = False) -> None:
+                         use_new_rounding: bool = False,
+                         challan_no: Optional[str] = None,
+                         challan_date: Optional[date] = None) -> None:
     """Update the original MR with final rate/party and assign branch_mr_no.
 
     Args:
@@ -1018,6 +1020,10 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             Position-based mapping — line items are always in the same order.
         use_new_rounding: When True, round rates at kg level (2 decimals),
             amounts to 2 decimals, no largest-item adjustment.
+        challan_no: If provided, set on the source MR (receiving challan from
+            the previous hop's sales invoice). If None, column is left alone.
+        challan_date: If provided, set on the source MR. If None, column is
+            left alone. mukam_id is never touched.
     """
     # Ensure the final party has correct party types before updating MR
     _ensure_party_types(conn, final_party_id, updated_by)
@@ -1075,8 +1081,22 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             WHERE jute_mr_li_id = :li_id
         """), {"rate": d["new_rate"], "total_price": d["total_price"], "li_id": d["li_id"]})
 
-    # Recompute header totals from line items; assign bill_pass_no and bill_pass_date
-    conn.execute(text("""
+    # Recompute header totals from line items; assign bill_pass_no and bill_pass_date.
+    # challan_no / challan_date are only written when the caller passes them —
+    # this keeps the "mukam_id untouched" and "leave columns alone when None"
+    # invariants explicit. mukam_id is never in this UPDATE.
+    optional_assignments = []
+    optional_params: dict = {}
+    if challan_no is not None:
+        optional_assignments.append("challan_no = :challan_no")
+        optional_params["challan_no"] = challan_no
+    if challan_date is not None:
+        optional_assignments.append("challan_date = :challan_date")
+        optional_params["challan_date"] = challan_date
+
+    optional_sql = (", " + ", ".join(optional_assignments)) if optional_assignments else ""
+
+    conn.execute(text(f"""
         UPDATE jute_mr SET
             party_id = :party_id,
             party_branch_id = :party_branch_id,
@@ -1091,8 +1111,10 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) - claim_amount,
             updated_by = :updated_by,
             updated_date_time = NOW()
+            {optional_sql}
         WHERE jute_mr_id = :mr_id
     """), {
+        **optional_params,
         "party_id": str(final_party_id),
         "party_branch_id": final_party_branch_id,
         "mr_no": new_mr_no,
@@ -1159,8 +1181,27 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
         """), {"rate": rate, "total_price": new_total, "li_id": li_id})
 
     # Restore header: clear branch_mr_no/bill_pass_*, status back to Pending,
-    # recompute totals. Do NOT touch party_id/party_branch_id.
-    conn.execute(text("""
+    # recompute totals. Do NOT touch party_id/party_branch_id or mukam_id.
+    # Also restore challan_no / challan_date from Step 1's MR: Step 1 preserved
+    # the original gate-entry challan because _create_mr falls back to
+    # source_mr's values when no override is supplied. Finalization overwrote
+    # them with the last hop's invoice challan, so we need to put the original
+    # back here.
+    step1_challan_no = step1_source_mr.get("challan_no")
+    step1_challan_date = step1_source_mr.get("challan_date")
+
+    revert_assignments = []
+    revert_params: dict = {"updated_by": updated_by, "mr_id": jute_mr_id}
+    if step1_challan_no is not None:
+        revert_assignments.append("challan_no = :challan_no")
+        revert_params["challan_no"] = step1_challan_no
+    if step1_challan_date is not None:
+        revert_assignments.append("challan_date = :challan_date")
+        revert_params["challan_date"] = step1_challan_date
+
+    revert_sql = (", " + ", ".join(revert_assignments)) if revert_assignments else ""
+
+    conn.execute(text(f"""
         UPDATE jute_mr SET
             branch_mr_no = NULL,
             bill_pass_no = NULL,
@@ -1172,11 +1213,9 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) - claim_amount,
             updated_by = :updated_by,
             updated_date_time = NOW()
+            {revert_sql}
         WHERE jute_mr_id = :mr_id
-    """), {
-        "updated_by": updated_by,
-        "mr_id": jute_mr_id,
-    })
+    """), revert_params)
 
 
 # ---------------------------------------------------------------------------
@@ -1272,7 +1311,7 @@ def save_transfer_step(
             prev_mr_row = prev_mr_result.fetchone()
             prev_mr_id = prev_mr_row[0] if prev_mr_row else source_mr_id
 
-            invoice_id, challan_date, challan_no = _create_sales_invoice(
+            invoice_id, inv_challan_date, inv_challan_no = _create_sales_invoice(
                 conn, prev_step_for_invoice, buyer_party_id,
                 buyer_party_branch_id, prev_mr_id, source_mr,
                 updated_by, rate_multiplier,
@@ -1298,6 +1337,9 @@ def save_transfer_step(
                 last_seller_party_id, last_seller_party_branch_id = _ensure_company_as_party(
                     conn, prev_co_id, prev_branch_id, source_co_id, updated_by
                 )
+                # Inherit challan_no/challan_date from the previous hop's invoice,
+                # mirroring the non-final branch below. mukam_id is preserved
+                # (not in the UPDATE inside _update_original_mr).
                 _update_original_mr(
                     conn, root_mr_id_for_update, rate_multiplier,
                     last_seller_party_id, last_seller_party_branch_id,
@@ -1305,6 +1347,8 @@ def save_transfer_step(
                     target_total=float(step.total_amount),
                     rate_source_line_items=rate_source_lis,
                     use_new_rounding=use_new_rounding,
+                    challan_no=inv_challan_no,
+                    challan_date=step.challan_date or inv_challan_date,
                 )
             else:
                 # Create MR for buyer
@@ -1318,7 +1362,8 @@ def save_transfer_step(
                 mr_id = _create_mr(
                     conn, source_mr, step, seller_party_id, seller_party_branch_id,
                     updated_by, rate_multiplier, prev_co_id, root_mr_id,
-                    challan_date=step.challan_date or challan_date, challan_no=challan_no,
+                    challan_date=step.challan_date or inv_challan_date,
+                    challan_no=inv_challan_no,
                     use_new_rounding=use_new_rounding,
                 )
 
