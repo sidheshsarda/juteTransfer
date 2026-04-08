@@ -1177,7 +1177,9 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
 
     Restores line item rates from Step 1 (the first transferred MR's snapshot,
     which is unaffected by finalization), clears branch_mr_no/bill_pass_*,
-    sets status_id back to Pending. Does NOT touch party_id/party_branch_id —
+    clears invoice_no/invoice_date/invoice_amount (which finalization wrote
+    from the last seller's sales_invoice), sets status_id back to Pending.
+    Does NOT touch party_id/party_branch_id —
     the original supplier party is not reliably recoverable, and leaving the
     current party in place is safe (a re-finalize will overwrite it correctly).
 
@@ -1218,9 +1220,10 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             WHERE jute_mr_li_id = :li_id
         """), {"rate": rate, "total_price": new_total, "li_id": li_id})
 
-    # Restore header: clear branch_mr_no/bill_pass_*, status back to Pending,
-    # recompute totals. Do NOT touch party_id/party_branch_id or mukam_id.
-    # Also restore challan_no / challan_date from Step 1's MR: Step 1 preserved
+    # Restore header: clear branch_mr_no/bill_pass_*, clear invoice_no/date/amount
+    # (which finalization wrote from the last hop's sales_invoice), status back
+    # to Pending, recompute totals. Do NOT touch party_id/party_branch_id or
+    # mukam_id. Also restore challan_no / challan_date from Step 1's MR: Step 1 preserved
     # the original gate-entry challan because _create_mr falls back to
     # source_mr's values when no override is supplied. Finalization overwrote
     # them with the last hop's invoice challan, so we need to put the original
@@ -1244,6 +1247,9 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             branch_mr_no = NULL,
             bill_pass_no = NULL,
             bill_pass_date = NULL,
+            invoice_no = NULL,
+            invoice_date = NULL,
+            invoice_amount = NULL,
             status_id = 0,
             total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
             roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) -
