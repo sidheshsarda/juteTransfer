@@ -27,6 +27,18 @@ MAX_TRANSFERS = 8
 CALCULATION_CHART_TOTALS_PLACEHOLDER = "-"
 
 
+def _source_orig_total(saved_chain, row):
+    """Return the source (Step 0) total amount.
+
+    When a real Step 1 exists in saved_chain, use its frozen snapshot
+    (unaffected by finalization's in-place updates to the source MR).
+    Otherwise fall back to the live row value.
+    """
+    if saved_chain and not saved_chain[0].get("is_final_return"):
+        return float(saved_chain[0].get("total_amount") or 0)
+    return float(row.get("Total Amount") or 0)
+
+
 def _render_step_calculation_chart(
     step_index: int,
     line_items: list,
@@ -210,6 +222,36 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
         chain_mrs = chain_df.to_dict("records")
         saved_chain = _reconstruct_chain(chain_mrs, selected_company_id or 0)
 
+    # Determine if the source MR has been finalized (returned to origin).
+    # When finalized, the return-to-origin step is NOT a separate jute_mr row —
+    # it's the in-place updated source MR. We must always know this state.
+    is_finalized = row.get("EJM MR No.") is not None
+    if is_finalized:
+        # Parse "CoPrefix-BranchName" from source_co_branch
+        if source_co_branch and "-" in source_co_branch:
+            co_prefix, branch_name = source_co_branch.split("-", 1)
+        else:
+            co_prefix, branch_name = (source_co_branch or ""), ""
+        final_step_record = {
+            "jute_mr_id": mr_id,
+            "co_prefix": co_prefix,
+            "branch_name": branch_name,
+            "branch_mr_no": row.get("EJM MR No."),
+            "jute_mr_date": row.get("MR DATE"),
+            "challan_date": row.get("Challan Date"),
+            "total_amount": float(row.get("Total Amount") or 0),
+            "claim_amount": float(row.get("Claim Amount") or 0),
+            "net_total": float(row.get("Net Total") or 0),
+            "src_com_id": None,  # not used downstream for synthetic
+            "owner_co_id": selected_company_id,  # back at origin
+            "is_final_return": True,
+        }
+        saved_chain.append(final_step_record)
+
+    # Compute the corrected source (Step 0) total ONCE, after saved_chain is
+    # in its final form (with synthetic step appended if applicable).
+    orig_total_source = _source_orig_total(saved_chain, row)
+
     # Determine how many steps are already saved vs editable
     num_saved = len(saved_chain)
     editable_steps = steps[num_saved:] if len(steps) > num_saved else [_empty_transfer_step()]
@@ -217,7 +259,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
     # Ensure steps list reflects saved + editable
     if num_saved > 0 and len(steps) <= num_saved:
         steps.clear()
-        prev_total = float(row.get("Total Amount") or 0)  # Source (Step 0) amount
+        prev_total = orig_total_source  # Source (Step 0) amount
         for sc in saved_chain:
             saved_step = _empty_transfer_step()
             label = f"{sc.get('co_prefix', '')}-{sc.get('branch_name', '')}"
@@ -235,13 +277,15 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
             else:
                 saved_step["pct_rate_increase"] = 0.0
             saved_step["saved_mr_id"] = sc.get("jute_mr_id")
+            saved_step["is_final_return"] = bool(sc.get("is_final_return"))
             steps.append(saved_step)
             prev_total = current_total
-        steps.append(_empty_transfer_step())
+        if not is_finalized:
+            steps.append(_empty_transfer_step())
         editable_steps = steps[num_saved:]
     elif num_saved > 0 and len(steps) > num_saved:
         # Update existing saved steps with correct pct_rate_increase values
-        prev_total = float(row.get("Total Amount") or 0)
+        prev_total = orig_total_source
         for i in range(num_saved):
             current_total = float(steps[i].get("total_amount") or 0)
             if prev_total > 0:
@@ -252,7 +296,7 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
 
     # Source card + step cards
     total_steps = len(steps)
-    col_count = 1 + total_steps + (1 if total_steps < MAX_TRANSFERS else 0)
+    col_count = 1 + total_steps + (1 if (total_steps < MAX_TRANSFERS and not is_finalized) else 0)
     cols = st.columns(col_count, gap="small")
 
     changed = False
@@ -261,8 +305,15 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
     with cols[0]:
         st.markdown("**Source**")
         st.markdown(f"**{source_co_branch or 'N/A'}**")
-        orig_total = float(row.get("Total Amount") or 0)
-        orig_claim = float(row.get("Claim Amount") or 0)
+        # When Step 1 exists, derive from it (frozen snapshot, unaffected by
+        # finalization in-place updates to the source MR's line items).
+        # saved_chain is ordered by jute_mr_id ASC; saved_chain[0] is always
+        # the real Step 1 (the synthetic final-return step is appended last).
+        orig_total = orig_total_source
+        if saved_chain and not saved_chain[0].get("is_final_return"):
+            orig_claim = float(saved_chain[0].get("claim_amount") or 0)
+        else:
+            orig_claim = float(row.get("Claim Amount") or 0)
         st.metric("Gate Entry Value", f"{orig_total:,.0f}")
         st.caption("📦 Initial recorded value when jute entered system")
         st.metric("Claim", f"{orig_claim:,.0f}")
@@ -696,7 +747,6 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
                             delete_chain_from_step(
                                 root_mr_id=mr_id,
                                 from_mr_id=from_mr_id,
-                                source_mr=None,
                                 updated_by=1,
                             )
                             st.success(f"Deleted steps from step {edit_step} onward.")
@@ -713,6 +763,6 @@ def _render_transfer_editor(mr_id: int, row: pd.Series, steps: list,
 
     # Recalculate if anything changed (no explicit rerun — Streamlit reruns naturally)
     if changed:
-        orig_total = float(row.get("Total Amount") or 0)
+        orig_total = _source_orig_total(saved_chain, row)
         _recalculate_chain(steps, line_items, orig_total)
         st.session_state[f"transfers_{filter_key}"][mr_id] = steps

@@ -343,3 +343,63 @@ def get_invoice_details_by_mr_id(mr_id: int) -> Optional[dict]:
     if df is not None and not df.empty:
         return df.iloc[0].to_dict()
     return None
+
+
+# ---------------------------------------------------------------------------
+# Company P&L dashboard aggregations
+# ---------------------------------------------------------------------------
+
+def get_company_wise_purchases_by_month(fy_start, fy_end) -> pd.DataFrame:
+    """Return per-(company, month) net purchase totals from jute_mr for a FY.
+
+    Columns: co_id, co_name, month (1-12), net_purchases (float).
+    """
+    return DatabaseConnection.execute_query(
+        """
+        SELECT
+            cm.co_id           AS co_id,
+            cm.co_name         AS co_name,
+            MONTH(mr.jute_mr_date) AS month,
+            SUM(COALESCE(mr.net_total, 0)) AS net_purchases
+        FROM jute_mr mr
+        JOIN branch_mst bm ON mr.branch_id = bm.branch_id
+        JOIN co_mst cm ON bm.co_id = cm.co_id
+        WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
+        GROUP BY cm.co_id, cm.co_name, MONTH(mr.jute_mr_date)
+        """,
+        {
+            "fy_start": fy_start.strftime("%Y-%m-%d"),
+            "fy_end": fy_end.strftime("%Y-%m-%d"),
+        },
+    )
+
+
+def get_company_wise_sales_by_month(fy_start, fy_end) -> pd.DataFrame:
+    """Return per-(company, month) net sales totals for raw-jute invoices in a FY.
+
+    Sales are attributed to the SELLER (sales_invoice.branch_id -> co_id).
+    Net sales = invoice_amount - COALESCE(sales_invoice_jute.claim_amount, 0).
+    Filters: invoice_type = 5 (raw jute), active = 1.
+    Columns: co_id, co_name, month (1-12), net_sales (float).
+    """
+    return DatabaseConnection.execute_query(
+        """
+        SELECT
+            cm.co_id           AS co_id,
+            cm.co_name         AS co_name,
+            MONTH(si.invoice_date) AS month,
+            SUM(COALESCE(si.invoice_amount, 0) - COALESCE(sij.claim_amount, 0)) AS net_sales
+        FROM sales_invoice si
+        JOIN branch_mst bm ON si.branch_id = bm.branch_id
+        JOIN co_mst cm ON bm.co_id = cm.co_id
+        LEFT JOIN sales_invoice_jute sij ON sij.invoice_id = si.invoice_id
+        WHERE si.invoice_type = 5
+          AND si.active = 1
+          AND si.invoice_date BETWEEN :fy_start AND :fy_end
+        GROUP BY cm.co_id, cm.co_name, MONTH(si.invoice_date)
+        """,
+        {
+            "fy_start": fy_start.strftime("%Y-%m-%d"),
+            "fy_end": fy_end.strftime("%Y-%m-%d"),
+        },
+    )

@@ -1084,6 +1084,7 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             jute_mr_date = :mr_date,
             bill_pass_no = :bill_pass_no,
             bill_pass_date = :mr_date,
+            status_id = :status_id,
             total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
             roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) -
                        (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
@@ -1097,6 +1098,7 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
         "mr_no": new_mr_no,
         "mr_date": mr_date,
         "bill_pass_no": new_bill_pass_no,
+        "status_id": 1,
         "updated_by": updated_by,
         "mr_id": jute_mr_id,
     })
@@ -1110,20 +1112,43 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
     _debug_log(f"VERIFY after update: bill_pass_no={verify[0]}, bill_pass_date={verify[1]}")
 
 
-def revert_original_mr(conn, jute_mr_id: int, source_mr: dict, updated_by: int) -> None:
+def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by: int) -> None:
     """Revert the original MR to its pre-finalization state.
 
-    Restores original party, rates, branch_mr_no=NULL, and line item rates.
-    Called when deleting a completed chain's final step.
+    Restores line item rates from Step 1 (the first transferred MR's snapshot,
+    which is unaffected by finalization), clears branch_mr_no/bill_pass_*,
+    sets status_id back to Pending. Does NOT touch party_id/party_branch_id —
+    the original supplier party is not reliably recoverable, and leaving the
+    current party in place is safe (a re-finalize will overwrite it correctly).
+
+    Args:
+        conn: Active SQLAlchemy connection inside a transaction.
+        jute_mr_id: The root MR id (the in-place finalized MR being reverted).
+        step1_source_mr: Full dict of Step 1's MR (the first transferred MR
+            in the chain), including a "line_items" list. Used as the source
+            of pre-finalization rates. Line items are matched positionally to
+            the root MR's line items (1:1 — both were cloned from the same
+            source).
+        updated_by: User id for audit columns.
     """
-    # Restore each line item to original rate
-    for li in source_mr.get("line_items", []):
-        li_id = li["jute_mr_li_id"]
-        original_rate = float(li.get("rate") or 0)
-        accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
-        # Use Decimal for precise calculation to avoid floating-point rounding errors
-        original_total = float(
-            (Decimal(str(accepted_weight)) * Decimal(str(original_rate)) / Decimal('100'))
+    # Load root MR's line items in stable order for positional matching
+    root_lis = conn.execute(
+        text("SELECT jute_mr_li_id, accepted_weight FROM jute_mr_li "
+             "WHERE jute_mr_id = :id ORDER BY jute_mr_li_id"),
+        {"id": jute_mr_id},
+    ).fetchall()
+
+    step1_lis = step1_source_mr.get("line_items", [])
+    pair_count = min(len(step1_lis), len(root_lis))
+
+    for idx in range(pair_count):
+        root_li = root_lis[idx]
+        step1_li = step1_lis[idx]
+        li_id = root_li[0]
+        accepted_weight = round(float(root_li[1] or 0), 0)
+        rate = float(step1_li.get("rate") or 0)
+        new_total = float(
+            (Decimal(str(accepted_weight)) * Decimal(str(rate)) / Decimal('100'))
             .quantize(Decimal('1'), rounding=ROUND_HALF_UP)
         )
 
@@ -1131,16 +1156,16 @@ def revert_original_mr(conn, jute_mr_id: int, source_mr: dict, updated_by: int) 
             UPDATE jute_mr_li SET
                 rate = :rate, total_price = :total_price, updated_date_time = NOW()
             WHERE jute_mr_li_id = :li_id
-        """), {"rate": original_rate, "total_price": original_total, "li_id": li_id})
+        """), {"rate": rate, "total_price": new_total, "li_id": li_id})
 
-    # Restore header: original party, NULL branch_mr_no/bill_pass, recompute totals
+    # Restore header: clear branch_mr_no/bill_pass_*, status back to Pending,
+    # recompute totals. Do NOT touch party_id/party_branch_id.
     conn.execute(text("""
         UPDATE jute_mr SET
-            party_id = :party_id,
-            party_branch_id = :party_branch_id,
             branch_mr_no = NULL,
             bill_pass_no = NULL,
             bill_pass_date = NULL,
+            status_id = 0,
             total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
             roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) -
                        (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
@@ -1149,8 +1174,6 @@ def revert_original_mr(conn, jute_mr_id: int, source_mr: dict, updated_by: int) 
             updated_date_time = NOW()
         WHERE jute_mr_id = :mr_id
     """), {
-        "party_id": str(source_mr.get("party_id", "")),
-        "party_branch_id": source_mr.get("party_branch_id"),
         "updated_by": updated_by,
         "mr_id": jute_mr_id,
     })
@@ -1366,26 +1389,32 @@ def delete_transfer_step(jute_mr_id: int, updated_by: int) -> None:
     logger.info(f"Deleted transfer MR {jute_mr_id} and linked invoices")
 
 
-def delete_chain_from_step(root_mr_id: int, from_mr_id: int,
-                            source_mr: dict, updated_by: int) -> None:
-    """Delete all chain steps from a given MR onward (cascade).
+def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) -> None:
+    """Delete chain steps from a given point onward, OR revert finalization.
 
-    Uses chain reconstruction to find the order, then deletes in reverse.
-    If the chain was complete (original MR finalized), reverts the original.
+    Special case: if from_mr_id == root_mr_id, the caller is "unfinalizing"
+    the in-place return-to-origin step. We do not delete any chain rows;
+    we only call revert_original_mr to restore the root MR to its
+    pre-finalization state, using Step 1's line items as the rate snapshot.
+
+    Otherwise: cascade-delete transfer rows from from_mr_id onward (in
+    reverse chain order), and if the chain was finalized, additionally
+    revert the root MR.
     """
     from .queries import get_transfer_chain
-    chain_df = get_transfer_chain(root_mr_id)
-    if chain_df is None or chain_df.empty:
-        return
-
-    # Reconstruct ordered chain
     from .jute_mr_chain_helpers import _reconstruct_chain
-    chain_mrs = chain_df.to_dict("records")
-    # Derive root co_id
+
     root_mr = get_source_mr_full(root_mr_id)
     if not root_mr:
         return
 
+    chain_df = get_transfer_chain(root_mr_id)
+    if chain_df is None or chain_df.empty:
+        return
+
+    chain_mrs = chain_df.to_dict("records")
+
+    # Derive root co_id
     with DatabaseConnection.get_transaction() as conn:
         root_branch = int(root_mr.get("branch_id") or 0)
         root_co_row = conn.execute(
@@ -1396,24 +1425,52 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int,
 
     ordered = _reconstruct_chain(chain_mrs, root_co_id)
 
-    # Find index of from_mr_id
+    was_complete = root_mr.get("branch_mr_no") is not None
+
+    # Snapshot Step 1 BEFORE any deletes (Step 1 = first transferred MR).
+    step1_source_mr = None
+    if ordered:
+        step1_id = ordered[0]["jute_mr_id"]
+        step1_source_mr = get_source_mr_full(step1_id)
+
+    # Branch A: root-return revert only (unfinalize the synthetic final step)
+    if from_mr_id == root_mr_id:
+        if not was_complete:
+            return
+        if step1_source_mr is None:
+            logger.warning(
+                f"delete_chain_from_step: cannot revert root MR {root_mr_id} — "
+                f"Step 1 source MR not found."
+            )
+            return
+        with DatabaseConnection.get_transaction() as conn:
+            revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
+        return
+
+    # Branch B: middle-step cascade delete
     from_idx = next((i for i, m in enumerate(ordered) if m["jute_mr_id"] == from_mr_id), None)
     if from_idx is None:
         return
 
-    # Check if chain was complete (original MR has branch_mr_no)
-    was_complete = root_mr.get("branch_mr_no") is not None
-
-    # Delete in reverse order from the end back to from_idx
     to_delete = ordered[from_idx:]
     for mr in reversed(to_delete):
         delete_transfer_step(mr["jute_mr_id"], updated_by)
 
-    # Revert original MR if chain was complete
     if was_complete:
-        with DatabaseConnection.get_transaction() as conn:
-            source_mr_full = get_source_mr_full(root_mr_id, conn=conn)
-            revert_original_mr(conn, root_mr_id, source_mr, updated_by)
+        if step1_source_mr is None:
+            logger.warning(
+                f"delete_chain_from_step: cannot revert root MR {root_mr_id} — "
+                f"Step 1 source MR not found; root may remain finalized."
+            )
+        elif from_idx == 0:
+            logger.warning(
+                f"delete_chain_from_step: Step 1 itself was deleted for root MR "
+                f"{root_mr_id}; cannot revert finalization using Step 1's data. "
+                f"Root MR may be left in a finalized state with no clean revert path."
+            )
+        else:
+            with DatabaseConnection.get_transaction() as conn:
+                revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
 
 
 # ---------------------------------------------------------------------------

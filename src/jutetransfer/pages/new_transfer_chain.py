@@ -329,6 +329,12 @@ def _render_chain_editor(filter_key):
 
     transfers = st.session_state[transfers_key]
 
+    # Detect finalization (chain completed back to origin). When finalized, the
+    # return-to-origin step is the in-place updated source MR — there is no
+    # separate jute_mr row for it, so we synthesize one. Always initialize this
+    # so downstream code can rely on it.
+    is_finalized = bool(row.get("EJM MR No."))
+
     # First time loading this MR: initialize from DB chain
     if mr_id not in transfers:
         transfers[mr_id] = []
@@ -340,8 +346,43 @@ def _render_chain_editor(filter_key):
                 chain_mrs = chain_data.to_dict("records") if hasattr(chain_data, 'to_dict') else chain_data
                 saved_chain = _reconstruct_chain(chain_mrs, st.session_state["selected_company_id"])
 
-                # Populate steps from saved chain
-                prev_total = raw_total
+                # If finalized, append a synthetic return-to-origin step built
+                # from the (in-place updated) source MR's row. saved_mr_id is
+                # set to the root mr_id so delete_chain_from_step's
+                # "from_mr_id == root_mr_id" branch handles unfinalize cleanly.
+                if is_finalized:
+                    _, _co_branch_mapping = get_company_branch_options()
+                    sel_co = st.session_state.get("selected_company_id")
+                    sel_br = st.session_state.get("selected_branch_id")
+                    src_label = next(
+                        (lbl for lbl, (cid, bid) in _co_branch_mapping.items()
+                         if cid == sel_co and bid == sel_br),
+                        "",
+                    )
+                    if src_label and "-" in src_label:
+                        _src_co_prefix, _src_branch_name = src_label.split("-", 1)
+                    else:
+                        _src_co_prefix, _src_branch_name = src_label, ""
+                    saved_chain.append({
+                        "jute_mr_id": mr_id,
+                        "co_prefix": _src_co_prefix,
+                        "branch_name": _src_branch_name,
+                        "branch_mr_no": row.get("EJM MR No."),
+                        "jute_mr_date": row.get("MR DATE"),
+                        "challan_date": row.get("Challan Date"),
+                        "total_amount": float(row.get("Total Amount") or 0),
+                        "claim_amount": float(row.get("Claim Amount") or 0),
+                        "net_total": float(row.get("Net Total") or 0),
+                        "is_final_return": True,
+                    })
+
+                # Populate steps from saved chain. Seed prev_total from Step 1
+                # (saved_chain[0]) when present — Step 1 is a frozen snapshot
+                # unaffected by finalization, so it's the true Source amount.
+                if saved_chain and not saved_chain[0].get("is_final_return"):
+                    prev_total = float(saved_chain[0].get("total_amount") or 0)
+                else:
+                    prev_total = raw_total
                 for sc in saved_chain:
                     step = _empty_transfer_step()
                     step["company"] = f"{sc.get('co_prefix', 'N/A')}-{sc.get('branch_name', 'N/A')}"
@@ -351,6 +392,7 @@ def _render_chain_editor(filter_key):
                     step["claim_amount"] = float(sc.get("claim_amount", 0))
                     step["net_amount"] = float(sc.get("net_total", 0))
                     step["saved_mr_id"] = sc.get("jute_mr_id")
+                    step["is_final_return"] = bool(sc.get("is_final_return"))
 
                     # Back-calculate % rate increase (TODO: use DB column after migration)
                     current_total = float(sc.get("total_amount", 0))
@@ -394,15 +436,24 @@ def _render_chain_editor(filter_key):
                 if li_list:
                     s["warehouse_id"] = li_list[0].get("warehouse_id")
 
-        # Add blank step for new entry
-        new_step = _empty_transfer_step()
-        new_step["mr_date"] = raw_mr_date
-        transfers[mr_id].append(new_step)
+        # Add blank step for new entry — but NOT when the chain is finalized
+        # (the synthetic return-to-origin step is the terminal state).
+        if not is_finalized:
+            new_step = _empty_transfer_step()
+            new_step["mr_date"] = raw_mr_date
+            transfers[mr_id].append(new_step)
 
     steps = transfers[mr_id]
     li_data = line_items_map.get(mr_id, [])
     step_li_map = st.session_state.get(f"step_line_items_{filter_key}_{mr_id}", {})
-    orig_total = raw_total
+
+    # Source (Step 0) display total: prefer Step 1's frozen snapshot when it
+    # exists (the source MR's row Total Amount is overwritten in-place during
+    # finalization, so it can no longer be trusted for "original" display).
+    if steps and steps[0].get("saved_mr_id") and not steps[0].get("is_final_return"):
+        orig_total = float(steps[0].get("total_amount") or 0)
+    else:
+        orig_total = raw_total
 
     # Ensure all step totals are up-to-date before rendering.
     # _recalculate_chain skips saved steps (uses DB total) and fills in unsaved steps.
@@ -707,7 +758,6 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                             delete_chain_from_step(
                                 root_mr_id=mr_id,
                                 from_mr_id=saved_mr_id,
-                                source_mr=None,
                                 updated_by=st.session_state.get("user_id", 1),
                             )
                             st.success(f"Deleted steps from step {step_index + 1} onward.")
