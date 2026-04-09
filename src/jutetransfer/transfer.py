@@ -555,6 +555,7 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
                prev_co_id: int, root_mr_id: int,
                challan_date: Optional[date] = None,
                challan_no: Optional[str] = None,
+               seller_invoice: Optional[dict] = None,
                use_new_rounding: bool = False) -> int:
     """Create a new jute_mr + jute_mr_li records for a transfer step.
 
@@ -563,6 +564,11 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
 
     When use_new_rounding=True, rounds rates at kg level (2 decimals) then *100,
     and rounds line item amounts to 2 decimals (no largest-item adjustment).
+
+    If seller_invoice is provided (intermediate buyer step), writes
+    invoice_no/invoice_date/invoice_amount onto the new MR row from the
+    just-created sales_invoice. When None (first-step / supplier delivery),
+    those columns are written as NULL.
 
     Returns the new jute_mr_id.
     """
@@ -585,7 +591,8 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
             updated_by, updated_date_time, po_id, branch_id, party_id,
             party_branch_id, jute_supplier_id, src_com_id,
             total_amount, claim_amount, roundoff, net_total, tds_amount,
-            src_jute_mr_id, bill_pass_no, bill_pass_date
+            src_jute_mr_id, bill_pass_no, bill_pass_date,
+            invoice_no, invoice_date, invoice_amount
         ) VALUES (
             :gate_entry_no, :branch_mr_no, :gate_entry_date,
             :mr_date, :challan_date, :challan_no, :challan_weight,
@@ -596,7 +603,8 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
             :updated_by, NOW(), :po_id, :branch_id, :party_id,
             :party_branch_id, :jute_supplier_id, :src_com_id,
             :total_amount, :claim_amount, :roundoff, :net_total, :tds_amount,
-            :src_jute_mr_id, :bill_pass_no, :bill_pass_date
+            :src_jute_mr_id, :bill_pass_no, :bill_pass_date,
+            :invoice_no, :invoice_date, :invoice_amount
         )
     """, {
         "gate_entry_no": _get_next_gate_entry_no(conn, step.branch_id),
@@ -640,6 +648,9 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
         "src_jute_mr_id": root_mr_id,  # always root
         "bill_pass_no": new_bill_pass_no,
         "bill_pass_date": step.mr_date,
+        "invoice_no": str(seller_invoice["invoice_no"]) if seller_invoice else None,
+        "invoice_date": seller_invoice["invoice_date"] if seller_invoice else None,
+        "invoice_amount": seller_invoice["invoice_amount"] if seller_invoice else None,
     })
 
     # Copy line items with per-item rate via rate_multiplier.
@@ -803,7 +814,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
                            buyer_party_id: int, buyer_party_branch_id: Optional[int],
                            mr_id: int, source_mr: dict,
                            updated_by: int, rate_multiplier: float,
-                           use_new_rounding: bool = False) -> tuple[int, date, str]:
+                           use_new_rounding: bool = False) -> dict:
     """Create a sales invoice from the seller to the buyer.
 
     Inserts into sales_invoice, sales_invoice_dtl, and sales_invoice_jute.
@@ -811,7 +822,13 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
     When use_new_rounding=True, rounds rates at kg level (2 decimals),
     line item amounts to 2 decimals, and uses roundoff instead of largest-item adjustment.
 
-    Returns tuple of (invoice_id, challan_date, challan_no).
+    Returns dict with keys:
+        invoice_id (int): Newly created sales_invoice.invoice_id
+        invoice_no (int): Sequential invoice number for the seller's branch in the FY
+        invoice_date (date): Invoice date (= seller_step.mr_date)
+        invoice_amount (float): Header invoice amount
+        challan_date (date): Challan date (= seller_step.mr_date)
+        challan_no (str): Generated challan number
     """
     invoice_no = _get_next_invoice_no(conn, seller_step.branch_id)
     challan_no = _get_next_challan_no(conn, seller_step.branch_id, seller_step.mr_date)
@@ -995,7 +1012,14 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         "unit_conversion": source_mr.get("unit_conversion"),
     })
 
-    return invoice_id, seller_step.mr_date, challan_no
+    return {
+        "invoice_id": invoice_id,
+        "invoice_no": invoice_no,            # int (BigInteger from sales_invoice)
+        "invoice_date": seller_step.mr_date, # date
+        "invoice_amount": invoice_amount,    # float
+        "challan_date": seller_step.mr_date,
+        "challan_no": challan_no,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1008,7 +1032,10 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
                          mr_date: date, updated_by: int,
                          target_total: Optional[float] = None,
                          rate_source_line_items: Optional[list] = None,
-                         use_new_rounding: bool = False) -> None:
+                         use_new_rounding: bool = False,
+                         challan_no: Optional[str] = None,
+                         challan_date: Optional[date] = None,
+                         seller_invoice: Optional[dict] = None) -> None:
     """Update the original MR with final rate/party and assign branch_mr_no.
 
     Args:
@@ -1018,6 +1045,15 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             Position-based mapping — line items are always in the same order.
         use_new_rounding: When True, round rates at kg level (2 decimals),
             amounts to 2 decimals, no largest-item adjustment.
+        challan_no: If provided, set on the source MR (receiving challan from
+            the previous hop's sales invoice). If None, column is left alone.
+        challan_date: If provided, set on the source MR. If None, column is
+            left alone. mukam_id is never touched.
+        seller_invoice: Dict from _create_sales_invoice (the last-hop invoice
+            for the final step). When provided, invoice_no/invoice_date/
+            invoice_amount on the root MR are set from these values
+            (via the same conditional SQL machinery as challan_no/challan_date).
+            When None, those columns are left untouched.
     """
     # Ensure the final party has correct party types before updating MR
     _ensure_party_types(conn, final_party_id, updated_by)
@@ -1075,8 +1111,30 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             WHERE jute_mr_li_id = :li_id
         """), {"rate": d["new_rate"], "total_price": d["total_price"], "li_id": d["li_id"]})
 
-    # Recompute header totals from line items; assign bill_pass_no and bill_pass_date
-    conn.execute(text("""
+    # Recompute header totals from line items; assign bill_pass_no and bill_pass_date.
+    # challan_no / challan_date / invoice_no / invoice_date / invoice_amount are
+    # only written when the caller passes them — this keeps the "mukam_id
+    # untouched" and "leave columns alone when None" invariants explicit.
+    # mukam_id is never in this UPDATE.
+    optional_assignments = []
+    optional_params: dict = {}
+    if challan_no is not None:
+        optional_assignments.append("challan_no = :challan_no")
+        optional_params["challan_no"] = challan_no
+    if challan_date is not None:
+        optional_assignments.append("challan_date = :challan_date")
+        optional_params["challan_date"] = challan_date
+    if seller_invoice is not None:
+        optional_assignments.append("invoice_no = :invoice_no")
+        optional_params["invoice_no"] = str(seller_invoice["invoice_no"])
+        optional_assignments.append("invoice_date = :invoice_date")
+        optional_params["invoice_date"] = seller_invoice["invoice_date"]
+        optional_assignments.append("invoice_amount = :invoice_amount")
+        optional_params["invoice_amount"] = seller_invoice["invoice_amount"]
+
+    optional_sql = (", " + ", ".join(optional_assignments)) if optional_assignments else ""
+
+    conn.execute(text(f"""
         UPDATE jute_mr SET
             party_id = :party_id,
             party_branch_id = :party_branch_id,
@@ -1091,8 +1149,10 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) - claim_amount,
             updated_by = :updated_by,
             updated_date_time = NOW()
+            {optional_sql}
         WHERE jute_mr_id = :mr_id
     """), {
+        **optional_params,
         "party_id": str(final_party_id),
         "party_branch_id": final_party_branch_id,
         "mr_no": new_mr_no,
@@ -1117,7 +1177,9 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
 
     Restores line item rates from Step 1 (the first transferred MR's snapshot,
     which is unaffected by finalization), clears branch_mr_no/bill_pass_*,
-    sets status_id back to Pending. Does NOT touch party_id/party_branch_id —
+    clears invoice_no/invoice_date/invoice_amount (which finalization wrote
+    from the last seller's sales_invoice), sets status_id back to Pending.
+    Does NOT touch party_id/party_branch_id —
     the original supplier party is not reliably recoverable, and leaving the
     current party in place is safe (a re-finalize will overwrite it correctly).
 
@@ -1158,13 +1220,36 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             WHERE jute_mr_li_id = :li_id
         """), {"rate": rate, "total_price": new_total, "li_id": li_id})
 
-    # Restore header: clear branch_mr_no/bill_pass_*, status back to Pending,
-    # recompute totals. Do NOT touch party_id/party_branch_id.
-    conn.execute(text("""
+    # Restore header: clear branch_mr_no/bill_pass_*, clear invoice_no/date/amount
+    # (which finalization wrote from the last hop's sales_invoice), status back
+    # to Pending, recompute totals. Do NOT touch party_id/party_branch_id or
+    # mukam_id. Also restore challan_no / challan_date from Step 1's MR: Step 1 preserved
+    # the original gate-entry challan because _create_mr falls back to
+    # source_mr's values when no override is supplied. Finalization overwrote
+    # them with the last hop's invoice challan, so we need to put the original
+    # back here.
+    step1_challan_no = step1_source_mr.get("challan_no")
+    step1_challan_date = step1_source_mr.get("challan_date")
+
+    revert_assignments = []
+    revert_params: dict = {"updated_by": updated_by, "mr_id": jute_mr_id}
+    if step1_challan_no is not None:
+        revert_assignments.append("challan_no = :challan_no")
+        revert_params["challan_no"] = step1_challan_no
+    if step1_challan_date is not None:
+        revert_assignments.append("challan_date = :challan_date")
+        revert_params["challan_date"] = step1_challan_date
+
+    revert_sql = (", " + ", ".join(revert_assignments)) if revert_assignments else ""
+
+    conn.execute(text(f"""
         UPDATE jute_mr SET
             branch_mr_no = NULL,
             bill_pass_no = NULL,
             bill_pass_date = NULL,
+            invoice_no = NULL,
+            invoice_date = NULL,
+            invoice_amount = NULL,
             status_id = 0,
             total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
             roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) -
@@ -1172,11 +1257,9 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) - claim_amount,
             updated_by = :updated_by,
             updated_date_time = NOW()
+            {revert_sql}
         WHERE jute_mr_id = :mr_id
-    """), {
-        "updated_by": updated_by,
-        "mr_id": jute_mr_id,
-    })
+    """), revert_params)
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1322,9 @@ def save_transfer_step(
             party_id, party_branch_id = _ensure_supplier_party(
                 conn, source_mr, step.co_id, updated_by
             )
+            # No seller_invoice: first-step is a supplier delivery, not a
+            # company-to-company sale — no inbound sales_invoice exists yet,
+            # so invoice_no/invoice_date/invoice_amount remain NULL on this MR.
             mr_id = _create_mr(
                 conn, source_mr, step, party_id, party_branch_id,
                 updated_by, rate_multiplier, prev_co_id, root_mr_id,
@@ -1272,12 +1358,15 @@ def save_transfer_step(
             prev_mr_row = prev_mr_result.fetchone()
             prev_mr_id = prev_mr_row[0] if prev_mr_row else source_mr_id
 
-            invoice_id, challan_date, challan_no = _create_sales_invoice(
+            seller_invoice = _create_sales_invoice(
                 conn, prev_step_for_invoice, buyer_party_id,
                 buyer_party_branch_id, prev_mr_id, source_mr,
                 updated_by, rate_multiplier,
                 use_new_rounding=use_new_rounding,
             )
+            invoice_id = seller_invoice["invoice_id"]
+            inv_challan_date = seller_invoice["challan_date"]
+            inv_challan_no = seller_invoice["challan_no"]
 
             if is_final:
                 # Final step: update original MR, don't create new MR.
@@ -1298,6 +1387,9 @@ def save_transfer_step(
                 last_seller_party_id, last_seller_party_branch_id = _ensure_company_as_party(
                     conn, prev_co_id, prev_branch_id, source_co_id, updated_by
                 )
+                # Inherit challan_no/challan_date from the previous hop's invoice,
+                # mirroring the non-final branch below. mukam_id is preserved
+                # (not in the UPDATE inside _update_original_mr).
                 _update_original_mr(
                     conn, root_mr_id_for_update, rate_multiplier,
                     last_seller_party_id, last_seller_party_branch_id,
@@ -1305,6 +1397,9 @@ def save_transfer_step(
                     target_total=float(step.total_amount),
                     rate_source_line_items=rate_source_lis,
                     use_new_rounding=use_new_rounding,
+                    challan_no=inv_challan_no,
+                    challan_date=step.challan_date or inv_challan_date,
+                    seller_invoice=seller_invoice,
                 )
             else:
                 # Create MR for buyer
@@ -1318,7 +1413,9 @@ def save_transfer_step(
                 mr_id = _create_mr(
                     conn, source_mr, step, seller_party_id, seller_party_branch_id,
                     updated_by, rate_multiplier, prev_co_id, root_mr_id,
-                    challan_date=step.challan_date or challan_date, challan_no=challan_no,
+                    challan_date=step.challan_date or inv_challan_date,
+                    challan_no=inv_challan_no,
+                    seller_invoice=seller_invoice,
                     use_new_rounding=use_new_rounding,
                 )
 
