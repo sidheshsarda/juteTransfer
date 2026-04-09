@@ -49,3 +49,8 @@ uv.lock
 
 # MCP
 .playwright-mcp/
+.streamlit
+.streamlit.txt
+debug_transfer.log
+debug_transfer.log
+src/debug_transfer.log
