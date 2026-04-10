@@ -403,3 +403,55 @@ def get_company_wise_sales_by_month(fy_start, fy_end) -> pd.DataFrame:
             "fy_end": fy_end.strftime("%Y-%m-%d"),
         },
     )
+
+
+def get_company_wise_unsold_stock(fy_start, fy_end) -> pd.DataFrame:
+    """Return per-company unsold-MR stock value (valued at purchase net_total).
+
+    An MR is considered 'stock' iff ALL of:
+      - Dated within the FY (jute_mr_date in [fy_start, fy_end])
+      - status_id = 3 (active intermediate transfer MR; excludes pending
+        gate entries at status 0 and finalized roots at status 1)
+      - Its chain root (src_jute_mr_id -> jute_mr) is NOT in a closed
+        state (root.status_id NOT IN (1, 13)). Status 13 is set by the
+        upstream ERP on roots whose source company is consuming the
+        material rather than reselling it; status 1 is set by this app
+        on finalization. Both indicate the chain is closed and any
+        return MR sitting at the source company should not be counted.
+      - Not referenced by an active raw-jute sales_invoice_jute row
+        (i.e., the seller has not yet invoiced this MR forward).
+
+    Columns: co_id, co_name, stock_value (float).
+    """
+    return DatabaseConnection.execute_query(
+        """
+        SELECT
+            cm.co_id   AS co_id,
+            cm.co_name AS co_name,
+            COALESCE(SUM(mr.net_total), 0) AS stock_value
+        FROM jute_mr mr
+        JOIN branch_mst bm ON mr.branch_id = bm.branch_id
+        JOIN co_mst    cm ON bm.co_id = cm.co_id
+        WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
+          AND mr.status_id = 3
+          AND NOT EXISTS (
+              SELECT 1
+              FROM jute_mr root
+              WHERE root.jute_mr_id = mr.src_jute_mr_id
+                AND root.status_id IN (1, 13)
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM sales_invoice_jute sij
+              JOIN sales_invoice si ON si.invoice_id = sij.invoice_id
+              WHERE sij.mr_id = mr.jute_mr_id
+                AND si.active = 1
+                AND si.invoice_type = 5
+          )
+        GROUP BY cm.co_id, cm.co_name
+        """,
+        {
+            "fy_start": fy_start.strftime("%Y-%m-%d"),
+            "fy_end": fy_end.strftime("%Y-%m-%d"),
+        },
+    )
