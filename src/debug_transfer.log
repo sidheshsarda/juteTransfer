@@ -19,3 +19,5 @@
 [2026-04-07T15:52:52.430342] _save_step: step_index=0, step_co_id=21, step_branch_id=17, source_co_id=1, source_branch_id=2, is_final=False, is_first_step=True
 [2026-04-07T15:59:40.295124] _save_step: step_index=1, step_co_id=26, step_branch_id=25, source_co_id=1, source_branch_id=2, is_final=False, is_first_step=False
 [2026-04-08T17:34:03.977681] _save_step: step_index=0, step_co_id=4, step_branch_id=9, source_co_id=1, source_branch_id=2, is_final=False, is_first_step=True
+[2026-04-17T15:55:20.312247] _save_step: step_index=4, step_co_id=1, step_branch_id=2, source_co_id=1, source_branch_id=2, is_final=True, is_first_step=False
+[2026-04-17T16:13:55.798245] _save_step: step_index=4, step_co_id=1, step_branch_id=2, source_co_id=1, source_branch_id=2, is_final=True, is_first_step=False

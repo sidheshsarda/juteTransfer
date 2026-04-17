@@ -300,6 +300,57 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
     return new_party_id, new_branch_id
 
 
+def _ensure_party_branch_from_source_branch(
+    conn, party_id: int, source_branch_id: int, updated_by: int
+) -> Optional[int]:
+    """Ensure a party_branch_mst row exists for party_id matching branch_mst[source_branch_id].
+
+    Match by gst_no (case-insensitive, trimmed). If source branch_mst has no
+    gst_no, inserts a new row unconditionally. Returns the party_mst_branch_id
+    (existing or newly inserted), or None if source branch_mst is not found.
+    """
+    br_row = conn.execute(
+        text("SELECT * FROM branch_mst WHERE branch_id = :bid"),
+        {"bid": source_branch_id},
+    ).fetchone()
+    if not br_row:
+        return None
+    br = br_row._mapping
+
+    src_gst = (br.get("gst_no") or "").strip()
+    if src_gst:
+        existing = conn.execute(
+            text("""SELECT party_mst_branch_id FROM party_branch_mst
+                    WHERE party_id = :pid
+                      AND LOWER(TRIM(gst_no)) = LOWER(TRIM(:gst))
+                    LIMIT 1"""),
+            {"pid": party_id, "gst": src_gst},
+        ).fetchone()
+        if existing:
+            return existing[0]
+
+    return DatabaseConnection.execute_insert_returning_id(conn, """
+        INSERT INTO party_branch_mst (party_id, active, gst_no, address,
+            address_additional, zip_code, city_id, state_id, contact_no,
+            contact_person, created_date, created_by, updated_by, updated_date_time)
+        VALUES (:party_id, 1, :gst_no, :address, :address2,
+            :zip_code, :city_id, :state_id, :contact_no, :contact_person,
+            NOW(), :created_by, :updated_by, NOW())
+    """, {
+        "party_id": party_id,
+        "gst_no": br.get("gst_no"),
+        "address": br.get("branch_address1"),
+        "address2": br.get("branch_address2"),
+        "zip_code": br.get("branch_zipcode"),
+        "city_id": br.get("city_id"),
+        "state_id": br.get("state_id"),
+        "contact_no": str(br.get("contact_no") or ""),
+        "contact_person": br.get("contact_person"),
+        "created_by": updated_by,
+        "updated_by": updated_by,
+    })
+
+
 def _ensure_supplier_party(conn, source_mr: dict, target_co_id: int,
                             updated_by: int) -> tuple[int, int]:
     """Ensure the original supplier's party exists in the target company.
@@ -1158,7 +1209,7 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
         "mr_no": new_mr_no,
         "mr_date": mr_date,
         "bill_pass_no": new_bill_pass_no,
-        "status_id": 1,
+        "status_id": 3,
         "updated_by": updated_by,
         "mr_id": jute_mr_id,
     })
@@ -1387,6 +1438,11 @@ def save_transfer_step(
                 last_seller_party_id, last_seller_party_branch_id = _ensure_company_as_party(
                     conn, prev_co_id, prev_branch_id, source_co_id, updated_by
                 )
+                ensured_branch_id = _ensure_party_branch_from_source_branch(
+                    conn, last_seller_party_id, prev_branch_id, updated_by
+                )
+                if ensured_branch_id is not None:
+                    last_seller_party_branch_id = ensured_branch_id
                 # Inherit challan_no/challan_date from the previous hop's invoice,
                 # mirroring the non-final branch below. mukam_id is preserved
                 # (not in the UPDATE inside _update_original_mr).
