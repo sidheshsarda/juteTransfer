@@ -41,3 +41,13 @@
 [2026-04-07T15:59:43.818843] _create_mr: branch_id=25, mr_date=2026-04-07, bill_pass_no=1
 [2026-04-08T17:34:03.977681] save_transfer_step: is_first_step=True, is_final=False, source_mr_id=27886, step.co_id=4, step.branch_id=9, source_co_id=1, source_branch_id=2
 [2026-04-08T17:34:04.877832] _create_mr: branch_id=9, mr_date=2026-04-08, bill_pass_no=1
+[2026-04-17T15:55:20.314275] save_transfer_step: is_first_step=False, is_final=True, source_mr_id=27931, step.co_id=1, step.branch_id=2, source_co_id=1, source_branch_id=2
+[2026-04-17T15:55:22.132986] FINAL STEP — calling _update_original_mr for root_mr_id=27927, source_branch_id=2, mr_date=2026-04-01
+[2026-04-17T15:55:22.682527] _update_original_mr: jute_mr_id=27927, branch_id=2, mr_date=2026-04-01, new_mr_no=1, new_bill_pass_no=1
+[2026-04-17T15:55:22.838613] UPDATE executed — bill_pass_no=1, bill_pass_date=2026-04-01 for jute_mr_id=27927
+[2026-04-17T15:55:22.905223] VERIFY after update: bill_pass_no=1, bill_pass_date=2026-04-01
+[2026-04-17T16:13:55.800248] save_transfer_step: is_first_step=False, is_final=True, source_mr_id=27931, step.co_id=1, step.branch_id=2, source_co_id=1, source_branch_id=2
+[2026-04-17T16:13:57.481078] FINAL STEP — calling _update_original_mr for root_mr_id=27927, source_branch_id=2, mr_date=2026-04-01
+[2026-04-17T16:13:58.249305] _update_original_mr: jute_mr_id=27927, branch_id=2, mr_date=2026-04-01, new_mr_no=1, new_bill_pass_no=1
+[2026-04-17T16:13:58.397915] UPDATE executed — bill_pass_no=1, bill_pass_date=2026-04-01 for jute_mr_id=27927
+[2026-04-17T16:13:58.465654] VERIFY after update: bill_pass_no=1, bill_pass_date=2026-04-01
