@@ -66,6 +66,7 @@ Or use uv to run directly:
 
 ```bash
 uv run streamlit run app.py
+streamlit run app.py --server.port 8502
 ```
 
 The application will open in your default web browser at `http://localhost:8502`
