@@ -20,7 +20,7 @@ The fundamental pattern is a **circular transfer chain**:
 - User **manually finalizes** the MR when it returns to Company A (not auto-detected)
 - Each transfer step has rates that cascade downward (compound effect)
 
-**Key requirement:** Preserve both "forest view" (all MRs for a month in compact table) and "tree view" (expandable editor for a single MR's transfer chain).
+**Key requirement:** The vertical transfer chain page is the single UI surface for viewing and editing an MR's chain from root through final return.
 
 ## Architecture
 
@@ -29,11 +29,11 @@ The fundamental pattern is a **circular transfer chain**:
 ```
 src/jutetransfer/
 ├── pages/
-│   ├── jute_mr.py                    # Main MR page UI (~270 lines)
+│   ├── new_transfer_chain.py         # Vertical transfer chain page (sole editing UI)
+│   ├── company_pl_dashboard.py       # Company P&L dashboard page
 │   ├── schema_viewer.py              # Schema browser page
 │   └── __init__.py
-├── jute_mr_chain_helpers.py          # Pure Python chain logic (257 lines)
-├── jute_mr_editor.py                 # Streamlit transfer editor component (517 lines)
+├── jute_mr_chain_helpers.py          # Pure Python chain logic
 ├── transfer.py                       # Transfer data operations & finalization
 ├── queries.py                        # Database queries (get_companies, get_jute_mr_with_line_items, etc)
 ├── models.py                         # SQLAlchemy ORM models
@@ -50,21 +50,17 @@ app.py                                # Streamlit entry point
 ### Critical Dependencies
 
 **jute_mr_chain_helpers.py** → **No circular imports allowed**
-- This is the pure Python core; imports nothing from pages or editor
+- This is the pure Python core; imports nothing from pages
 - Contains: grouping, chain reconstruction, status checks, rate recalculation math
-- Used by: `jute_mr_editor.py`, `transfer.py`, `jute_mr.py`
-
-**jute_mr_editor.py** → **Streamlit UI for transfer editing**
-- Imports: `jute_mr_chain_helpers`, `transfer`, `queries`
-- DO NOT import from `pages/jute_mr.py` (would create circular dep)
+- Used by: `transfer.py`, `pages/new_transfer_chain.py`
 
 **transfer.py** → **Public API for transfer operations**
-- Imports: `jute_mr_chain_helpers` (for `_reconstruct_chain`)
-- Used by: `jute_mr_editor.py` for save/delete operations
+- Imports: `jute_mr_chain_helpers`, `queries`, `database`
+- Used by: `pages/new_transfer_chain.py` for save/delete/finalize operations
 
-**pages/jute_mr.py** → **Main dashboard page**
-- Imports: `jute_mr_chain_helpers`, `jute_mr_editor`, `queries`
-- Renders monthly table + expandable editor for selected MR
+**pages/new_transfer_chain.py** → **Transfer Chain (Vertical) page**
+- Imports: `jute_mr_chain_helpers`, `transfer`, `queries`
+- Renders the vertical 3-level chain editor used for all transfer editing
 
 ## Key Implementation Patterns
 
@@ -77,7 +73,7 @@ app.py                                # Streamlit entry point
 2. `value=current_pct` parameter reset widget state every rerun
 3. Closures captured stale loop variables
 
-**Current Solution (jute_mr_editor.py lines ~482-501):**
+**Current Solution (in `pages/new_transfer_chain.py`):**
 ```python
 # Initialize widget state if missing
 if pct_key not in st.session_state:
@@ -101,7 +97,7 @@ if new_pct != current_pct:
 - Respects claim propagation rules (don't cascade past claim breaks)
 - Returns updated chain with all dependent steps recalculated
 
-**Used by:** jute_mr_editor when user modifies % rate increase or other step properties.
+**Used by:** the vertical transfer chain page when the user modifies % rate increase or other step properties.
 
 ### 3. Session State Management
 
@@ -129,7 +125,7 @@ Do NOT use:
 
 ```bash
 # Module import validation
-python -c "from src.jutetransfer import jute_mr_chain_helpers, jute_mr_editor, pages.jute_mr, transfer; print('✓ All imports OK')"
+python -c "from src.jutetransfer import jute_mr_chain_helpers, transfer; from src.jutetransfer.pages import new_transfer_chain, schema_viewer, company_pl_dashboard; print('✓ All imports OK')"
 
 # Full app (requires MySQL, .env with credentials)
 streamlit run app.py
@@ -168,15 +164,14 @@ When modifying chain logic or the transfer editor:
 
 3. **Keep modules focused**
    - jute_mr_chain_helpers: pure Python chain math
-   - jute_mr_editor: Streamlit UI rendering
+   - pages/new_transfer_chain: Streamlit UI rendering
    - transfer.py: data operations
    - queries.py: database reads
 
 ### File Size Targets
 
-- **pages/jute_mr.py**: Keep under 400 lines (currently ~270)
-- **jute_mr_editor.py**: Keep under 600 lines (currently ~517)
-- **jute_mr_chain_helpers.py**: Keep under 350 lines (currently ~257)
+- **pages/new_transfer_chain.py**: Keep focused; extract helpers if it grows past ~700 lines
+- **jute_mr_chain_helpers.py**: Keep under 350 lines
 
 If a module exceeds these targets, consider extracting helper functions into separate files (e.g., `jute_mr_calculations.py`).
 
@@ -185,7 +180,7 @@ If a module exceeds these targets, consider extracting helper functions into sep
 ### Adding a New Transfer Step Property
 
 1. Update `_empty_transfer_step()` in `jute_mr_chain_helpers.py`
-2. Add field to `jute_mr_editor._render_transfer_editor()` input section
+2. Add field to the editor input section in `pages/new_transfer_chain.py`
 3. Update `_recalculate_chain()` logic if the property affects downstream calculations
 4. Update `transfer.save_transfer_step()` to persist the new field
 5. Test: Verify new field displays, saves, and cascades (if applicable)
@@ -212,6 +207,6 @@ If a module exceeds these targets, consider extracting helper functions into sep
 
 ---
 
-**Last Updated:** 2026-04-03  
+**Last Updated:** 2026-04-18  
 **Maintained By:** Development Team  
-**Key Constraint:** Circular transfer chains must be preserved; monthly table visibility is non-negotiable
+**Key Constraint:** Circular transfer chains must be preserved; the vertical transfer chain page is the sole editing UI

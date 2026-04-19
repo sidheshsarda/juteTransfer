@@ -6,7 +6,6 @@ from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 from src.jutetransfer.auth import login, logout, is_authenticated, get_username
 
 from src.jutetransfer.pages import (
-    jute_mr_table_page,
     schema_viewer_page,
     transfer_chain_page,
     company_pl_dashboard_page,
@@ -37,7 +36,7 @@ def display_sidebar():
             page = st.radio(
                 "Select Page",
                 ["Dashboard", "Analytics",
-                    "Jute MR Table", "Transfer Chain (Vertical)",
+                    "Transfer Chain (Vertical)",
                     "Company P&L", "Schema Viewer"],
                 label_visibility="collapsed"
             )
@@ -101,8 +100,6 @@ def main():
         dashboard_page()
     elif page == "Analytics":
         analytics_page()
-    elif page == "Jute MR Table":
-        jute_mr_table_page()
     elif page == "Transfer Chain (Vertical)":
         transfer_chain_page()
     elif page == "Company P&L":

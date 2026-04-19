@@ -10,13 +10,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 from typing import Optional, Any, Literal, Union
 from contextlib import contextmanager
-import logging
 
 from .config import DatabaseConfig
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 class DatabaseConnection:
@@ -28,19 +23,14 @@ class DatabaseConnection:
     def get_engine(cls):
         """Get or create SQLAlchemy engine with connection pooling."""
         if cls._engine is None:
-            try:
-                connection_string = DatabaseConfig.get_connection_string()
-                cls._engine = create_engine(
-                    connection_string,
-                    pool_size=DatabaseConfig.POOL_SIZE,
-                    max_overflow=DatabaseConfig.MAX_OVERFLOW,
-                    pool_pre_ping=True,  # Enable connection health checks
-                    echo=False,  # Set to True for SQL debugging
-                )
-                logger.info("Database engine created successfully")
-            except Exception as e:
-                logger.error(f"Failed to create database engine: {e}")
-                raise
+            connection_string = DatabaseConfig.get_connection_string()
+            cls._engine = create_engine(
+                connection_string,
+                pool_size=DatabaseConfig.POOL_SIZE,
+                max_overflow=DatabaseConfig.MAX_OVERFLOW,
+                pool_pre_ping=True,  # Enable connection health checks
+                echo=False,  # Set to True for SQL debugging
+            )
         return cls._engine
     
     @classmethod
@@ -52,8 +42,7 @@ class DatabaseConnection:
             engine = cls.get_engine()
             connection = engine.connect()
             yield connection
-        except Exception as e:
-            logger.error(f"Database connection error: {e}")
+        except Exception:
             if connection:
                 connection.rollback()
             raise
@@ -87,16 +76,12 @@ class DatabaseConnection:
         Returns:
             pd.DataFrame: Query results
         """
-        try:
-            with cls.get_connection() as conn:
-                if params:
-                    df = pd.read_sql_query(text(query), conn, params=params)
-                else:
-                    df = pd.read_sql_query(text(query), conn)
-                return df
-        except Exception as e:
-            logger.error(f"Query execution error: {e}")
-            raise
+        with cls.get_connection() as conn:
+            if params:
+                df = pd.read_sql_query(text(query), conn, params=params)
+            else:
+                df = pd.read_sql_query(text(query), conn)
+            return df
     
     @classmethod
     @contextmanager
@@ -135,14 +120,10 @@ class DatabaseConnection:
         Returns:
             int: Number of affected rows
         """
-        try:
-            with cls.get_connection() as conn:
-                result = conn.execute(text(query), params or {})
-                conn.commit()
-                return result.rowcount
-        except Exception as e:
-            logger.error(f"Non-query execution error: {e}")
-            raise
+        with cls.get_connection() as conn:
+            result = conn.execute(text(query), params or {})
+            conn.commit()
+            return result.rowcount
     
     @classmethod
     def insert_dataframe(cls, df: pd.DataFrame, table_name: str, 
@@ -157,19 +138,14 @@ class DatabaseConnection:
         Returns:
             int: Number of rows inserted
         """
-        try:
-            engine = cls.get_engine()
-            rows_inserted = df.to_sql(
-                name=table_name,
-                con=engine,
-                if_exists=if_exists,
-                index=False
-            )
-            logger.info(f"Inserted {rows_inserted} rows into {table_name}")
-            return rows_inserted or len(df)
-        except Exception as e:
-            logger.error(f"DataFrame insertion error: {e}")
-            raise
+        engine = cls.get_engine()
+        rows_inserted = df.to_sql(
+            name=table_name,
+            con=engine,
+            if_exists=if_exists,
+            index=False
+        )
+        return rows_inserted or len(df)
 
 
 def get_mysql_connector() -> Optional[Union[mysql.connector.MySQLConnection, PooledMySQLConnection, MySQLConnectionAbstract]]:
@@ -182,10 +158,8 @@ def get_mysql_connector() -> Optional[Union[mysql.connector.MySQLConnection, Poo
         config = DatabaseConfig.get_mysql_config()
         connection = mysql.connector.connect(**config)
         if connection.is_connected():
-            logger.info("MySQL connector connection established")
             return connection
-    except MySQLError as e:
-        logger.error(f"MySQL connector error: {e}")
+    except MySQLError:
         return None
 
 

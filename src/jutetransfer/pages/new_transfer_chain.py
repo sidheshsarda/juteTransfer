@@ -613,7 +613,7 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 else:
                     st.write("**Warehouse:** —")
             else:
-                # Editable warehouse selectbox (same pattern as jute_mr_editor.py:327-349)
+                # Editable warehouse selectbox
                 company_label = step.get("company", "")
                 _, co_branch_mapping = get_company_branch_options()
                 if company_label and company_label in co_branch_mapping:
