@@ -553,9 +553,13 @@ def _get_next_gate_entry_no(conn, branch_id: int) -> int:
     return int(result.scalar() or 0) + 1
 
 
-def _get_next_mr_number_in_txn(conn, branch_id: int) -> int:
-    """Get next branch_mr_no inside an existing transaction."""
-    fy_start, fy_end = _get_financial_year_bounds()
+def _get_next_mr_number_in_txn(conn, branch_id: int, mr_date: date) -> int:
+    """Get next branch_mr_no inside an existing transaction.
+
+    FY window is derived from mr_date (the date of the MR being inserted), so
+    back-dated or forward-dated entries are numbered within their own FY.
+    """
+    fy_start, fy_end = _get_financial_year_bounds(mr_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(branch_mr_no), 0) AS max_no
                 FROM jute_mr
@@ -1097,7 +1101,7 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
     _ensure_party_types(conn, final_party_id, updated_by)
 
     # Assign branch_mr_no and bill_pass_no
-    new_mr_no = _get_next_mr_number_in_txn(conn, branch_id)
+    new_mr_no = _get_next_mr_number_in_txn(conn, branch_id, mr_date)
     new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, branch_id)
 
     # Update each line item with its computed absolute rate.
@@ -1338,7 +1342,7 @@ def save_transfer_step(
             raise ValueError(f"Source MR {source_mr_id} not found")
 
         # Assign MR number inside transaction
-        step.mr_no = _get_next_mr_number_in_txn(conn, step.branch_id)
+        step.mr_no = _get_next_mr_number_in_txn(conn, step.branch_id, step.mr_date)
         step.gate_entry_no = _get_next_gate_entry_no(conn, step.branch_id)
 
         if is_first_step:
