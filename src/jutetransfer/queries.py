@@ -2,7 +2,7 @@
 
 import pandas as pd
 from typing import Optional, Tuple
-from datetime import datetime
+from datetime import date, datetime
 from .database import DatabaseConnection
 
 
@@ -67,12 +67,12 @@ def get_company_branch_options() -> Tuple[list, dict]:
     return options, mapping
 
 
-def _get_financial_year_bounds() -> Tuple[datetime, datetime]:
-    """Get the current financial year start and end dates (April to March)."""
-    now = datetime.now()
-    if now.month >= 4:
-        return datetime(now.year, 4, 1), datetime(now.year + 1, 3, 31)
-    return datetime(now.year - 1, 4, 1), datetime(now.year, 3, 31)
+def _get_financial_year_bounds(ref_date: Optional[date] = None) -> Tuple[datetime, datetime]:
+    """FY bounds (April 1 – March 31) containing ref_date; defaults to today."""
+    d = ref_date or datetime.now().date()
+    if d.month >= 4:
+        return datetime(d.year, 4, 1), datetime(d.year + 1, 3, 31)
+    return datetime(d.year - 1, 4, 1), datetime(d.year, 3, 31)
 
 
 def get_next_mr_number(co_id: int, branch_id: int) -> int:

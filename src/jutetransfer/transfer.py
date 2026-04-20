@@ -9,23 +9,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
-import logging
 
 from sqlalchemy import text
 
 from .database import DatabaseConnection
 from .jute_mr_chain_helpers import _calculate_line_item_amount
 from .queries import get_source_mr_full, _get_financial_year_bounds
-
-logger = logging.getLogger(__name__)
-
-
-def _debug_log(msg: str) -> None:
-    """Append debug message to a log file (Streamlit swallows stdout)."""
-    import os
-    log_path = os.path.join(os.path.dirname(__file__), "..", "..", "debug_transfer.log")
-    with open(log_path, "a") as f:
-        f.write(f"[{datetime.now().isoformat()}] {msg}\n")
 
 # Fixed invoice type for raw jute transfers
 RAW_JUTE_INVOICE_TYPE = 5
@@ -564,9 +553,13 @@ def _get_next_gate_entry_no(conn, branch_id: int) -> int:
     return int(result.scalar() or 0) + 1
 
 
-def _get_next_mr_number_in_txn(conn, branch_id: int) -> int:
-    """Get next branch_mr_no inside an existing transaction."""
-    fy_start, fy_end = _get_financial_year_bounds()
+def _get_next_mr_number_in_txn(conn, branch_id: int, mr_date: date) -> int:
+    """Get next branch_mr_no inside an existing transaction.
+
+    FY window is derived from mr_date (the date of the MR being inserted), so
+    back-dated or forward-dated entries are numbered within their own FY.
+    """
+    fy_start, fy_end = _get_financial_year_bounds(mr_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(branch_mr_no), 0) AS max_no
                 FROM jute_mr
@@ -628,8 +621,6 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
 
     # Generate bill_pass_no for this branch/financial year
     new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, step.branch_id)
-    _debug_log(f"_create_mr: branch_id={step.branch_id}, mr_date={step.mr_date}, "
-               f"bill_pass_no={new_bill_pass_no}")
 
     new_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO jute_mr (
@@ -1110,10 +1101,8 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
     _ensure_party_types(conn, final_party_id, updated_by)
 
     # Assign branch_mr_no and bill_pass_no
-    new_mr_no = _get_next_mr_number_in_txn(conn, branch_id)
+    new_mr_no = _get_next_mr_number_in_txn(conn, branch_id, mr_date)
     new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, branch_id)
-    _debug_log(f"_update_original_mr: jute_mr_id={jute_mr_id}, branch_id={branch_id}, "
-               f"mr_date={mr_date}, new_mr_no={new_mr_no}, new_bill_pass_no={new_bill_pass_no}")
 
     # Update each line item with its computed absolute rate.
     # source_mr provides the jute_mr_li_id (which DB row to update).
@@ -1213,14 +1202,6 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
         "updated_by": updated_by,
         "mr_id": jute_mr_id,
     })
-    _debug_log(f"UPDATE executed — bill_pass_no={new_bill_pass_no}, "
-               f"bill_pass_date={mr_date} for jute_mr_id={jute_mr_id}")
-
-    # Verify the update actually persisted
-    verify = conn.execute(text(
-        "SELECT bill_pass_no, bill_pass_date FROM jute_mr WHERE jute_mr_id = :mr_id"
-    ), {"mr_id": jute_mr_id}).fetchone()
-    _debug_log(f"VERIFY after update: bill_pass_no={verify[0]}, bill_pass_date={verify[1]}")
 
 
 def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by: int) -> None:
@@ -1355,17 +1336,13 @@ def save_transfer_step(
     mr_id = None
     invoice_id = None
 
-    _debug_log(f"save_transfer_step: is_first_step={is_first_step}, is_final={is_final}, "
-               f"source_mr_id={source_mr_id}, step.co_id={step.co_id}, step.branch_id={step.branch_id}, "
-               f"source_co_id={source_co_id}, source_branch_id={source_branch_id}")
-
     with DatabaseConnection.get_transaction() as conn:
         source_mr = get_source_mr_full(source_mr_id, conn=conn)
         if not source_mr:
             raise ValueError(f"Source MR {source_mr_id} not found")
 
         # Assign MR number inside transaction
-        step.mr_no = _get_next_mr_number_in_txn(conn, step.branch_id)
+        step.mr_no = _get_next_mr_number_in_txn(conn, step.branch_id, step.mr_date)
         step.gate_entry_no = _get_next_gate_entry_no(conn, step.branch_id)
 
         if is_first_step:
@@ -1433,8 +1410,6 @@ def save_transfer_step(
                     root_mr = source_mr
                     rate_source_lis = None  # same MR, no separate rate source needed
 
-                _debug_log(f"FINAL STEP — calling _update_original_mr "
-                           f"for root_mr_id={root_mr_id_for_update}, source_branch_id={source_branch_id}, mr_date={step.mr_date}")
                 last_seller_party_id, last_seller_party_branch_id = _ensure_company_as_party(
                     conn, prev_co_id, prev_branch_id, source_co_id, updated_by
                 )
@@ -1475,7 +1450,6 @@ def save_transfer_step(
                     use_new_rounding=use_new_rounding,
                 )
 
-    logger.info(f"Transfer step saved for MR {source_mr_id}: mr_id={mr_id}, invoice_id={invoice_id}")
     return {"mr_id": mr_id, "invoice_id": invoice_id}
 
 
@@ -1539,8 +1513,6 @@ def delete_transfer_step(jute_mr_id: int, updated_by: int) -> None:
         conn.execute(text("DELETE FROM jute_mr_li WHERE jute_mr_id = :id"), {"id": jute_mr_id})
         conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"), {"id": jute_mr_id})
 
-    logger.info(f"Deleted transfer MR {jute_mr_id} and linked invoices")
-
 
 def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) -> None:
     """Delete chain steps from a given point onward, OR revert finalization.
@@ -1591,12 +1563,29 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
         if not was_complete:
             return
         if step1_source_mr is None:
-            logger.warning(
-                f"delete_chain_from_step: cannot revert root MR {root_mr_id} — "
-                f"Step 1 source MR not found."
-            )
             return
+        # The finalization invoice was created with sales_invoice_jute.mr_id =
+        # the last seller's MR (last entry of the reconstructed chain). Delete
+        # those invoice rows in the same transaction as the root-MR revert so
+        # nothing orphans if either step fails.
+        last_seller_mr_id = ordered[-1]["jute_mr_id"] if ordered else None
         with DatabaseConnection.get_transaction() as conn:
+            if last_seller_mr_id is not None:
+                inv_rows = conn.execute(
+                    text("SELECT invoice_id FROM sales_invoice_jute "
+                         "WHERE mr_id = :mr_id"),
+                    {"mr_id": last_seller_mr_id},
+                ).fetchall()
+                for (inv_id,) in inv_rows:
+                    conn.execute(text(
+                        "DELETE FROM sales_invoice_jute WHERE invoice_id = :id"
+                    ), {"id": inv_id})
+                    conn.execute(text(
+                        "DELETE FROM sales_invoice_dtl WHERE invoice_id = :id"
+                    ), {"id": inv_id})
+                    conn.execute(text(
+                        "DELETE FROM sales_invoice WHERE invoice_id = :id"
+                    ), {"id": inv_id})
             revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
         return
 
@@ -1609,21 +1598,9 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
     for mr in reversed(to_delete):
         delete_transfer_step(mr["jute_mr_id"], updated_by)
 
-    if was_complete:
-        if step1_source_mr is None:
-            logger.warning(
-                f"delete_chain_from_step: cannot revert root MR {root_mr_id} — "
-                f"Step 1 source MR not found; root may remain finalized."
-            )
-        elif from_idx == 0:
-            logger.warning(
-                f"delete_chain_from_step: Step 1 itself was deleted for root MR "
-                f"{root_mr_id}; cannot revert finalization using Step 1's data. "
-                f"Root MR may be left in a finalized state with no clean revert path."
-            )
-        else:
-            with DatabaseConnection.get_transaction() as conn:
-                revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
+    if was_complete and step1_source_mr is not None and from_idx != 0:
+        with DatabaseConnection.get_transaction() as conn:
+            revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
 
 
 # ---------------------------------------------------------------------------
@@ -1678,8 +1655,4 @@ def finalize_transfer_chain(
         if result.get("invoice_id"):
             invoice_ids.append(result["invoice_id"])
 
-    logger.info(
-        f"Transfer chain finalized for MR {source_mr_id}: "
-        f"created {len(mr_ids)} MRs, {len(invoice_ids)} invoices"
-    )
     return {"mr_ids": mr_ids, "invoice_ids": invoice_ids}
