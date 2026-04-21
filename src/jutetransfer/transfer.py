@@ -805,9 +805,13 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
 # Sales invoice creation
 # ---------------------------------------------------------------------------
 
-def _get_next_invoice_no(conn, branch_id: int) -> int:
-    """Get the next sequential invoice number for a branch in the current FY."""
-    fy_start, fy_end = _get_financial_year_bounds()
+def _get_next_invoice_no(conn, branch_id: int, invoice_date: date) -> int:
+    """Next sequential invoice_no for a branch within the FY of invoice_date.
+
+    FY window is derived from invoice_date so back-dated / forward-dated
+    invoices are numbered within their own FY (matches _get_next_mr_number_in_txn).
+    """
+    fy_start, fy_end = _get_financial_year_bounds(invoice_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(invoice_no), 0) AS max_no
                 FROM sales_invoice
@@ -872,7 +876,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         challan_date (date): Challan date (= seller_step.mr_date)
         challan_no (str): Generated challan number
     """
-    invoice_no = _get_next_invoice_no(conn, seller_step.branch_id)
+    invoice_no = _get_next_invoice_no(conn, seller_step.branch_id, seller_step.mr_date)
     challan_no = _get_next_challan_no(conn, seller_step.branch_id, seller_step.mr_date)
 
     # Calculate invoice amounts with precise decimal arithmetic
