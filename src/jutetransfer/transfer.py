@@ -690,7 +690,7 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
         "src_jute_mr_id": root_mr_id,  # always root
         "bill_pass_no": new_bill_pass_no,
         "bill_pass_date": step.mr_date,
-        "invoice_no": str(seller_invoice["invoice_no"]) if seller_invoice else None,
+        "invoice_no": seller_invoice["invoice_no_formatted"] if seller_invoice else None,
         "invoice_date": seller_invoice["invoice_date"] if seller_invoice else None,
         "invoice_amount": seller_invoice["invoice_amount"] if seller_invoice else None,
     })
@@ -805,6 +805,48 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
 # Sales invoice creation
 # ---------------------------------------------------------------------------
 
+def _get_seller_prefixes(conn, branch_id: int) -> tuple[Optional[str], Optional[str]]:
+    """Fetch (co_prefix, branch_prefix) for a branch in-transaction."""
+    row = conn.execute(
+        text("""SELECT cm.co_prefix, bm.branch_prefix
+                FROM branch_mst bm
+                JOIN co_mst cm ON cm.co_id = bm.co_id
+                WHERE bm.branch_id = :bid"""),
+        {"bid": branch_id},
+    ).fetchone()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+def _format_financial_year(ref_date: date) -> str:
+    """FY label like '25-26' for an Indian fiscal year (Apr–Mar) containing ref_date."""
+    start_year = ref_date.year if ref_date.month >= 4 else ref_date.year - 1
+    return f"{start_year % 100:02d}-{(start_year + 1) % 100:02d}"
+
+
+def _format_document_no(
+    doc_no: Optional[int],
+    co_prefix: Optional[str],
+    branch_prefix: Optional[str],
+    ref_date: date,
+    document_type: str = "SI",
+) -> str:
+    """Format '<co>/<branch>/<type>/<FY>/<n>', dropping empty prefix parts.
+
+    Returns "" when doc_no is None or 0.
+    """
+    if not doc_no:
+        return ""
+    parts: list[str] = []
+    if co_prefix:
+        parts.append(co_prefix)
+    if branch_prefix:
+        parts.append(branch_prefix)
+    parts.extend([document_type, _format_financial_year(ref_date), str(doc_no)])
+    return "/".join(parts)
+
+
 def _get_next_invoice_no(conn, branch_id: int, invoice_date: date) -> int:
     """Next sequential invoice_no for a branch within the FY of invoice_date.
 
@@ -871,6 +913,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
     Returns dict with keys:
         invoice_id (int): Newly created sales_invoice.invoice_id
         invoice_no (int): Sequential invoice number for the seller's branch in the FY
+        invoice_no_formatted (str): '<co>/<branch>/SI/<FY>/<n>' for jute_mr.invoice_no
         invoice_date (date): Invoice date (= seller_step.mr_date)
         invoice_amount (float): Header invoice amount
         challan_date (date): Challan date (= seller_step.mr_date)
@@ -878,6 +921,11 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
     """
     invoice_no = _get_next_invoice_no(conn, seller_step.branch_id, seller_step.mr_date)
     challan_no = _get_next_challan_no(conn, seller_step.branch_id, seller_step.mr_date)
+
+    co_prefix, branch_prefix = _get_seller_prefixes(conn, seller_step.branch_id)
+    invoice_no_formatted = _format_document_no(
+        invoice_no, co_prefix, branch_prefix, seller_step.mr_date, document_type="SI",
+    )
 
     # Calculate invoice amounts with precise decimal arithmetic
     line_amounts = []
@@ -1061,6 +1109,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
     return {
         "invoice_id": invoice_id,
         "invoice_no": invoice_no,            # int (BigInteger from sales_invoice)
+        "invoice_no_formatted": invoice_no_formatted,  # str for jute_mr.invoice_no
         "invoice_date": seller_step.mr_date, # date
         "invoice_amount": invoice_amount,    # float
         "challan_date": seller_step.mr_date,
@@ -1170,7 +1219,7 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
         optional_params["challan_date"] = challan_date
     if seller_invoice is not None:
         optional_assignments.append("invoice_no = :invoice_no")
-        optional_params["invoice_no"] = str(seller_invoice["invoice_no"])
+        optional_params["invoice_no"] = seller_invoice["invoice_no_formatted"]
         optional_assignments.append("invoice_date = :invoice_date")
         optional_params["invoice_date"] = seller_invoice["invoice_date"]
         optional_assignments.append("invoice_amount = :invoice_amount")
