@@ -1651,7 +1651,16 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
     for mr in reversed(to_delete):
         delete_transfer_step(mr["jute_mr_id"], updated_by)
 
-    if was_complete and step1_source_mr is not None and from_idx != 0:
+    if from_idx == 0:
+        # Whole chain rolled back from Step 1: the root MR is a bare gate entry
+        # again, so return its status from "pending" (13) to "open" (1).
+        with DatabaseConnection.get_transaction() as conn:
+            conn.execute(
+                text("UPDATE jute_mr SET status_id = 1, updated_by = :uid, "
+                     "updated_date_time = NOW() WHERE jute_mr_id = :id"),
+                {"uid": updated_by, "id": root_mr_id},
+            )
+    elif was_complete and step1_source_mr is not None:
         with DatabaseConnection.get_transaction() as conn:
             revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
 

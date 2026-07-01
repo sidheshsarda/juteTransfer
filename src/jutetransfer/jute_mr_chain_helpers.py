@@ -116,7 +116,7 @@ def _group_by_mr(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
         # Aggregated row
         first = group.iloc[0].to_dict()
-        total_weight = sum(li["weight"] for li in items)
+        total_weight = sum(li["weight"] or 0 for li in items)
         total_amount = group["Total Amount"].fillna(0).astype(float).sum()
         claim_amount = group["Claim Amount"].fillna(0).astype(float).sum()
 
