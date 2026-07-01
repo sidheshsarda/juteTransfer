@@ -350,7 +350,10 @@ def get_invoice_details_by_mr_id(mr_id: int) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def get_company_wise_purchases_by_month(fy_start, fy_end) -> pd.DataFrame:
-    """Return per-(company, month) net purchase totals from jute_mr for a FY.
+    """Return per-(company, month) net purchase totals from jute_mr.net_total.
+
+    Filters: jute_mr.status_id = 3 (Approved),
+             jute_mr_date within [fy_start, fy_end].
 
     Columns: co_id, co_name, month (1-12), net_purchases (float).
     """
@@ -365,6 +368,7 @@ def get_company_wise_purchases_by_month(fy_start, fy_end) -> pd.DataFrame:
         JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         JOIN co_mst cm ON bm.co_id = cm.co_id
         WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
+          AND mr.status_id = 3
         GROUP BY cm.co_id, cm.co_name, MONTH(mr.jute_mr_date)
         """,
         {

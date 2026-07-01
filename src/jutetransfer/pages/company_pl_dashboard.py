@@ -44,14 +44,15 @@ def _fy_label_to_bounds(label: str) -> Tuple[date, date]:
     return date(start_year, 4, 1), date(start_year + 1, 3, 31)
 
 
-def _current_and_previous_fy_labels() -> List[str]:
-    """Return [current_fy, previous_fy] as labels like '25-26'."""
+def _current_and_previous_fy_labels(earliest_start_year: int = 2018) -> List[str]:
+    """Return FY labels from current FY back to `earliest_start_year` (descending)."""
     today = datetime.now().date()
     current = _date_to_fy_label(today)
-    start_year = 2000 + int(current.split("-")[0])
-    prev_start = start_year - 1
-    previous = f"{prev_start % 100:02d}-{(prev_start + 1) % 100:02d}"
-    return [current, previous]
+    current_start = 2000 + int(current.split("-")[0])
+    labels: List[str] = []
+    for start in range(current_start, earliest_start_year - 1, -1):
+        labels.append(f"{start % 100:02d}-{(start + 1) % 100:02d}")
+    return labels
 
 
 # ---------------------------------------------------------------------------
