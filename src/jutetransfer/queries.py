@@ -27,7 +27,7 @@ def load_branches() -> pd.DataFrame:
 def load_warehouses() -> pd.DataFrame:
     """Load all warehouses (no cache - always fresh from database)."""
     return DatabaseConnection.execute_query(
-        "SELECT warehouse_id, warehouse_name, branch_id FROM warehouse_mst ORDER BY warehouse_name"
+        "SELECT warehouse_id, warehouse_name, warehouse_type, branch_id FROM warehouse_mst ORDER BY warehouse_name"
     )
 
 
@@ -147,7 +147,8 @@ def get_jute_mr_with_line_items(
     year: int,
     month: int,
     company_id: Optional[int] = None,
-    branch_id: Optional[int] = None
+    branch_id: Optional[int] = None,
+    transfer_mode: int = 0
 ) -> pd.DataFrame:
     """Fetch Jute MR records joined with line items.
     
@@ -163,6 +164,7 @@ def get_jute_mr_with_line_items(
     query = """
         SELECT
             mr.jute_mr_id AS `jute_mr_id`,
+            li.jute_mr_li_id AS `jute_mr_li_id`,
             mr.jute_gate_entry_no AS `Jute Gate Entry No`,
             mr.jute_gate_entry_date AS `Jute Gate Entry Date`,
             p.po_no AS `PO.No.`,
@@ -201,8 +203,9 @@ def get_jute_mr_with_line_items(
         LEFT JOIN warehouse_mst wh ON li.warehouse_id = wh.warehouse_id
         WHERE YEAR(mr.jute_gate_entry_date) = :year
         AND MONTH(mr.jute_gate_entry_date) = :month
+        AND mr.transfer_mode = :transfer_mode
     """
-    params = {"year": year, "month": month}
+    params = {"year": year, "month": month, "transfer_mode": transfer_mode}
 
     if company_id:
         query += " AND bm.co_id = :co_id"
@@ -283,6 +286,7 @@ def get_transfer_chain(root_mr_id: int) -> pd.DataFrame:
         JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         JOIN co_mst cm ON bm.co_id = cm.co_id
         WHERE mr.src_jute_mr_id = :root_id
+        AND mr.transfer_mode = 0
         ORDER BY mr.jute_mr_id ASC
         """,
         {"root_id": root_mr_id},
@@ -308,6 +312,7 @@ def get_transfer_chains_batch(mr_ids: list) -> dict:
         JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         JOIN co_mst cm ON bm.co_id = cm.co_id
         WHERE mr.src_jute_mr_id IN ({placeholders})
+        AND mr.transfer_mode = 0
         ORDER BY mr.jute_mr_id ASC
     """)
     if df is None or df.empty:
@@ -323,6 +328,24 @@ def get_warehouses_by_branch(branch_id: int) -> dict:
     # Explicit int cast to avoid numpy/pandas dtype mismatch from iterrows()
     filtered = df[df['branch_id'] == int(branch_id)]
     return dict(zip(filtered['warehouse_name'], filtered['warehouse_id']))
+
+
+def get_marked_warehouses_by_branch(branch_id: int) -> dict:
+    """Return {warehouse_name: warehouse_id} for a branch, only godowns tagged
+    as marked (warehouse_type == 'MARKED')."""
+    df = load_warehouses()
+    if df is None or df.empty:
+        return {}
+    filtered = df[(df['branch_id'] == int(branch_id)) & (df['warehouse_type'] == 'MARKED')]
+    return dict(zip(filtered['warehouse_name'], filtered['warehouse_id']))
+
+
+def set_warehouse_marked(warehouse_id: int, marked: bool) -> None:
+    """Tag/untag a godown as marked (warehouse_type = 'MARKED' or NULL)."""
+    DatabaseConnection.execute_non_query(
+        "UPDATE warehouse_mst SET warehouse_type = :t WHERE warehouse_id = :id",
+        {"t": "MARKED" if marked else None, "id": int(warehouse_id)},
+    )
 
 
 def get_invoice_details_by_mr_id(mr_id: int) -> Optional[dict]:
@@ -434,6 +457,7 @@ def get_company_wise_unsold_stock(fy_start, fy_end) -> pd.DataFrame:
         JOIN co_mst    cm ON bm.co_id = cm.co_id
         WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
           AND mr.status_id = 3
+          AND mr.transfer_mode = 0
           AND NOT EXISTS (
               SELECT 1
               FROM jute_mr root
@@ -448,6 +472,30 @@ def get_company_wise_unsold_stock(fy_start, fy_end) -> pd.DataFrame:
                 AND si.active = 1
                 AND si.invoice_type = 5
           )
+        GROUP BY cm.co_id, cm.co_name
+        """,
+        {
+            "fy_start": fy_start.strftime("%Y-%m-%d"),
+            "fy_end": fy_end.strftime("%Y-%m-%d"),
+        },
+    )
+
+
+def get_company_wise_marked_stock(fy_start, fy_end) -> pd.DataFrame:
+    """Return per-company warehouse-marked stock value (net_total of
+    transfer_mode=1 MRs). Columns: co_id, co_name, stock_value (float)."""
+    return DatabaseConnection.execute_query(
+        """
+        SELECT
+            cm.co_id   AS co_id,
+            cm.co_name AS co_name,
+            COALESCE(SUM(mr.net_total), 0) AS stock_value
+        FROM jute_mr mr
+        JOIN branch_mst bm ON mr.branch_id = bm.branch_id
+        JOIN co_mst    cm ON bm.co_id = cm.co_id
+        WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
+          AND mr.status_id = 3
+          AND mr.transfer_mode = 1
         GROUP BY cm.co_id, cm.co_name
         """,
         {
