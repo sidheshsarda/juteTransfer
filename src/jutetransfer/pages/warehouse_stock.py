@@ -188,7 +188,68 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
 
 def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
                        user_id: int) -> None:
-    st.info("Marked Stock tab — implemented in a later task.")
+    with st.expander("Tag godowns as marked"):
+        all_wh = get_warehouses_by_branch(branch_id)
+        marked_wh = get_marked_warehouses_by_branch(branch_id)
+        if not all_wh:
+            st.write("No godowns for this branch.")
+        else:
+            chosen = st.multiselect(
+                "Marked godowns (this branch)",
+                options=list(all_wh.keys()),
+                default=list(marked_wh.keys()),
+            )
+            if st.button("Save godown tags"):
+                chosen_ids = {int(all_wh[n]) for n in chosen}
+                for _name, wid in all_wh.items():
+                    set_warehouse_marked(int(wid), int(wid) in chosen_ids)
+                st.success("Godown tags updated.")
+                st.rerun()
+
+    mk = get_marked_stock_with_balance(co_id, branch_id, year, month)
+    st.subheader("Marked stock here")
+    if mk is None or mk.empty:
+        st.info("No marked stock for this filter.")
+        return
+
+    in_stock_val = mk.loc[mk["consumed"] == 0, "value"].sum()
+    st.markdown(
+        f"**Remaining marked value: {in_stock_val:,.2f}** "
+        f"(balance-priced; consumed lots drop out of P&L automatically)"
+    )
+
+    for mr_id, grp in mk.groupby("jute_mr_id", sort=True):
+        mr_id = int(mr_id)
+        consumed = bool((grp["consumed"] == 1).all())
+        partially = bool((grp["balance_kg"] < grp["kg"]).any()) and not consumed
+        src_raw = grp["src_jute_mr_id"].iloc[0]
+        src_label = int(src_raw) if pd.notna(src_raw) else "-"
+        head = (
+            f"MR {mr_id} (no. {grp['mr_no'].iloc[0]}, {grp['mr_date'].iloc[0]}) "
+            f"— source MR {src_label}"
+        )
+        if partially:
+            head += " — **partially consumed**"
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.markdown(("~~" + head + "~~ **CONSUMED**") if consumed else head)
+            st.dataframe(
+                grp[["quality", "kg", "balance_kg", "rate", "value", "godown"]],
+                use_container_width=True, hide_index=True,
+            )
+            prov = get_lot_provenance(mr_id)
+            if not prov.empty:
+                with st.expander("Source provenance"):
+                    st.dataframe(prov, use_container_width=True, hide_index=True)
+        with c2:
+            can_delete = bool((grp["balance_kg"] >= grp["kg"]).all())
+            if st.button("Delete", key=f"del_mk_{mr_id}", disabled=not can_delete):
+                try:
+                    delete_marked_move(mr_id, user_id)
+                    st.success("Deleted; source restored.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
 
 
 def warehouse_stock_page() -> None:
