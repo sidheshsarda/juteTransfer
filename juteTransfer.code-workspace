@@ -1,0 +1,18 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../vowerp3be"
+		},
+		{
+			"path": "../vowerp3ui"
+		}
+	],
+	"settings": {
+		"terminal.integrated.env.windows": {
+			"VIRTUAL_ENV": "${workspaceFolder}/.venv"
+		}
+	}
+}
