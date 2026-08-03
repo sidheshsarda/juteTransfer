@@ -212,15 +212,17 @@ marked moves):
 In `warehouse_stock_ops.py`:
 
 - `save_marked_batch(lot_li_ids: list[int], pct_change: float, target_co_id,
-  target_branch_id, warehouse_id, mr_date, updated_by) -> list[int]`
-  (returns created child MR ids; supersedes single `save_marked_move` on the
+  target_branch_id, warehouse_id, mr_date, updated_by) -> list[dict]`
+  (returns one `{"child_mr_id": int, "invoice_no": str, "invoice_amount": float}`
+  per created child MR; supersedes single `save_marked_move` on the
   page — the old function stays for compatibility/tests)
 - `_create_marked_sales_invoice(conn, child_mr_id, src_mr_id, src_branch_id,
-  buyer_party_id, buyer_party_branch_id, mr_date, updated_by) -> dict`
+  buyer_party_id, buyer_party_branch_id, inv_lines, mr_date, updated_by) -> dict`
   (amendment 2026-08-03) — the Type 2 counterpart of
   `transfer._create_sales_invoice`, called by `save_marked_batch` once per
-  child MR after its lines exist; reads child lines back for amounts; returns
-  the invoice dict used to stamp the child MR row.
+  child MR after its lines exist; line data (kg/rate/price/source-company
+  item id) is passed in by the caller via `inv_lines` instead of reading
+  child lines back; returns the invoice dict used to stamp the child MR row.
 - `delete_marked_move` — add sold-invoice block; additionally (amendment
   2026-08-03) cascade-delete the linked invoice (`sales_invoice_jute_dtl` →
   `sales_invoice_jute` → `sales_invoice_dtl` → `sales_invoice`) found via

@@ -149,9 +149,10 @@ _LI_INSERT_SQL = """
 
 
 def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
-                                 src_co_id: int, src_branch_id: int,
+                                 src_branch_id: int,
                                  buyer_party_id: int, buyer_party_branch_id,
-                                 mr_date: date, updated_by: int) -> dict:
+                                 inv_lines: list, mr_date: date,
+                                 updated_by: int) -> dict:
     """Seller-side Raw-Jute invoice for one marked child MR (owner amendment
     2026-08-03): the batch transfer IS the inter-company sale, so the source
     branch bills the target company at the child's (marked-up) rates. One
@@ -160,19 +161,12 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
     sales_invoice_jute.mr_id stores the CHILD MR id — the deletion linkage
     for delete_marked_move. NOTE: Type 1 stores the seller MR id there; the
     differing semantics are safe because mode-1 MRs never enter a chain.
-    Invoice line item ids are remapped back to the SOURCE company via
-    _ensure_item (child lines carry target-company item ids; normally a
-    no-op lookup since the item originates at the source).
+    Line data (kg/rate/price/item id) is passed in by the caller
+    (save_marked_batch) — item ids are the ORIGINAL source-company ids the
+    caller already had in scope, not re-derived here.
     """
-    lines = [
-        dict(r._mapping) for r in conn.execute(text("""
-            SELECT accepted_weight, rate, total_price, actual_item_id,
-                   actual_qty, unit_conversion
-            FROM jute_mr_li WHERE jute_mr_id = :id
-            ORDER BY jute_mr_li_id
-        """), {"id": child_mr_id}).fetchall()
-    ]
-    line_sum = round(sum(float(l["total_price"] or 0) for l in lines), 2)
+    lines = inv_lines
+    line_sum = round(sum(float(l["price"] or 0) for l in lines), 2)
     invoice_amount = float(round(line_sum, 0))
     round_off = round(invoice_amount - line_sum, 2)
 
@@ -216,11 +210,9 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
     })
 
     for l in lines:
-        kg = float(l["accepted_weight"] or 0)
+        kg = float(l["kg"] or 0)
         rate_kg = round(float(l["rate"] or 0) / 100.0, 2)
-        item_id = l["actual_item_id"]
-        if item_id:
-            item_id = _ensure_item(conn, int(item_id), src_co_id, updated_by)
+        item_id = l["item_id"]
         qty = l["actual_qty"] or ""
         unit = l["unit_conversion"] or ""
         dtl_id = DatabaseConnection.execute_insert_returning_id(conn, """
@@ -236,7 +228,7 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
             "item_id": item_id,
             "kg": kg,
             "rate": rate_kg,
-            "amount": float(l["total_price"] or 0),
+            "amount": float(l["price"] or 0),
             "remarks": f"Raw Jute - {qty} {unit}".strip(),
         })
         try:
@@ -522,6 +514,7 @@ def save_marked_batch(
                 "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id, mr_date),
             })
 
+            inv_lines = []
             for r in grp:
                 moved = float(r["moved_kg"])
                 new_rate = apply_pct(float(r["rate"] or 0), pct_change)
@@ -556,6 +549,17 @@ def save_marked_batch(
                        "src_li": int(r["jute_mr_li_id"]),
                        "qty": moved, "aq": aq_delta, "aw": aw_delta,
                        "by": updated_by})
+                # Original source-company item id, taken BEFORE the
+                # target-company remap above — used as-is on the invoice
+                # line so the invoice never round-trips through _ensure_item.
+                inv_lines.append({
+                    "kg": moved,
+                    "rate": new_rate,
+                    "price": line_price(moved, new_rate),
+                    "item_id": (int(src_item_id) if src_item_id else None),
+                    "actual_qty": aq_delta,
+                    "unit_conversion": r["unit_conversion"],
+                })
 
             _recompute_mr_header(conn, src_mr_id, updated_by)
             _recompute_mr_header(conn, child_mr_id, updated_by)
@@ -566,8 +570,9 @@ def save_marked_batch(
                 conn, target_co_id, target_branch_id, src_co_id, updated_by
             )
             invoice = _create_marked_sales_invoice(
-                conn, child_mr_id, src_mr_id, src_co_id, src_branch_id,
-                buyer_party_id, buyer_party_branch_id, mr_date, updated_by,
+                conn, child_mr_id, src_mr_id, src_branch_id,
+                buyer_party_id, buyer_party_branch_id, inv_lines,
+                mr_date, updated_by,
             )
             conn.execute(text("""
                 UPDATE jute_mr

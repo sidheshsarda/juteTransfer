@@ -1436,9 +1436,11 @@ def save_transfer_step(
                 order_date_for_lc=step.order_date_for_lc,
             )
             # Find the previous MR ID for invoice linkage
+            # mode-1 marked children share src_jute_mr_id; never chain rows
             prev_mr_result = conn.execute(
                 text("""SELECT jute_mr_id FROM jute_mr
                         WHERE src_jute_mr_id = :root AND branch_id = :bid
+                        AND transfer_mode = 0
                         ORDER BY jute_mr_id DESC LIMIT 1"""),
                 {"root": root_mr_id, "bid": prev_branch_id},
             )
@@ -1533,9 +1535,11 @@ def delete_transfer_step(jute_mr_id: int, updated_by: int) -> None:
         root_mr_id, current_branch_id = mr_info
 
         # Find the previous MR in the chain (same root, different branch, most recent)
+        # mode-1 marked children share src_jute_mr_id; never chain rows
         prev_mr_result = conn.execute(
             text("""SELECT jute_mr_id FROM jute_mr
                     WHERE src_jute_mr_id = :root AND branch_id != :bid
+                    AND transfer_mode = 0
                     ORDER BY jute_mr_id DESC LIMIT 1"""),
             {"root": root_mr_id, "bid": current_branch_id},
         )
