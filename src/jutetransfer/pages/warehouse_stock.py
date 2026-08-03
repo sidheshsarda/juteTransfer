@@ -35,7 +35,16 @@ def _lot_grid(df: pd.DataFrame, key: str) -> pd.DataFrame:
     DataFrame (empty if none)."""
     gb = GridOptionsBuilder.from_dataframe(df)
     gb.configure_default_column(resizable=True, filterable=True, sortable=True)
-    gb.configure_selection("multiple", use_checkbox=True)
+    # use_checkbox=True would attach the checkbox to the FIRST column def
+    # (jute_mr_id, hidden below) and it silently disappears — put it on the
+    # first visible column instead; selection is checkbox-only.
+    gb.configure_selection("multiple", suppressRowClickSelection=True)
+    gb.configure_column(
+        "mr_no",
+        checkboxSelection=True,
+        headerCheckboxSelection=True,
+        headerCheckboxSelectionFilteredOnly=True,
+    )
     gb.configure_column("jute_mr_id", hide=True)
     gb.configure_column("jute_mr_li_id", hide=True)
     resp = AgGrid(
