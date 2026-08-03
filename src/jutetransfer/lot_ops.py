@@ -31,7 +31,7 @@ _LOCK_LINE_SQL = """
            li.actual_quality, li.challan_quality_id, li.marka, li.crop_year,
            li.unit_conversion, li.warehouse_id, li.jute_mr_id,
            li.actual_qty, li.actual_weight, li.actual_rate,
-           mr.branch_id, mr.transfer_mode, mr.status_id,
+           mr.branch_id, mr.transfer_mode, mr.status_id, mr.src_jute_mr_id,
            mr.party_id, mr.party_branch_id, bm.co_id
     FROM jute_mr_li li
     JOIN jute_mr mr ON mr.jute_mr_id = li.jute_mr_id
@@ -81,6 +81,10 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
             if int(r["status_id"] or 0) != 3:
                 raise ValueError("Can only re-lot Approved (status 3) MRs")
             mr_id = int(r["jute_mr_id"])
+            if int(r["transfer_mode"] or 0) == 0 and r["src_jute_mr_id"] is not None:
+                raise ValueError(
+                    f"MR {mr_id} is a chain-hop MR (src_jute_mr_id set); re-lot disabled"
+                )
             if mr_id not in checked:
                 if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": mr_id}).fetchone():
                     raise ValueError(

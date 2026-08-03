@@ -252,6 +252,7 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int) -> pd.
         LEFT JOIN party_mst pm ON pm.party_id = mr.party_id AND pm.co_id = bm.co_id
         WHERE mr.transfer_mode = 0
           AND mr.status_id = 3
+          AND mr.src_jute_mr_id IS NULL
           AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
                     COALESCE(li.accepted_weight, 0)) > 0
           AND bm.co_id = :co_id
@@ -290,6 +291,7 @@ def get_quality_availability_summary(co_id: int, branch_id: int, year: int, mont
         LEFT JOIN item_mst im ON im.item_id = li.actual_item_id
         WHERE mr.transfer_mode = 0
           AND mr.status_id = 3
+          AND mr.src_jute_mr_id IS NULL
           AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
                     COALESCE(li.accepted_weight, 0)) > 0
           AND bm.co_id = :co_id

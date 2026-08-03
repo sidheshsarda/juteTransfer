@@ -291,7 +291,8 @@ def save_marked_batch(
                        li.marka, li.crop_year, li.unit_conversion,
                        li.actual_qty, li.actual_weight, li.actual_rate,
                        li.jute_mr_id, mr.branch_id AS src_branch_id,
-                       mr.transfer_mode, mr.status_id, bm.co_id AS src_co_id
+                       mr.transfer_mode, mr.status_id, mr.src_jute_mr_id,
+                       bm.co_id AS src_co_id
                 FROM jute_mr_li li
                 JOIN jute_mr mr ON mr.jute_mr_id = li.jute_mr_id
                 JOIN branch_mst bm ON bm.branch_id = mr.branch_id
@@ -305,6 +306,11 @@ def save_marked_batch(
                 raise ValueError("Can only mark-move from normal (transfer_mode=0) stock")
             if int(r["status_id"] or 0) != 3:
                 raise ValueError("Can only mark-move Approved (status 3) MRs")
+            if r["src_jute_mr_id"] is not None:
+                raise ValueError(
+                    f"MR {int(r['jute_mr_id'])} is a chain-hop MR "
+                    "(src_jute_mr_id set); re-lot disabled"
+                )
             r["moved_kg"] = _available_kg(
                 conn, li_id, float(r["accepted_weight"] or 0)
             )
