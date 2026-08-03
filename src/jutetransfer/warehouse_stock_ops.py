@@ -260,6 +260,157 @@ def save_marked_move(
         return child_mr_id
 
 
+def save_marked_batch(
+    lot_li_ids: list,
+    pct_change: float,
+    target_co_id: int,
+    target_branch_id: int,
+    warehouse_id: int,
+    mr_date: date,
+    updated_by: int,
+) -> list:
+    """Move N whole lots into a marked godown in one transaction.
+
+    Selected lines are grouped by source MR; each source MR gets ONE child MR
+    (transfer_mode=1) holding its selected lines at rate * (1 + pct/100).
+    The moved amount per line is the balance-aware available kg
+    (LEAST(view balance, accepted_weight)) — weight already issued to
+    production stays behind. Provenance rows are written to jute_lot_src so
+    deletion restores sources exactly. Returns the created child MR ids.
+    """
+    if not lot_li_ids:
+        raise ValueError("no lots selected")
+    ids = sorted({int(x) for x in lot_li_ids})
+
+    with DatabaseConnection.get_transaction() as conn:
+        rows = []
+        for li_id in ids:  # ascending lock order
+            row = conn.execute(text("""
+                SELECT li.jute_mr_li_id, li.accepted_weight, li.rate,
+                       li.actual_item_id, li.actual_quality, li.challan_quality_id,
+                       li.marka, li.crop_year, li.unit_conversion,
+                       li.actual_qty, li.actual_weight, li.actual_rate,
+                       li.jute_mr_id, mr.branch_id AS src_branch_id,
+                       mr.transfer_mode, mr.status_id, bm.co_id AS src_co_id
+                FROM jute_mr_li li
+                JOIN jute_mr mr ON mr.jute_mr_id = li.jute_mr_id
+                JOIN branch_mst bm ON bm.branch_id = mr.branch_id
+                WHERE li.jute_mr_li_id = :id
+                FOR UPDATE
+            """), {"id": li_id}).fetchone()
+            if not row:
+                raise ValueError(f"Source line {li_id} not found")
+            r = dict(row._mapping)
+            if int(r["transfer_mode"] or 0) != 0:
+                raise ValueError("Can only mark-move from normal (transfer_mode=0) stock")
+            if int(r["status_id"] or 0) != 3:
+                raise ValueError("Can only mark-move Approved (status 3) MRs")
+            r["moved_kg"] = _available_kg(
+                conn, li_id, float(r["accepted_weight"] or 0)
+            )
+            if r["moved_kg"] <= 0:
+                raise ValueError(f"Line {li_id} has no available weight")
+            rows.append(r)
+
+        checked = set()
+        for r in rows:
+            mr_id = int(r["jute_mr_id"])
+            if mr_id in checked:
+                continue
+            chain_child = conn.execute(text("""
+                SELECT 1 FROM jute_mr
+                WHERE src_jute_mr_id = :sid AND transfer_mode = 0
+                  AND jute_mr_id <> :sid
+                LIMIT 1
+            """), {"sid": mr_id}).fetchone()
+            if chain_child:
+                raise ValueError(
+                    f"MR {mr_id} is part of a vertical transfer chain; "
+                    "mark-move is disabled to avoid corrupting it"
+                )
+            checked.add(mr_id)
+
+        by_mr = {}
+        for r in rows:
+            by_mr.setdefault(int(r["jute_mr_id"]), []).append(r)
+
+        child_ids = []
+        for src_mr_id in sorted(by_mr):
+            grp = by_mr[src_mr_id]
+            src_co_id = int(grp[0]["src_co_id"])
+            src_branch_id = int(grp[0]["src_branch_id"])
+            party_id, party_branch_id = _ensure_company_as_party(
+                conn, src_co_id, src_branch_id, target_co_id, updated_by
+            )
+            child_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
+                INSERT INTO jute_mr (
+                    jute_gate_entry_no, branch_mr_no, jute_gate_entry_date, jute_mr_date,
+                    status_id, transfer_mode, updated_by, updated_date_time,
+                    branch_id, party_id, party_branch_id, src_com_id, src_jute_mr_id,
+                    total_amount, claim_amount, roundoff, net_total,
+                    bill_pass_no, bill_pass_date
+                ) VALUES (
+                    :gate_no, :mr_no, :mr_date, :mr_date,
+                    3, 1, :updated_by, NOW(),
+                    :branch_id, :party_id, :party_branch_id, :src_com_id, :src_jute_mr_id,
+                    0, 0, 0, 0,
+                    :bill_pass_no, :mr_date
+                )
+            """, {
+                "gate_no": _get_next_gate_entry_no(conn, target_branch_id),
+                "mr_no": _get_next_mr_number_in_txn(conn, target_branch_id, mr_date),
+                "mr_date": mr_date,
+                "updated_by": updated_by,
+                "branch_id": target_branch_id,
+                "party_id": party_id,
+                "party_branch_id": party_branch_id,
+                "src_com_id": src_co_id,
+                "src_jute_mr_id": src_mr_id,  # direct parent (mode-1 semantics)
+                "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id),
+            })
+
+            for r in grp:
+                moved = float(r["moved_kg"])
+                new_rate = apply_pct(float(r["rate"] or 0), pct_change)
+                src_item_id = r["actual_item_id"]
+                target_item_id = (
+                    _ensure_item(conn, int(src_item_id), target_co_id, updated_by)
+                    if src_item_id else None
+                )
+                aq_delta, aw_delta = _reduce_source_line(conn, r, moved, moved)
+                child_li_id = DatabaseConnection.execute_insert_returning_id(
+                    conn, _LI_INSERT_SQL, {
+                        "mr_id": child_mr_id,
+                        "actual_item_id": target_item_id,
+                        "actual_quality": r["actual_quality"],
+                        "challan_quality_id": r["challan_quality_id"],
+                        "w": moved,
+                        "rate": new_rate,
+                        "price": line_price(moved, new_rate),
+                        "warehouse_id": warehouse_id,
+                        "actual_qty": aq_delta,
+                        "marka": r["marka"],
+                        "crop_year": r["crop_year"],
+                        "unit_conversion": r["unit_conversion"],
+                    })
+                conn.execute(text("""
+                    INSERT INTO jute_lot_src
+                        (new_jute_mr_li_id, src_jute_mr_li_id, qty_kg,
+                         actual_qty_delta, actual_weight_delta,
+                         created_by, created_date_time)
+                    VALUES (:new_li, :src_li, :qty, :aq, :aw, :by, NOW())
+                """), {"new_li": child_li_id,
+                       "src_li": int(r["jute_mr_li_id"]),
+                       "qty": moved, "aq": aq_delta, "aw": aw_delta,
+                       "by": updated_by})
+
+            _recompute_mr_header(conn, src_mr_id, updated_by)
+            _recompute_mr_header(conn, child_mr_id, updated_by)
+            child_ids.append(child_mr_id)
+
+        return child_ids
+
+
 def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
     """Reverse a marked move: return the child's weight to the matching source
     line, recompute the source header, and delete the child MR + line item.
@@ -285,7 +436,71 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
         if grandchild:
             raise ValueError("Delete dependent marked moves first")
 
+        issued = conn.execute(text("""
+            SELECT 1 FROM jute_issue ji
+            JOIN jute_mr_li li ON li.jute_mr_li_id = ji.jute_mr_li_id
+            WHERE li.jute_mr_id = :id AND COALESCE(ji.status_id, 0) <> 4
+            LIMIT 1
+        """), {"id": child_mr_id}).fetchone()
+        if issued:
+            raise ValueError(
+                "This marked MR has ERP issue entries (consumption started); "
+                "cannot delete"
+            )
+
         source_mr_id = c["src_jute_mr_id"]
+
+        prov = conn.execute(text("""
+            SELECT ls.src_jute_mr_li_id, ls.qty_kg,
+                   ls.actual_qty_delta, ls.actual_weight_delta,
+                   ls.new_jute_mr_li_id
+            FROM jute_lot_src ls
+            JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
+            WHERE li.jute_mr_id = :id
+            FOR UPDATE
+        """), {"id": child_mr_id}).fetchall()
+        if prov:
+            src_mr_ids = set()
+            for p in sorted(prov, key=lambda p: int(p._mapping["src_jute_mr_li_id"])):
+                m = p._mapping
+                src = conn.execute(text("""
+                    SELECT jute_mr_li_id, jute_mr_id, accepted_weight, rate,
+                           actual_qty, actual_weight
+                    FROM jute_mr_li WHERE jute_mr_li_id = :id FOR UPDATE
+                """), {"id": int(m["src_jute_mr_li_id"])}).fetchone()
+                if not src:
+                    raise ValueError(
+                        f"Source line {m['src_jute_mr_li_id']} vanished; cannot restore"
+                    )
+                s = src._mapping
+                qty = float(m["qty_kg"] or 0)
+                new_w = round(float(s["accepted_weight"] or 0) + qty, 3)
+                conn.execute(text("""
+                    UPDATE jute_mr_li
+                    SET accepted_weight = :w, total_price = :p,
+                        actual_weight = :aw, actual_qty = :aq,
+                        updated_date_time = NOW()
+                    WHERE jute_mr_li_id = :id
+                """), {"w": new_w,
+                       "p": _round2(new_w * float(s["rate"] or 0) / 100.0),
+                       "aw": round(float(s["actual_weight"] or 0)
+                                   + float(m["actual_weight_delta"] or 0), 3),
+                       "aq": round(float(s["actual_qty"] or 0)
+                                   + float(m["actual_qty_delta"] or 0), 3),
+                       "id": int(s["jute_mr_li_id"])})
+                src_mr_ids.add(int(s["jute_mr_id"]))
+            for mr_id in sorted(src_mr_ids):
+                _recompute_mr_header(conn, mr_id, updated_by)
+            conn.execute(text("""
+                DELETE ls FROM jute_lot_src ls
+                JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
+                WHERE li.jute_mr_id = :id
+            """), {"id": child_mr_id})
+            conn.execute(text("DELETE FROM jute_mr_li WHERE jute_mr_id = :id"),
+                         {"id": child_mr_id})
+            conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"),
+                         {"id": child_mr_id})
+            return
 
         child_li = conn.execute(text("""
             SELECT COALESCE(SUM(accepted_weight),0) AS w, MIN(actual_quality) AS q
