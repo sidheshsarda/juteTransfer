@@ -1,6 +1,6 @@
 """Tests for MR grouping logic."""
 import pandas as pd
-from src.jutetransfer.pages.jute_mr import _group_by_mr
+from src.jutetransfer.jute_mr_chain_helpers import _group_by_mr
 
 
 def test_single_mr_single_li():

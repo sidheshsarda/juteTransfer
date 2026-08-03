@@ -1,5 +1,5 @@
 """Tests for _recalculate_chain with rounding rules."""
-from src.jutetransfer.pages.jute_mr import _recalculate_chain
+from src.jutetransfer.jute_mr_chain_helpers import _recalculate_chain
 
 
 def _make_line_items(items):

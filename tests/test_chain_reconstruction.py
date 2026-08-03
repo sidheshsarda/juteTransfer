@@ -1,5 +1,5 @@
 """Tests for chain reconstruction algorithm."""
-from src.jutetransfer.pages.jute_mr import _reconstruct_chain
+from src.jutetransfer.jute_mr_chain_helpers import _reconstruct_chain
 
 
 def _make_chain_mrs(entries):
