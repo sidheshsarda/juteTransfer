@@ -1,7 +1,9 @@
 # Warehouse Marked Page v2 — Lot Management, Batch Transfer, Auto Sold Detection
 
 **Date:** 2026-08-03
-**Status:** Approved by owner (design review 2026-08-03)
+**Status:** Approved by owner (design review 2026-08-03; amended same day — owner
+ruling: batch transfer must ALSO create the seller-side sales invoice, see §4
+Tab 2 step 5 and §6)
 **Scope:** juteTransfer repo only, sls tenant DB only. No vowerp3be / vowerp3ui changes.
 
 ## 1. Problem
@@ -105,7 +107,51 @@ Guards for create: every source line's MR must be `transfer_mode = 0`,
    - Source lines go to `accepted_weight = 0`, `total_price = 0`; headers
      recomputed. Zero-weight lines remain as audit trail and disappear from all
      availability views (kg > 0 filter).
-5. Existing guards keep working: cannot move from mode-1 stock, cannot move a
+5. **Seller sales invoice per child MR** (owner amendment 2026-08-03): the
+   transfer IS an inter-company sale — one Raw-Jute `sales_invoice`
+   (`invoice_type = 5`, `status_id = 3`, `active = 1`) is created at the
+   **source** branch per child MR, buyer party = the **target** company
+   represented in the source company's `party_mst`
+   (`_ensure_company_as_party(conn, target_co_id, target_branch_id,
+   source_co_id, updated_by)` — the mirror of the child-MR party call).
+   Unlike Type 1 there is no chain and no return leg: source sells once,
+   target holds the stock until it is consumed/sold onward in the ERP.
+   - `invoice_date` = `challan_date` = transfer `mr_date`; `invoice_no` via
+     `_get_next_invoice_no` (FY window at source branch); `challan_no` via
+     `_get_next_challan_no`; formatted no `<co>/<branch>/SI/<FY>/<n>` via
+     `_format_document_no` + `_get_seller_prefixes`.
+   - One `sales_invoice_dtl` per child line: `quantity = sales_weight` =
+     moved kg, `uom_id = 163`, `rate` = kg rate `round(new_rate/100, 2)`,
+     `amount_without_tax = total_amount` = the child line's `total_price`,
+     remarks `"Raw Jute - {qty} {unit_conversion}"`; plus one
+     `sales_invoice_jute_dtl` row per line with zero claims (marked moves
+     are claim-free by design).
+   - `invoice_amount` = child MR total (`ROUND(SUM(line prices), 0)`),
+     `round_off` = `invoice_amount − SUM(line prices)`.
+   - `sales_invoice_jute`: `mr_id` = **child** MR id (app-side deletion
+     linkage — NOTE: different from Type 1, where it is the seller MR id),
+     `mr_no` = source MR's `branch_mr_no`, `claim_amount = 0`, `mukam_id`/
+     `unit_conversion` copied from the source MR header.
+   - The child `jute_mr` row is stamped with `invoice_no` (formatted),
+     `invoice_date`, `invoice_amount` — same as Type 1 buyer MRs.
+   - P&L needs no query change: Sales already aggregates `invoice_type = 5`
+     by seller branch, so the source company books the sale (margin realises
+     at source at transfer time); the target books the purchase via the
+     child MR's `net_total`.
+   - **Masters auto-populate** (owner requirement 2026-08-03): every master
+     the documents reference is created on the fly if missing. Party:
+     `_ensure_company_as_party` (creates party + party types + party branch)
+     — source co in the target's `party_mst` for the child MR, target co in
+     the source's `party_mst` for the invoice. Quality/item: in this app
+     "quality" IS the item (`item_mst.item_name` via `actual_item_id`;
+     `jute_quality_mst` is deprecated in the ERP — quality is managed via
+     the `item_grp_mst` → `item_mst` hierarchy), and `_ensure_item` creates
+     the item group + item in the counterparty company — target co for
+     child MR lines (existing), source co for invoice lines (new; normally
+     a no-op since the source item originates there). The deprecated
+     `actual_quality`/`challan_quality_id` ids are copied unchanged, same
+     as Type 1 chain hops.
+6. Existing guards keep working: cannot move from mode-1 stock, cannot move a
    line of a live-chain MR.
 
 ### Tab 3 — Marked Stock
@@ -169,7 +215,17 @@ In `warehouse_stock_ops.py`:
   target_branch_id, warehouse_id, mr_date, updated_by) -> list[int]`
   (returns created child MR ids; supersedes single `save_marked_move` on the
   page — the old function stays for compatibility/tests)
-- `delete_marked_move` — add sold-invoice block.
+- `_create_marked_sales_invoice(conn, child_mr_id, src_mr_id, src_branch_id,
+  buyer_party_id, buyer_party_branch_id, mr_date, updated_by) -> dict`
+  (amendment 2026-08-03) — the Type 2 counterpart of
+  `transfer._create_sales_invoice`, called by `save_marked_batch` once per
+  child MR after its lines exist; reads child lines back for amounts; returns
+  the invoice dict used to stamp the child MR row.
+- `delete_marked_move` — add sold-invoice block; additionally (amendment
+  2026-08-03) cascade-delete the linked invoice (`sales_invoice_jute_dtl` →
+  `sales_invoice_jute` → `sales_invoice_dtl` → `sales_invoice`) found via
+  `sales_invoice_jute.mr_id = child_mr_id`, in BOTH the provenance and the
+  legacy restore paths, before the source restore runs.
 
 All writes inside `DatabaseConnection.get_transaction()`, `FOR UPDATE` locks on
 every touched line.
@@ -213,6 +269,14 @@ balance ≤ 0 per line. Full probe: `.superpowers/sdd/…/db-probe-stock-view.md
 - Re-lotting a lot MR is allowed (recursive provenance).
 - A lot MR with some lines transferred (mode-1 child exists) cannot be deleted.
 - Empty marked-godown list at target → save disabled (as today).
+- Two batches from the same source MR → two child MRs → two invoices; each
+  invoice is keyed to its own child via `sales_invoice_jute.mr_id`, so undoing
+  one batch never touches the other's invoice.
+- Type 1 chain deletes never see Type 2 invoices: chain invoice lookups run on
+  chain MR ids, and mode-1 child MRs can never enter a chain (mutual-exclusion
+  guards).
+- Pre-amendment mode-1 MRs (none exist live — verified 0 rows) would simply
+  have no linked invoice; the delete cascade is a no-op for them.
 
 ## 9. Testing
 
@@ -223,6 +287,10 @@ balance ≤ 0 per line. Full probe: `.superpowers/sdd/…/db-probe-stock-view.md
   one lot, batch transfer 6 lots from 4 MRs → 4 child MRs with common %, undo
   lot, undo marked move, sold invoice hides lot + drops P&L marked stock,
   chain-MR line blocked from lot/transfer, mode-1 line blocked as lot source.
+- Invoice checklist (amendment): batch transfer of 2 source MRs → 2 invoices at
+  the source branch, buyer = target company party, invoice_amount = child MR
+  total, child MR stamped with formatted invoice no; undo deletes the invoice
+  rows completely (jute_dtl included) and leaves other invoices untouched.
 
 ## 10. Out of scope
 
