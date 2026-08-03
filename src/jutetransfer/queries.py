@@ -220,6 +220,96 @@ def get_jute_mr_with_line_items(
     return DatabaseConnection.execute_query(query, params)
 
 
+def get_available_lots(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
+    """Transferable lots: mode 0, Approved (status 3), available kg > 0, not
+    feeding a live vertical chain. One row per jute_mr_li line. Available kg is
+    balance-aware: LEAST(view balance, accepted_weight) — weight already issued
+    to production is not movable. is_lot=1 marks app-created lines (provenance
+    exists in jute_lot_src)."""
+    query = """
+        SELECT
+            mr.jute_mr_id,
+            li.jute_mr_li_id,
+            mr.branch_mr_no AS mr_no,
+            mr.jute_mr_date AS mr_date,
+            im.item_name AS quality,
+            ROUND(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                        li.accepted_weight), 3) AS remaining_kg,
+            li.rate AS rate,
+            wh.warehouse_name AS warehouse,
+            COALESCE(s.supplier_name, pm.supp_name) AS party,
+            EXISTS(
+                SELECT 1 FROM jute_lot_src ls
+                WHERE ls.new_jute_mr_li_id = li.jute_mr_li_id
+            ) AS is_lot
+        FROM jute_mr mr
+        JOIN branch_mst bm ON bm.branch_id = mr.branch_id
+        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
+        LEFT JOIN item_mst im ON im.item_id = li.actual_item_id
+        LEFT JOIN warehouse_mst wh ON wh.warehouse_id = li.warehouse_id
+        LEFT JOIN jute_supplier_mst s ON s.supplier_id = mr.jute_supplier_id
+        LEFT JOIN party_mst pm ON pm.party_id = mr.party_id AND pm.co_id = bm.co_id
+        WHERE mr.transfer_mode = 0
+          AND mr.status_id = 3
+          AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                    COALESCE(li.accepted_weight, 0)) > 0
+          AND bm.co_id = :co_id
+          AND mr.branch_id = :branch_id
+          AND YEAR(mr.jute_gate_entry_date) = :year
+          AND MONTH(mr.jute_gate_entry_date) = :month
+          AND NOT EXISTS (
+              SELECT 1 FROM jute_mr c
+              WHERE c.src_jute_mr_id = mr.jute_mr_id
+                AND c.transfer_mode = 0
+                AND c.jute_mr_id <> mr.jute_mr_id
+          )
+        ORDER BY mr.jute_mr_date, mr.jute_mr_id, li.jute_mr_li_id
+    """
+    return DatabaseConnection.execute_query(
+        query, {"co_id": co_id, "branch_id": branch_id, "year": year, "month": month}
+    )
+
+
+def get_quality_availability_summary(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
+    """Quality-wise availability: lot count, total kg, weighted-avg rate."""
+    query = """
+        SELECT
+            im.item_name AS quality,
+            COUNT(*) AS lots,
+            ROUND(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                            li.accepted_weight)), 2) AS total_kg,
+            ROUND(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                            li.accepted_weight) * li.rate)
+                  / NULLIF(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                                     li.accepted_weight)), 0), 2) AS avg_rate
+        FROM jute_mr mr
+        JOIN branch_mst bm ON bm.branch_id = mr.branch_id
+        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
+        LEFT JOIN item_mst im ON im.item_id = li.actual_item_id
+        WHERE mr.transfer_mode = 0
+          AND mr.status_id = 3
+          AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                    COALESCE(li.accepted_weight, 0)) > 0
+          AND bm.co_id = :co_id
+          AND mr.branch_id = :branch_id
+          AND YEAR(mr.jute_gate_entry_date) = :year
+          AND MONTH(mr.jute_gate_entry_date) = :month
+          AND NOT EXISTS (
+              SELECT 1 FROM jute_mr c
+              WHERE c.src_jute_mr_id = mr.jute_mr_id
+                AND c.transfer_mode = 0
+                AND c.jute_mr_id <> mr.jute_mr_id
+          )
+        GROUP BY im.item_name
+        ORDER BY im.item_name
+    """
+    return DatabaseConnection.execute_query(
+        query, {"co_id": co_id, "branch_id": branch_id, "year": year, "month": month}
+    )
+
+
 def get_source_mr_full(jute_mr_id: int, conn=None) -> Optional[dict]:
     """Fetch complete jute_mr record + line items for copying during transfer.
 
