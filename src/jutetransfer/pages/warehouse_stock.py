@@ -25,6 +25,7 @@ from ..queries import (
     set_warehouse_marked,
 )
 from ..lot_ops import create_lot, delete_lot
+from ..lot_helpers import apply_pct, line_price
 from ..warehouse_stock_ops import save_marked_batch, delete_marked_move
 
 
@@ -118,7 +119,71 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
 
 def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
                          user_id: int) -> None:
-    st.info("Transfer tab — implemented in the next task.")
+    lots = get_available_lots(co_id, branch_id, year, month)
+    if lots is None or lots.empty:
+        st.info("No available lots for this filter.")
+        return
+    st.subheader("Select lots to transfer (whole lots — split first for partials)")
+    sel = _lot_grid(lots, key="transfer_grid")
+    if sel.empty:
+        st.caption("Select one or more lots above.")
+        return
+
+    cb_options, cb_map = get_company_branch_options()
+    t1, t2, t3, t4 = st.columns(4)
+    with t1:
+        cb_label = st.selectbox("To company/branch", options=cb_options,
+                                key="xfer_cb")
+        tgt = cb_map.get(cb_label)
+    with t2:
+        if tgt:
+            tgt_co, tgt_br = tgt
+            mwh = get_marked_warehouses_by_branch(tgt_br)
+            wh_name = st.selectbox("Marked godown",
+                                   options=list(mwh.keys()) or ["(none tagged)"],
+                                   key="xfer_wh")
+            wh_id = mwh.get(wh_name)
+        else:
+            tgt_co = tgt_br = wh_id = None
+            st.selectbox("Marked godown", options=["(select company)"],
+                         key="xfer_wh")
+    with t3:
+        move_date = st.date_input("Date", value=date.today(), key="xfer_dt")
+    with t4:
+        if "xfer_pct" not in st.session_state:
+            st.session_state["xfer_pct"] = 0.0
+        pct = st.number_input("% rate change (+/-)", step=0.5, key="xfer_pct")
+
+    prev = sel.copy()
+    prev["new_rate"] = prev["rate"].map(lambda r: apply_pct(float(r or 0), pct))
+    prev["value"] = prev.apply(
+        lambda r: line_price(float(r["remaining_kg"]), float(r["rate"] or 0)), axis=1)
+    prev["new_value"] = prev.apply(
+        lambda r: line_price(float(r["remaining_kg"]), float(r["new_rate"])), axis=1)
+    show = prev[["mr_no", "quality", "remaining_kg", "rate", "new_rate",
+                 "value", "new_value"]]
+    st.subheader("Preview")
+    st.dataframe(show, use_container_width=True, hide_index=True)
+    st.markdown(
+        f"**Total: {prev['remaining_kg'].sum():,.2f} kg — "
+        f"value {prev['value'].sum():,.2f} → {prev['new_value'].sum():,.2f}**"
+    )
+
+    n_src_mrs = prev["jute_mr_id"].nunique()
+    st.caption(f"Will create {n_src_mrs} MR(s) at the target (one per source MR).")
+    can_save = bool(tgt) and bool(wh_id)
+    if st.button("Transfer selected lots", type="primary",
+                 disabled=not can_save, key="btn_batch_move"):
+        try:
+            li_ids = [int(x) for x in prev["jute_mr_li_id"]]
+            child_ids = save_marked_batch(
+                li_ids, float(pct), int(tgt_co), int(tgt_br), int(wh_id),
+                move_date, user_id,
+            )
+            st.success(f"Transferred. Created MR(s): {', '.join(map(str, child_ids))}")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
 
 
 def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
