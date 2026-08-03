@@ -127,14 +127,14 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
                 :bill_pass_no, :mr_date
             )
         """, {
-            "gate_no": _get_next_gate_entry_no(conn, branch_id),
+            "gate_no": _get_next_gate_entry_no(conn, branch_id, mr_date),
             "mr_no": _get_next_mr_number_in_txn(conn, branch_id, mr_date),
             "mr_date": mr_date,
             "updated_by": updated_by,
             "branch_id": branch_id,
             "party_id": primary["party_id"],
             "party_branch_id": primary["party_branch_id"],
-            "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, branch_id),
+            "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, branch_id, mr_date),
         })
 
         # One lot line + one provenance row per take. Same company: item ids

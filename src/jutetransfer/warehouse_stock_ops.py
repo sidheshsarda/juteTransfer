@@ -212,7 +212,7 @@ def save_marked_move(
                 :bill_pass_no, :mr_date
             )
         """, {
-            "gate_no": _get_next_gate_entry_no(conn, target_branch_id),
+            "gate_no": _get_next_gate_entry_no(conn, target_branch_id, mr_date),
             "mr_no": _get_next_mr_number_in_txn(conn, target_branch_id, mr_date),
             "mr_date": mr_date,
             "updated_by": updated_by,
@@ -222,7 +222,7 @@ def save_marked_move(
             "src_com_id": source_co_id,
             "src_jute_mr_id": source_mr_id,  # direct parent (origin, not a chain root)
             "total": child_total,
-            "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id),
+            "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id, mr_date),
         })
 
         # 4. Insert the child line item: moved qty at the new rate, claim-free
@@ -363,7 +363,7 @@ def save_marked_batch(
                     :bill_pass_no, :mr_date
                 )
             """, {
-                "gate_no": _get_next_gate_entry_no(conn, target_branch_id),
+                "gate_no": _get_next_gate_entry_no(conn, target_branch_id, mr_date),
                 "mr_no": _get_next_mr_number_in_txn(conn, target_branch_id, mr_date),
                 "mr_date": mr_date,
                 "updated_by": updated_by,
@@ -372,7 +372,7 @@ def save_marked_batch(
                 "party_branch_id": party_branch_id,
                 "src_com_id": src_co_id,
                 "src_jute_mr_id": src_mr_id,  # direct parent (mode-1 semantics)
-                "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id),
+                "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id, mr_date),
             })
 
             for r in grp:
