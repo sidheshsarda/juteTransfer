@@ -20,7 +20,7 @@ from typing import Tuple
 from sqlalchemy import text
 
 from .database import DatabaseConnection
-from .lot_helpers import apply_pct, line_price
+from .lot_helpers import apply_pct, line_price, reduce_amounts, restore_amounts
 from .transfer import (
     _ensure_company_as_party,
     _ensure_item,
@@ -84,14 +84,13 @@ def _available_kg(conn, li_id: int, accepted: float) -> float:
 def _reduce_source_line(conn, r: dict, qty: float, available: float) -> tuple:
     """Reduce a locked source line by qty kg across accepted AND actual fields.
 
-    Returns (actual_qty_delta, actual_weight_delta) for provenance storage."""
-    accepted = float(r["accepted_weight"] or 0)
-    actual_w = float(r["actual_weight"] or 0)
-    actual_q = float(r["actual_qty"] or 0)
-    frac = qty / available if available > 0 else 1.0
-    aw_delta = round(min(qty, actual_w), 3)
-    aq_delta = round(actual_q * frac, 3)
-    new_accepted = round(accepted - qty, 3)
+    Returns (actual_qty_delta, actual_weight_delta) for provenance storage.
+    Raises ValueError (via reduce_amounts) if actual_weight is missing or
+    less than qty — moving more than the line's actual on-hand weight would
+    mint balance the ERP stock view doesn't have."""
+    new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta = reduce_amounts(
+        r["accepted_weight"], r["actual_weight"], r["actual_qty"], qty, available
+    )
     conn.execute(text("""
         UPDATE jute_mr_li
         SET accepted_weight = :w, total_price = :p,
@@ -101,8 +100,8 @@ def _reduce_source_line(conn, r: dict, qty: float, available: float) -> tuple:
     """), {
         "w": new_accepted,
         "p": line_price(new_accepted, float(r["rate"] or 0)),
-        "aw": round(max(0.0, actual_w - aw_delta), 3),
-        "aq": round(max(0.0, actual_q - aq_delta), 3),
+        "aw": new_actual_w,
+        "aq": new_actual_q,
         "id": int(r["jute_mr_li_id"]),
     })
     return aq_delta, aw_delta
@@ -480,7 +479,10 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
                     )
                 s = src._mapping
                 qty = float(m["qty_kg"] or 0)
-                new_w = round(float(s["accepted_weight"] or 0) + qty, 3)
+                new_w, new_aw, new_aq = restore_amounts(
+                    s["accepted_weight"], s["actual_weight"], s["actual_qty"],
+                    qty, m["actual_qty_delta"], m["actual_weight_delta"],
+                )
                 conn.execute(text("""
                     UPDATE jute_mr_li
                     SET accepted_weight = :w, total_price = :p,
@@ -489,10 +491,8 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
                     WHERE jute_mr_li_id = :id
                 """), {"w": new_w,
                        "p": _round2(new_w * float(s["rate"] or 0) / 100.0),
-                       "aw": round(float(s["actual_weight"] or 0)
-                                   + float(m["actual_weight_delta"] or 0), 3),
-                       "aq": round(float(s["actual_qty"] or 0)
-                                   + float(m["actual_qty_delta"] or 0), 3),
+                       "aw": new_aw,
+                       "aq": new_aq,
                        "id": int(s["jute_mr_li_id"])})
                 src_mr_ids.add(int(s["jute_mr_id"]))
             for mr_id in sorted(src_mr_ids):

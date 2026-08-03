@@ -13,7 +13,7 @@ from datetime import date
 from sqlalchemy import bindparam, text
 
 from .database import DatabaseConnection
-from .lot_helpers import validate_takes, line_price, primary_source_mr
+from .lot_helpers import validate_takes, line_price, primary_source_mr, restore_amounts
 from .transfer import (
     _get_next_gate_entry_no,
     _get_next_mr_number_in_txn,
@@ -241,7 +241,10 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
             if not src:
                 raise ValueError(f"Source line {src_li_id} vanished; cannot restore")
             s = src._mapping
-            new_w = round(float(s["accepted_weight"] or 0) + qty, 3)
+            new_w, new_aw, new_aq = restore_amounts(
+                s["accepted_weight"], s["actual_weight"], s["actual_qty"],
+                qty, aq_delta, aw_delta,
+            )
             conn.execute(text("""
                 UPDATE jute_mr_li
                 SET accepted_weight = :w, total_price = :p,
@@ -249,8 +252,8 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
                     updated_date_time = NOW()
                 WHERE jute_mr_li_id = :id
             """), {"w": new_w, "p": line_price(new_w, float(s["rate"] or 0)),
-                   "aw": round(float(s["actual_weight"] or 0) + aw_delta, 3),
-                   "aq": round(float(s["actual_qty"] or 0) + aq_delta, 3),
+                   "aw": new_aw,
+                   "aq": new_aq,
                    "id": src_li_id})
             src_mr_ids.add(int(s["jute_mr_id"]))
         for mr_id in sorted(src_mr_ids):
