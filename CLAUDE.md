@@ -43,9 +43,9 @@ Both live on `jute_mr` and are kept disjoint by `jute_mr.transfer_mode`:
 | `transfer_mode` | 0 | 1 |
 | Status | **Built, tested, working** | **Built:** lot management (split/merge via lot MRs), batch transfer with common % change, balance-based consumption via `vw_jute_stock_outstanding` (ERP issue entries reduce balance; consumed = balance ≤ 0) |
 | Shape | Circular: gate entry at Co A → sold B → C → … → back to A; % markup per hop; manual finalize | One-shot: partial qty of a purchased line moved to a MARKED godown at another company; stays there until sold |
-| Per hop | New `jute_mr`+`jute_mr_li` at buyer + Raw-Jute `sales_invoice` (`invoice_type=5`); final hop UPDATEs the root in place | Single child `jute_mr`+`jute_mr_li`; **no invoice, no chain, no return leg** |
+| Per hop | New `jute_mr`+`jute_mr_li` at buyer + Raw-Jute `sales_invoice` (`invoice_type=5`); final hop UPDATEs the root in place | Single child `jute_mr`+`jute_mr_li` **+ seller Raw-Jute `sales_invoice` (`invoice_type=5`) at the source branch**; no chain, no return leg |
 | `src_jute_mr_id` | Always the chain ROOT (star topology); hops linked via `src_com_id` | The DIRECT parent MR (different semantics!) |
-| Tracking | Full chain reconstruction + rate cascade | None by design; P&L impact only; source already recorded via `src_jute_mr_id` at move time; sale completes in the ERP (Raw-Jute invoice → Approved) |
+| Tracking | Full chain reconstruction + rate cascade | No chain to reconstruct; the transfer itself books the inter-company sale (invoice created at move time, source recorded via `src_jute_mr_id`); the *onward* sale/consumption at the target still happens in the ERP (issue entries reduce the `vw_jute_stock_outstanding` balance) |
 | UI | `pages/new_transfer_chain.py` (sole chain editor) | `pages/warehouse_stock.py` |
 | Ops | `transfer.py` | `warehouse_stock_ops.py` + `lot_ops.py` |
 
@@ -63,6 +63,7 @@ Mutual exclusion is enforced in code: a line feeding a live chain can't be mark-
 
 - Godowns tagged via `warehouse_mst.warehouse_type = 'MARKED'` (`queries.set_warehouse_marked`).
 - `save_marked_move`: reduces source `jute_mr_li.accepted_weight`/`total_price` (recomputes source header), INSERTs child MR at target branch/warehouse with `transfer_mode=1`, possibly different rate.
+- `save_marked_batch`: also books one seller Raw-Jute `sales_invoice` per child MR at the source branch (buyer = target company's party, auto-created if missing), stamps the child MR with invoice no/date/amount, and links via `sales_invoice_jute.mr_id` = child MR id (deletion linkage — different semantics from Type 1's hop linkage). `delete_marked_move` cascades the invoice.
 - P&L counts marked stock: `transfer_mode=1` MRs at status 3 (`get_company_wise_marked_stock`).
 
 ### P&L dashboard (`pages/company_pl_dashboard.py`)

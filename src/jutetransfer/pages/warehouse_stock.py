@@ -171,17 +171,26 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
     )
 
     n_src_mrs = prev["jute_mr_id"].nunique()
-    st.caption(f"Will create {n_src_mrs} MR(s) at the target (one per source MR).")
+    st.caption(
+        f"Will create {n_src_mrs} MR(s) at the target and {n_src_mrs} seller "
+        f"invoice(s) at the source (one per source MR)."
+    )
     can_save = bool(tgt) and bool(wh_id)
     if st.button("Transfer selected lots", type="primary",
                  disabled=not can_save, key="btn_batch_move"):
         try:
             li_ids = [int(x) for x in prev["jute_mr_li_id"]]
-            child_ids = save_marked_batch(
+            created = save_marked_batch(
                 li_ids, float(pct), int(tgt_co), int(tgt_br), int(wh_id),
                 move_date, user_id,
             )
-            st.success(f"Transferred. Created MR(s): {', '.join(map(str, child_ids))}")
+            st.success(
+                "Transferred. " + "; ".join(
+                    f"MR {c['child_mr_id']} — invoice {c['invoice_no']} "
+                    f"({c['invoice_amount']:,.0f})"
+                    for c in created
+                )
+            )
             st.rerun()
         except Exception as e:
             st.error(str(e))
