@@ -3,12 +3,16 @@
 A "mark move" takes part of a purchased stock line at company A and moves it
 into a marked godown at company B: it reduces the source line's accepted_weight
 (the balance stays at A) and inserts a child jute_mr (transfer_mode=1) at B
-carrying only the moved quantity at a possibly-new rate. No sales invoice is
-created — the markup surfaces only as extra stock value at B.
+carrying only the moved quantity at a possibly-new rate. The batch transfer is
+an inter-company SALE (owner amendment 2026-08-03): one seller-side Raw-Jute
+sales_invoice (invoice_type=5) is created at the source branch per child MR,
+and missing masters (party, item/quality) are auto-created on both ends.
 
 Kept deliberately separate from the vertical transfer chain (transfer.py):
-no rate cascade, no finalization / return-to-origin, no invoices. The two
-worlds are disjoint by jute_mr.transfer_mode (0 = chain, 1 = marked stock).
+no rate cascade, no finalization / return-to-origin, no chain of invoices.
+The two worlds are disjoint by jute_mr.transfer_mode (0 = chain, 1 = marked
+stock). The legacy single-line save_marked_move still creates no invoice
+(dead code kept for compatibility; the page only calls save_marked_batch).
 
 Run `python -m src.jutetransfer.warehouse_stock_ops` for the split_weights
 self-check (no DB required).
@@ -22,11 +26,16 @@ from sqlalchemy import text
 from .database import DatabaseConnection
 from .lot_helpers import apply_pct, line_price, reduce_amounts, restore_amounts
 from .transfer import (
+    RAW_JUTE_INVOICE_TYPE,
     _ensure_company_as_party,
     _ensure_item,
+    _format_document_no,
+    _get_next_challan_no,
     _get_next_gate_entry_no,
+    _get_next_invoice_no,
     _get_next_mr_number_in_txn,
     _get_next_bill_pass_no_in_txn,
+    _get_seller_prefixes,
 )
 
 
@@ -137,6 +146,129 @@ _LI_INSERT_SQL = """
 """
 # actual_weight = accepted kg and actual_rate = rate on app-created lines, so
 # the ERP stock view computes balances for them (bal = actual_weight - issued).
+
+
+def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
+                                 src_co_id: int, src_branch_id: int,
+                                 buyer_party_id: int, buyer_party_branch_id,
+                                 mr_date: date, updated_by: int) -> dict:
+    """Seller-side Raw-Jute invoice for one marked child MR (owner amendment
+    2026-08-03): the batch transfer IS the inter-company sale, so the source
+    branch bills the target company at the child's (marked-up) rates. One
+    invoice per child MR; claim-free by design.
+
+    sales_invoice_jute.mr_id stores the CHILD MR id — the deletion linkage
+    for delete_marked_move. NOTE: Type 1 stores the seller MR id there; the
+    differing semantics are safe because mode-1 MRs never enter a chain.
+    Invoice line item ids are remapped back to the SOURCE company via
+    _ensure_item (child lines carry target-company item ids; normally a
+    no-op lookup since the item originates at the source).
+    """
+    lines = [
+        dict(r._mapping) for r in conn.execute(text("""
+            SELECT accepted_weight, rate, total_price, actual_item_id,
+                   actual_qty, unit_conversion
+            FROM jute_mr_li WHERE jute_mr_id = :id
+            ORDER BY jute_mr_li_id
+        """), {"id": child_mr_id}).fetchall()
+    ]
+    line_sum = round(sum(float(l["total_price"] or 0) for l in lines), 2)
+    invoice_amount = float(round(line_sum, 0))
+    round_off = round(invoice_amount - line_sum, 2)
+
+    invoice_no = _get_next_invoice_no(conn, src_branch_id, mr_date)
+    challan_no = _get_next_challan_no(conn, src_branch_id, mr_date)
+    co_prefix, branch_prefix = _get_seller_prefixes(conn, src_branch_id)
+    invoice_no_formatted = _format_document_no(
+        invoice_no, co_prefix, branch_prefix, mr_date, document_type="SI",
+    )
+
+    src = conn.execute(text("""
+        SELECT branch_mr_no, mukam_id, unit_conversion
+        FROM jute_mr WHERE jute_mr_id = :id
+    """), {"id": src_mr_id}).fetchone()._mapping
+
+    invoice_id = DatabaseConnection.execute_insert_returning_id(conn, """
+        INSERT INTO sales_invoice (
+            invoice_no, invoice_date, invoice_type, invoice_amount,
+            party_id, billing_to_id, shipping_to_id, branch_id,
+            challan_date, challan_no,
+            active, status_id, round_off, updated_by, updated_date_time
+        ) VALUES (
+            :invoice_no, :invoice_date, :invoice_type, :invoice_amount,
+            :party_id, :billing_to_id, :shipping_to_id, :branch_id,
+            :challan_date, :challan_no,
+            1, 3, :round_off, :updated_by, NOW()
+        )
+    """, {
+        "invoice_no": invoice_no,
+        "invoice_date": mr_date,
+        "invoice_type": RAW_JUTE_INVOICE_TYPE,
+        "invoice_amount": invoice_amount,
+        "party_id": buyer_party_id,
+        "billing_to_id": buyer_party_branch_id,
+        "shipping_to_id": buyer_party_branch_id,
+        "branch_id": src_branch_id,
+        "challan_date": mr_date,
+        "challan_no": challan_no,
+        "round_off": round_off,
+        "updated_by": updated_by,
+    })
+
+    for l in lines:
+        kg = float(l["accepted_weight"] or 0)
+        rate_kg = round(float(l["rate"] or 0) / 100.0, 2)
+        item_id = l["actual_item_id"]
+        if item_id:
+            item_id = _ensure_item(conn, int(item_id), src_co_id, updated_by)
+        qty = l["actual_qty"] or ""
+        unit = l["unit_conversion"] or ""
+        dtl_id = DatabaseConnection.execute_insert_returning_id(conn, """
+            INSERT INTO sales_invoice_dtl (
+                invoice_id, item_id, hsn_code, quantity, sales_weight,
+                uom_id, rate, amount_without_tax, total_amount, remarks
+            ) VALUES (
+                :invoice_id, :item_id, NULL, :kg, :kg,
+                163, :rate, :amount, :amount, :remarks
+            )
+        """, {
+            "invoice_id": invoice_id,
+            "item_id": item_id,
+            "kg": kg,
+            "rate": rate_kg,
+            "amount": float(l["total_price"] or 0),
+            "remarks": f"Raw Jute - {qty} {unit}".strip(),
+        })
+        try:
+            qty_unit_conv = int(float(l["actual_qty"] or 0))
+        except (TypeError, ValueError):
+            qty_unit_conv = 0
+        conn.execute(text("""
+            INSERT INTO sales_invoice_jute_dtl (
+                invoice_line_item_id, claim_desc, claim_rate,
+                claim_amount_dtl, unit_conversion, qty_untit_conversion
+            ) VALUES (:dtl_id, NULL, 0, 0, :unit, :qty)
+        """), {"dtl_id": dtl_id, "unit": l["unit_conversion"],
+               "qty": qty_unit_conv})
+
+    conn.execute(text("""
+        INSERT INTO sales_invoice_jute (
+            invoice_id, mr_no, mr_id, mukam_id, claim_amount, unit_conversion
+        ) VALUES (:invoice_id, :mr_no, :mr_id, :mukam_id, 0, :unit)
+    """), {
+        "invoice_id": invoice_id,
+        "mr_no": str(src["branch_mr_no"] or ""),
+        "mr_id": child_mr_id,
+        "mukam_id": src["mukam_id"],
+        "unit": src["unit_conversion"],
+    })
+
+    return {
+        "invoice_id": invoice_id,
+        "invoice_no": invoice_no,
+        "invoice_no_formatted": invoice_no_formatted,
+        "invoice_amount": invoice_amount,
+    }
 
 
 def save_marked_move(
@@ -288,7 +420,13 @@ def save_marked_batch(
     The moved amount per line is the balance-aware available kg
     (LEAST(view balance, accepted_weight)) — weight already issued to
     production stays behind. Provenance rows are written to jute_lot_src so
-    deletion restores sources exactly. Returns the created child MR ids.
+    deletion restores sources exactly.
+
+    Also creates one seller-side Raw-Jute sales invoice per child MR at the
+    source branch (buyer = target company, auto-created in the source's
+    party_mst if missing) and stamps the child MR with the formatted invoice
+    no/date/amount. Returns a list of dicts:
+    {"child_mr_id": int, "invoice_no": str, "invoice_amount": float}.
     """
     if not lot_li_ids:
         raise ValueError("no lots selected")
@@ -421,14 +559,38 @@ def save_marked_batch(
 
             _recompute_mr_header(conn, src_mr_id, updated_by)
             _recompute_mr_header(conn, child_mr_id, updated_by)
-            child_ids.append(child_mr_id)
+
+            # Seller-side inter-company sale (owner amendment 2026-08-03):
+            # the source branch bills the target company for this child MR.
+            buyer_party_id, buyer_party_branch_id = _ensure_company_as_party(
+                conn, target_co_id, target_branch_id, src_co_id, updated_by
+            )
+            invoice = _create_marked_sales_invoice(
+                conn, child_mr_id, src_mr_id, src_co_id, src_branch_id,
+                buyer_party_id, buyer_party_branch_id, mr_date, updated_by,
+            )
+            conn.execute(text("""
+                UPDATE jute_mr
+                SET invoice_no = :ino, invoice_date = :idate,
+                    invoice_amount = :iamt, updated_date_time = NOW()
+                WHERE jute_mr_id = :id
+            """), {"ino": invoice["invoice_no_formatted"],
+                   "idate": mr_date,
+                   "iamt": invoice["invoice_amount"],
+                   "id": child_mr_id})
+            child_ids.append({
+                "child_mr_id": child_mr_id,
+                "invoice_no": invoice["invoice_no_formatted"],
+                "invoice_amount": invoice["invoice_amount"],
+            })
 
         return child_ids
 
 
 def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
-    """Reverse a marked move: return the child's weight to the matching source
-    line, recompute the source header, and delete the child MR + line item.
+    """Reverse a marked move: delete the linked seller invoice, return the
+    child's weight to the matching source line(s), recompute the source
+    header(s), and delete the child MR + line items.
 
     Blocks if the child is itself the source of another marked move (leaf-first).
     """
@@ -462,6 +624,29 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
                 "This marked MR has ERP issue entries (consumption started); "
                 "cannot delete"
             )
+
+        # Cascade-delete the seller invoice created at transfer time
+        # (sales_invoice_jute.mr_id = child MR id; absent on pre-amendment
+        # rows, so this is a no-op for legacy marked MRs).
+        inv_rows = conn.execute(text(
+            "SELECT invoice_id FROM sales_invoice_jute WHERE mr_id = :id"
+        ), {"id": child_mr_id}).fetchall()
+        for (inv_id,) in inv_rows:
+            conn.execute(text("""
+                DELETE sijd FROM sales_invoice_jute_dtl sijd
+                JOIN sales_invoice_dtl sid
+                  ON sid.invoice_line_item_id = sijd.invoice_line_item_id
+                WHERE sid.invoice_id = :id
+            """), {"id": inv_id})
+            conn.execute(text(
+                "DELETE FROM sales_invoice_jute WHERE invoice_id = :id"
+            ), {"id": inv_id})
+            conn.execute(text(
+                "DELETE FROM sales_invoice_dtl WHERE invoice_id = :id"
+            ), {"id": inv_id})
+            conn.execute(text(
+                "DELETE FROM sales_invoice WHERE invoice_id = :id"
+            ), {"id": inv_id})
 
         source_mr_id = c["src_jute_mr_id"]
 
