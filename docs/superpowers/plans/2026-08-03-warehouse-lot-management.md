@@ -4,7 +4,7 @@
 
 **Goal:** Rebuild the warehouse-marked page into 3 tabs (Lots / Transfer / Marked Stock) with lot split/merge via app-created lot MRs, multi-lot batch transfer with a common % rate change, and auto-only sold detection.
 
-**Architecture:** A lot is a `jute_mr_li` row. Re-lotting creates a new "lot MR" (`transfer_mode=0`, `status_id=3`, `src_jute_mr_id` NULL) at the source company; the new sls-only table `jute_lot_src` records line-level provenance. Batch transfer generalises `save_marked_move` to many lines: one mode-1 child MR per source MR, whole-lot moves only. Sold detection is a `sales_invoice_jute.mr_id` join — no status flips, no buttons.
+**Architecture:** A lot is a `jute_mr_li` row. Re-lotting creates a new "lot MR" (`transfer_mode=0`, `status_id=3`, `src_jute_mr_id` NULL) at the source company; the new sls-only table `jute_lot_src` records line-level provenance. Batch transfer generalises `save_marked_move` to many lines: one mode-1 child MR per source MR, whole-lot moves only. Consumption is detected via the balance-based ERP stock view `vw_jute_stock_outstanding` (`bal_weight = actual_weight − issued`) — no status flips, no buttons.
 
 **Tech Stack:** Streamlit + st_aggrid, SQLAlchemy raw SQL (`text()`), MySQL (sls tenant), pytest.
 
@@ -1243,7 +1243,7 @@ git commit -m "feat: save_marked_batch (one child MR per source MR, common pct) 
 - Modify: `src/jutetransfer/pages/warehouse_stock.py` (full rewrite)
 
 **Interfaces:**
-- Consumes: `get_available_lots`, `get_quality_availability_summary` (Task 4), `get_lot_provenance`, `get_marked_stock_with_sold` (Task 5), `lot_ops.create_lot/delete_lot` (Task 6), `save_marked_batch/delete_marked_move` (Task 7), existing `get_companies/get_branches_by_company/get_company_branch_options/get_warehouses_by_branch/get_marked_warehouses_by_branch/set_warehouse_marked`.
+- Consumes: `get_available_lots`, `get_quality_availability_summary` (Task 4), `get_lot_provenance`, `get_marked_stock_with_balance` (Task 5), `lot_ops.create_lot/delete_lot` (Task 6), `save_marked_batch/delete_marked_move` (Task 7), existing `get_companies/get_branches_by_company/get_company_branch_options/get_warehouses_by_branch/get_marked_warehouses_by_branch/set_warehouse_marked`.
 - Produces: `warehouse_stock_page()` (same export — `app.py:107` keeps working); `_lot_grid(df, key) -> pd.DataFrame` (selected rows) reused by Task 9; `_render_transfer_tab` / `_render_marked_tab` placeholders replaced by Tasks 9-10.
 
 - [ ] **Step 1: Rewrite the file with tabs + Lots tab; Transfer/Marked tabs as placeholders**
@@ -1254,7 +1254,8 @@ git commit -m "feat: save_marked_batch (one child MR per source MR, common pct) 
 Lots: quality-wise availability + split/merge into app-created lot MRs
 (jute_lot_src provenance). Transfer: multi-lot whole-lot batch move into a
 marked godown with a common % rate change. Marked Stock: mode-1 stock with
-auto sold detection (raw-jute invoice join).
+balance-based consumption tracking (ERP stock view vw_jute_stock_outstanding;
+consumed when remaining balance <= 0).
 """
 
 from datetime import date, datetime
@@ -1423,7 +1424,7 @@ def warehouse_stock_page() -> None:
 Notes:
 - This rewrite drops the old per-line move form and old marked list — Tasks 9 and 10 replace them. `get_jute_mr_with_line_items` and `save_marked_move` are no longer imported by the page but remain in the codebase.
 - The old `this_year = datetime.now().month and datetime.now().year` oddity is fixed to `datetime.now().year`.
-- Keep the unused-at-this-point imports (`get_marked_stock_with_sold`, `save_marked_batch`, `delete_marked_move`, `get_company_branch_options`, warehouse helpers) — Tasks 9-10 use them.
+- Keep the unused-at-this-point imports (`get_marked_stock_with_balance`, `save_marked_batch`, `delete_marked_move`, `get_company_branch_options`, warehouse helpers) — Tasks 9-10 use them.
 
 - [ ] **Step 2: Import validation**
 
@@ -1557,7 +1558,7 @@ git commit -m "feat(page): batch transfer tab - multi-lot, common pct, preview, 
 - Modify: `src/jutetransfer/pages/warehouse_stock.py` (replace `_render_marked_tab`)
 
 **Interfaces:**
-- Consumes: `get_marked_stock_with_sold` (Task 5), `delete_marked_move` (Task 7), `get_lot_provenance` (Task 5), `get_warehouses_by_branch`, `get_marked_warehouses_by_branch`, `set_warehouse_marked`.
+- Consumes: `get_marked_stock_with_balance` (Task 5), `delete_marked_move` (Task 7), `get_lot_provenance` (Task 5), `get_warehouses_by_branch`, `get_marked_warehouses_by_branch`, `set_warehouse_marked`.
 - Produces: working Marked Stock tab; completes the page.
 
 - [ ] **Step 1: Implement**

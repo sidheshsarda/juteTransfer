@@ -3,7 +3,8 @@
 Lots: quality-wise availability + split/merge into app-created lot MRs
 (jute_lot_src provenance). Transfer: multi-lot whole-lot batch move into a
 marked godown with a common % rate change. Marked Stock: mode-1 stock with
-auto sold detection (raw-jute invoice join).
+balance-based consumption tracking (ERP stock view vw_jute_stock_outstanding;
+consumed when remaining balance <= 0).
 """
 
 from datetime import date, datetime

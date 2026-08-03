@@ -81,7 +81,16 @@ def _available_kg(conn, li_id: int, accepted: float) -> float:
     """Balance-aware available kg: LEAST(view balance, accepted_weight).
 
     The view row can be missing (e.g. freshly created line inside this
-    transaction) — fall back to accepted_weight."""
+    transaction) — fall back to accepted_weight.
+
+    # ponytail: reads vw_jute_stock_outstanding without a lock, so a
+    # concurrent ERP issue between this read and the caller's UPDATE can
+    # shrink the true balance in between (TOCTOU). Accepted risk: queries
+    # clamp with GREATEST(0), so the worst case is a stale-high available
+    # figure for one save, not a negative/corrupt balance. Upgrade path if
+    # this ever bites: SELECT ... FOR UPDATE on the view's underlying rows,
+    # or move the check inside the same locked transaction as the UPDATE.
+    """
     row = conn.execute(text(_BALANCE_SQL), {"id": li_id}).fetchone()
     bal = row._mapping["bal_weight"] if row else None
     return round(min(float(bal), accepted), 3) if bal is not None else accepted
