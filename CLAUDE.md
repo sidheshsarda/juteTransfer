@@ -2,25 +2,73 @@
 
 ## Project Overview
 
-**JuteTransfer** is a Streamlit-based application for managing Material Receipt (MR) records in jute trading. It replaces an Excel-based workflow with a structured digital system that tracks circular transfer chains across companies.
+**JuteTransfer** is a standalone Streamlit application — a customization built **only for the `sls` tenant** of the VoWERP3 ERP — that manages internal jute transfers between sls's own companies. It replaces an Excel-based workflow.
 
 **Tech Stack:**
 - Frontend: Streamlit + streamlit-aggrid
-- Backend: Python 3.12+ with SQLAlchemy ORM
-- Database: MySQL
-- Auth: Custom authentication layer in `src.jutetransfer.auth`
+- Backend: Python 3.12+ with SQLAlchemy (raw SQL via `text()`), mysql-connector
+- Database: MySQL — connects **directly** to the `sls` tenant DB (credentials in `.env`)
+- Auth: local demo auth in `src.jutetransfer.auth` (not connected to VoWERP JWT)
 
-## Core Business Logic
+## Ecosystem & Scope (READ FIRST)
 
-### Transfer Chain Pattern
+Three sibling repos work in tandem:
 
-The fundamental pattern is a **circular transfer chain**:
-- Gate entry occurs at Company A (creates MR in "pending" state)
-- First purchaser is Company B → B sells to C → C to D → ... → jute returns to Company A
-- User **manually finalizes** the MR when it returns to Company A (not auto-detected)
-- Each transfer step has rates that cascade downward (compound effect)
+| Repo | Role | Editable here? |
+|------|------|----------------|
+| `../vowerp3be` | ERP backend (FastAPI) — owns jute procurement (PO → Gate Entry → MI → MR → Bill Pass) | **NO — context only** |
+| `../vowerp3ui` | ERP frontend (Next.js) — portal pages incl. jute purchase + sales | **NO — context only** |
+| `juteTransfer` (this repo) | sls-only inter-company transfer app | **YES** |
 
-**Key requirement:** The vertical transfer chain page is the single UI surface for viewing and editing an MR's chain from root through final return.
+**Hard scope rule: changes are made only in this repo and only against the `sls` tenant database. Never touch other tenants, vowconsole3, or the vowerp3be/vowerp3ui codebases.**
+
+Full process explanation + evidence: **`docs/TRANSFER_PROCESS_UNDERSTANDING.md`** (canonical companion to this file).
+
+### Database integration facts
+
+- This app bypasses the VoWERP API/auth/tenancy entirely — raw SQL reads/writes into the shared `sls` DB.
+- Shared tables: `jute_mr`, `jute_mr_li`, `sales_invoice(+_dtl)`, `sales_invoice_jute(+_dtl)`, `warehouse_mst`, `co_mst`, `branch_mst`, `party_mst`, `party_branch_mst`, `item_mst`, `item_grp_mst`, `status_mst`.
+- **juteTransfer-only columns** on `jute_mr`: `src_jute_mr_id`, `transfer_mode` (and the write-path of `src_com_id`). They exist in the sls DB but are absent from vowerp3be's ORM and migrations — treat them as **sls-only**; never assume them on other tenants.
+- **juteTransfer-only table** `jute_lot_src` (`lot_src_id, new_jute_mr_li_id, src_jute_mr_li_id, qty_kg, actual_qty_delta, actual_weight_delta, created_by, created_date_time`) — line-level provenance for every app-created line (lot-MR lines and marked child lines), sls-only, created by `scripts/migrate_jute_lot_src.py`.
+- `jute_mr.status_id` semantics: `1` Open, `3` Approved (eligible for transfer), `13` Pending — documented by vowerp3be itself as "terminal on MR screen, handed off to external system" (= this app). Status 13 on a chain root means the origin company is consuming the jute (chain closed).
+- Gate-entry root MRs are created by VoWERP, never by this app. App-created **lot MRs** (re-allocations at the same company) are the one exception: `transfer_mode=0`, `status_id=3`, `src_jute_mr_id` NULL, always traceable via `jute_lot_src`.
+- Legacy caveat: ~10.8k historic `jute_mr` rows carry migration-era `src_com_id` values that do NOT match live `co_mst.co_id` — never key logic on `src_com_id` alone; chain queries must keep filtering on `src_jute_mr_id`.
+
+## The Two Transfer Types
+
+Both live on `jute_mr` and are kept disjoint by `jute_mr.transfer_mode`:
+
+| | **Type 1 — Vertical Transfer Chain** | **Type 2 — Marked Warehouse Stock** |
+|---|---|---|
+| `transfer_mode` | 0 | 1 |
+| Status | **Built, tested, working** | **Built:** lot management (split/merge via lot MRs), batch transfer with common % change, balance-based consumption via `vw_jute_stock_outstanding` (ERP issue entries reduce balance; consumed = balance ≤ 0) |
+| Shape | Circular: gate entry at Co A → sold B → C → … → back to A; % markup per hop; manual finalize | One-shot: partial qty of a purchased line moved to a MARKED godown at another company; stays there until sold |
+| Per hop | New `jute_mr`+`jute_mr_li` at buyer + Raw-Jute `sales_invoice` (`invoice_type=5`); final hop UPDATEs the root in place | Single child `jute_mr`+`jute_mr_li` **+ seller Raw-Jute `sales_invoice` (`invoice_type=5`) at the source branch**; no chain, no return leg |
+| `src_jute_mr_id` | Always the chain ROOT (star topology); hops linked via `src_com_id` | The DIRECT parent MR (different semantics!) |
+| Tracking | Full chain reconstruction + rate cascade | No chain to reconstruct; the transfer itself books the inter-company sale (invoice created at move time, source recorded via `src_jute_mr_id`); the *onward* sale/consumption at the target still happens in the ERP (issue entries reduce the `vw_jute_stock_outstanding` balance) |
+| UI | `pages/new_transfer_chain.py` (sole chain editor) | `pages/warehouse_stock.py` |
+| Ops | `transfer.py` | `warehouse_stock_ops.py` + `lot_ops.py` |
+
+Mutual exclusion is enforced in code: a line feeding a live chain can't be mark-moved and vice versa.
+
+### Type 1 core logic
+
+- Chain reconstruction: `get_transfer_chain` filters `src_jute_mr_id = root AND transfer_mode = 0`; `_reconstruct_chain` walks `src_com_id` as a received-from linked list from the root company.
+- Rates cascade multiplicatively hop-to-hop (`_cascade_rate`: round at kg level each hop, ×100 back to quintal).
+- **Claims never cascade** — every step's `claim_amount` is the flat sum of the original per-line claims. (Older phrasing "claim breaks" in this file was misleading; no such flag exists.)
+- Finalization = buyer's company+branch equals root's → `_update_original_mr` UPDATEs the root row in place (no new row). `revert_original_mr` undoes it.
+- Deletion from a middle step cascades downstream (MR + line items + both linked invoices per hop).
+
+### Type 2 core logic (as built)
+
+- Godowns tagged via `warehouse_mst.warehouse_type = 'MARKED'` (`queries.set_warehouse_marked`).
+- `save_marked_move`: reduces source `jute_mr_li.accepted_weight`/`total_price` (recomputes source header), INSERTs child MR at target branch/warehouse with `transfer_mode=1`, possibly different rate.
+- `save_marked_batch`: also books one seller Raw-Jute `sales_invoice` per child MR at the source branch (buyer = target company's party, auto-created if missing), stamps the child MR with invoice no/date/amount, and links via `sales_invoice_jute.mr_id` = child MR id (deletion linkage — different semantics from Type 1's hop linkage). `delete_marked_move` cascades the invoice.
+- P&L counts marked stock: `transfer_mode=1` MRs at status 3 (`get_company_wise_marked_stock`).
+
+### P&L dashboard (`pages/company_pl_dashboard.py`)
+
+Per company per FY month: Purchases = SUM(`jute_mr.net_total`); Sales = SUM(invoice − claim) of `invoice_type=5` invoices by seller branch; Stock = unsold chain stock (mode 0, open root) + marked stock (mode 1); Adjusted P&L = (Sales − Purchases) + Stock.
 
 ## Architecture
 
@@ -29,51 +77,42 @@ The fundamental pattern is a **circular transfer chain**:
 ```
 src/jutetransfer/
 ├── pages/
-│   ├── new_transfer_chain.py         # Vertical transfer chain page (sole editing UI)
-│   ├── company_pl_dashboard.py       # Company P&L dashboard page
-│   ├── schema_viewer.py              # Schema browser page
+│   ├── new_transfer_chain.py         # Type 1: vertical chain page (sole chain-editing UI)
+│   ├── warehouse_stock.py            # Type 2: marked-godown stock page
+│   ├── company_pl_dashboard.py       # Company P&L dashboard
+│   ├── schema_viewer.py              # Schema browser (dev tool)
 │   └── __init__.py
-├── jute_mr_chain_helpers.py          # Pure Python chain logic
-├── transfer.py                       # Transfer data operations & finalization
-├── queries.py                        # Database queries (get_companies, get_jute_mr_with_line_items, etc)
-├── models.py                         # SQLAlchemy ORM models
-├── database.py                       # DB connection & session management
-├── config.py                         # Configuration (env vars)
-├── auth.py                           # Authentication helpers
-├── schemas.py                        # Pydantic schemas
-├── data.py                           # Data utilities
+├── jute_mr_chain_helpers.py          # Pure Python chain math (no Streamlit/DB imports)
+├── lot_helpers.py                    # Pure lot math (no Streamlit/DB imports)
+├── transfer.py                       # Type 1 DB writes: save/delete/finalize/revert
+├── warehouse_stock_ops.py            # Type 2 DB writes: save/delete marked moves
+├── lot_ops.py                        # Lot MR create/delete (split/merge, provenance)
+├── queries.py                        # All read queries + P&L aggregations
+├── models.py                         # ORM mirror of sls tables (reference only — queries use raw SQL)
+├── database.py                       # Cached engine, execute helpers, get_transaction()
+├── config.py                         # .env-driven DB config
+├── auth.py                           # Demo auth
+├── schemas.py                        # Schema introspection cache (schema viewer only)
+├── data.py                           # Fake data for demo pages (unused by real pages)
 └── __init__.py
 
 app.py                                # Streamlit entry point
+tests/                                # pytest: chain reconstruction, grouping, recalculation
 ```
 
 ### Critical Dependencies
 
-**jute_mr_chain_helpers.py** → **No circular imports allowed**
-- This is the pure Python core; imports nothing from pages
-- Contains: grouping, chain reconstruction, status checks, rate recalculation math
-- Used by: `transfer.py`, `pages/new_transfer_chain.py`
-
-**transfer.py** → **Public API for transfer operations**
-- Imports: `jute_mr_chain_helpers`, `queries`, `database`
-- Used by: `pages/new_transfer_chain.py` for save/delete/finalize operations
-
-**pages/new_transfer_chain.py** → **Transfer Chain (Vertical) page**
-- Imports: `jute_mr_chain_helpers`, `transfer`, `queries`
-- Renders the vertical 3-level chain editor used for all transfer editing
+- **jute_mr_chain_helpers.py** — pure Python core; imports nothing from pages/DB. No circular imports allowed.
+- **transfer.py** — type 1 public API (`save_transfer_step`, `delete_transfer_step`, `delete_chain_from_step`, `revert_original_mr`). All writes inside `DatabaseConnection.get_transaction()`.
+- **warehouse_stock_ops.py** — type 2 public API (`save_marked_move`, `delete_marked_move`). Keep it independent of chain logic; the `transfer_mode` guard rails must stay.
 
 ## Key Implementation Patterns
 
 ### 1. The % Rate Increase Widget Bug (SOLVED)
 
-**Historical Context:** Users couldn't enter % rate increases—the input appeared broken.
+**Root causes:** `nonlocal` doesn't cross Streamlit reruns; `value=` param resets widget state every rerun; closures capture stale loop variables.
 
-**Root Causes:**
-1. `nonlocal` doesn't cross Streamlit reruns (callbacks execute in different frames)
-2. `value=current_pct` parameter reset widget state every rerun
-3. Closures captured stale loop variables
-
-**Current Solution (in `pages/new_transfer_chain.py`):**
+**Solution (in `pages/new_transfer_chain.py`):**
 ```python
 # Initialize widget state if missing
 if pct_key not in st.session_state:
@@ -91,122 +130,51 @@ if new_pct != current_pct:
 
 ### 2. Chain Recalculation
 
-**jute_mr_chain_helpers._recalculate_chain()** is the math engine:
-- Takes a step with modified rate/factor
-- Propagates changes downward through all subsequent steps
-- Respects claim propagation rules (don't cascade past claim breaks)
-- Returns updated chain with all dependent steps recalculated
-
-**Used by:** the vertical transfer chain page when the user modifies % rate increase or other step properties.
+`jute_mr_chain_helpers._recalculate_chain()` is the math engine: takes a step with modified rate/pct, propagates totals forward through subsequent steps (round-then-cascade at kg level), recomputes claim as flat original total per step.
 
 ### 3. Session State Management
 
-Use `st.session_state` for:
-- Widget values that persist across reruns
-- Cached data that should survive a single user action
-- Intermediate state during complex workflows
+Use `st.session_state` for widget values, cached data, intermediate workflow state.
+Do NOT use: `nonlocal` in callbacks, closure captures of loop variables, module-level globals.
 
-Do NOT use:
-- `nonlocal` for widget callbacks
-- Closure captures for loop variables
-- Module-level globals
-
-## Testing Strategy
-
-### Current Status
-
-- [x] Module imports (no circular dependencies)
-- [ ] Integration: App start, page loads
-- [ ] Widget behavior: % Rate Increase form flow
-- [ ] Chain propagation: Rate changes cascade correctly
-- [ ] Persistence: Save/reload preserves changes
-
-### How to Run Tests
+## Testing
 
 ```bash
-# Module import validation
-python -c "from src.jutetransfer import jute_mr_chain_helpers, transfer; from src.jutetransfer.pages import new_transfer_chain, schema_viewer, company_pl_dashboard; print('✓ All imports OK')"
+# Import validation
+python -c "from src.jutetransfer import jute_mr_chain_helpers, transfer, warehouse_stock_ops; from src.jutetransfer.pages import new_transfer_chain, warehouse_stock, schema_viewer, company_pl_dashboard; print('OK')"
 
-# Full app (requires MySQL, .env with credentials)
+# Unit tests
+pytest tests/ -v
+
+# Full app (requires MySQL access + .env)
 streamlit run app.py
 ```
 
-### Integration Test Checklist
-
-When modifying chain logic or the transfer editor:
-
-1. **Rate Cascade**
-   - Enter 10% in Step 2 → Verify Step 3's rate updates
-   - Enter -5% → Verify decrease propagates
-
-2. **Save/Reload**
-   - Save a modified step
-   - Reload the page
-   - Verify changes persisted and display is correct
-
-3. **Edge Cases**
-   - Empty chains (pending MR, no transfers yet)
-   - Single-step chains
-   - Chains with claim breaks (should stop cascading at that point)
+Integration checklist when touching chain logic: rate cascade (10% on step 2 → step 3 updates; −5% propagates), save/reload persistence, edge cases (pending root with no transfers, single-step chain). When touching type 2: partial move reduces source and creates mode-1 child; move blocked when line is in a live chain; delete restores source weights.
 
 ## Development Workflow
 
 ### Before Committing
 
-1. **Verify imports are correct**
-   - No circular dependencies between modules
-   - Chain helpers imports only stdlib/third-party, never pages/editor
+1. No circular imports (chain helpers import only stdlib/third-party).
+2. Test the affected feature (cascade / widget state / query shape / marked-move guards).
+3. All multi-statement writes go through `get_transaction()` — never partial commits.
+4. Remember the scope rule: sls DB only.
 
-2. **Test the affected feature**
-   - If modifying chain logic: test rate cascade
-   - If modifying editor UI: test widget state persistence
-   - If modifying queries: verify data structure unchanged
+### Known housekeeping debt (don't be surprised by these)
 
-3. **Keep modules focused**
-   - jute_mr_chain_helpers: pure Python chain math
-   - pages/new_transfer_chain: Streamlit UI rendering
-   - transfer.py: data operations
-   - queries.py: database reads
-
-### File Size Targets
-
-- **pages/new_transfer_chain.py**: Keep focused; extract helpers if it grows past ~700 lines
-- **jute_mr_chain_helpers.py**: Keep under 350 lines
-
-If a module exceeds these targets, consider extracting helper functions into separate files (e.g., `jute_mr_calculations.py`).
-
-## Common Tasks
-
-### Adding a New Transfer Step Property
-
-1. Update `_empty_transfer_step()` in `jute_mr_chain_helpers.py`
-2. Add field to the editor input section in `pages/new_transfer_chain.py`
-3. Update `_recalculate_chain()` logic if the property affects downstream calculations
-4. Update `transfer.save_transfer_step()` to persist the new field
-5. Test: Verify new field displays, saves, and cascades (if applicable)
-
-### Fixing a Widget State Bug
-
-- Check if you're using `value=` parameter (usually the culprit)
-- Use `st.session_state` for initialization instead
-- Read value from `st.session_state` after widget renders
-- Do NOT use `nonlocal` in callbacks
-
-### Adding a New Database Query
-
-1. Write function in `queries.py` (keep it simple, single SELECT/JOIN)
-2. Import in the page or editor that needs it
-3. Test: Verify query returns expected shape and handles edge cases
+- Live `[DEBUG]` caption in `new_transfer_chain.py` (~line 470) and `debug_transfer.log` append on every save — leftover instrumentation.
+- Stray `pages/company_pl_dashboard.py.tmp.*` file.
+- Demo auth means `updated_by` is always `1`.
+- `docs/invoice_data_flow_step2.md`, `docs/invoice_verification_checklist.md`, `docs/step2_invoice_example.md` and the 2026-03/04 superpowers plans reference the retired `jute_mr.py`/`jute_mr_editor.py` pages — historical only.
 
 ## References
 
-- **Business Logic Detail**: See memory file `project_jute_transfer.md`
-- **Refactoring History**: See memory file `refactoring_session.md`
-- **% Rate Increase Deep Dive**: See memory file `rate_increase_execution_flow.md`
-- **Widget State Fix**: See memory file `rate_increase_enter_key_fix.md`
+- **Process understanding (canonical):** `docs/TRANSFER_PROCESS_UNDERSTANDING.md` — full two-transfer-type explanation, ERP seam, DB evidence, open questions
+- **Vertical chain page design:** `docs/NEW_VERTICAL_TRANSFER_CHAIN_PAGE_DESIGN.md`
+- **ERP-side context:** `../vowerp3be/CLAUDE.md`, `../vowerp3ui/docs/claude/modules/jute-purchase/`
 
 ---
 
-**Last Updated:** 2026-04-18  
-**Maintained By:** Development Team  
-**Key Constraint:** Circular transfer chains must be preserved; the vertical transfer chain page is the sole editing UI
+**Last Updated:** 2026-08-03
+**Key Constraints:** sls tenant only; `transfer_mode` keeps the two transfer types disjoint; the vertical chain page is the sole chain-editing UI; gate-entry root MRs come from VoWERP, never from this app — app-created lot MRs are the one exception, always traceable via `jute_lot_src`

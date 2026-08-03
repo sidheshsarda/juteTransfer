@@ -539,9 +539,14 @@ def _ensure_item(conn, source_item_id: int, target_co_id: int,
 # Gate entry / MR number helpers
 # ---------------------------------------------------------------------------
 
-def _get_next_gate_entry_no(conn, branch_id: int) -> int:
-    """Get the next gate entry number for a branch in the current FY."""
-    fy_start, fy_end = _get_financial_year_bounds()
+def _get_next_gate_entry_no(conn, branch_id: int, mr_date: date = None) -> int:
+    """Get the next gate entry number for a branch within mr_date's FY.
+
+    FY window is derived from mr_date (the date being stamped on the row),
+    so back-dated or forward-dated entries are numbered within their own FY.
+    mr_date=None keeps today's behavior (matches _get_financial_year_bounds).
+    """
+    fy_start, fy_end = _get_financial_year_bounds(mr_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(jute_gate_entry_no), 0) AS max_no
                 FROM jute_mr
@@ -571,13 +576,14 @@ def _get_next_mr_number_in_txn(conn, branch_id: int, mr_date: date) -> int:
     return int(result.scalar() or 0) + 1
 
 
-def _get_next_bill_pass_no_in_txn(conn, branch_id: int) -> int:
+def _get_next_bill_pass_no_in_txn(conn, branch_id: int, mr_date: date = None) -> int:
     """Get next bill_pass_no inside an existing transaction.
 
     Bill pass numbers are sequential per branch within a financial year
-    (April 1 to March 31).
+    (April 1 to March 31). FY window is derived from mr_date (the date being
+    stamped on the row); mr_date=None keeps today's behavior.
     """
-    fy_start, fy_end = _get_financial_year_bounds()
+    fy_start, fy_end = _get_financial_year_bounds(mr_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(bill_pass_no), 0) AS max_no
                 FROM jute_mr
@@ -620,7 +626,7 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
     _ensure_party_types(conn, party_id, updated_by)
 
     # Generate bill_pass_no for this branch/financial year
-    new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, step.branch_id)
+    new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, step.branch_id, step.mr_date)
 
     new_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO jute_mr (
@@ -649,7 +655,7 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
             :invoice_no, :invoice_date, :invoice_amount
         )
     """, {
-        "gate_entry_no": _get_next_gate_entry_no(conn, step.branch_id),
+        "gate_entry_no": _get_next_gate_entry_no(conn, step.branch_id, step.mr_date),
         "branch_mr_no": step.mr_no,
         "gate_entry_date": step.mr_date,
         "mr_date": step.mr_date,
@@ -1155,7 +1161,7 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
 
     # Assign branch_mr_no and bill_pass_no
     new_mr_no = _get_next_mr_number_in_txn(conn, branch_id, mr_date)
-    new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, branch_id)
+    new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, branch_id, mr_date)
 
     # Update each line item with its computed absolute rate.
     # source_mr provides the jute_mr_li_id (which DB row to update).
@@ -1396,7 +1402,7 @@ def save_transfer_step(
 
         # Assign MR number inside transaction
         step.mr_no = _get_next_mr_number_in_txn(conn, step.branch_id, step.mr_date)
-        step.gate_entry_no = _get_next_gate_entry_no(conn, step.branch_id)
+        step.gate_entry_no = _get_next_gate_entry_no(conn, step.branch_id, step.mr_date)
 
         if is_first_step:
             # Step[0]: first receiver gets MR from original supplier
@@ -1430,9 +1436,11 @@ def save_transfer_step(
                 order_date_for_lc=step.order_date_for_lc,
             )
             # Find the previous MR ID for invoice linkage
+            # mode-1 marked children share src_jute_mr_id; never chain rows
             prev_mr_result = conn.execute(
                 text("""SELECT jute_mr_id FROM jute_mr
                         WHERE src_jute_mr_id = :root AND branch_id = :bid
+                        AND transfer_mode = 0
                         ORDER BY jute_mr_id DESC LIMIT 1"""),
                 {"root": root_mr_id, "bid": prev_branch_id},
             )
@@ -1527,9 +1535,11 @@ def delete_transfer_step(jute_mr_id: int, updated_by: int) -> None:
         root_mr_id, current_branch_id = mr_info
 
         # Find the previous MR in the chain (same root, different branch, most recent)
+        # mode-1 marked children share src_jute_mr_id; never chain rows
         prev_mr_result = conn.execute(
             text("""SELECT jute_mr_id FROM jute_mr
                     WHERE src_jute_mr_id = :root AND branch_id != :bid
+                    AND transfer_mode = 0
                     ORDER BY jute_mr_id DESC LIMIT 1"""),
             {"root": root_mr_id, "bid": current_branch_id},
         )

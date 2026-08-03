@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from ..queries import (
+    get_company_wise_marked_stock,
     get_company_wise_purchases_by_month,
     get_company_wise_sales_by_month,
     get_company_wise_unsold_stock,
@@ -59,13 +60,14 @@ def _current_and_previous_fy_labels() -> List[str]:
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=300)
-def _load_fy_data(fy_label: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _load_fy_data(fy_label: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Fetch sales, purchase, and unsold-stock dataframes for a FY label."""
     fy_start, fy_end = _fy_label_to_bounds(fy_label)
     purchases = get_company_wise_purchases_by_month(fy_start, fy_end)
     sales = get_company_wise_sales_by_month(fy_start, fy_end)
     stock = get_company_wise_unsold_stock(fy_start, fy_end)
-    return sales, purchases, stock
+    marked = get_company_wise_marked_stock(fy_start, fy_end)
+    return sales, purchases, stock, marked
 
 
 def _pivot_to_fy_months(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
@@ -122,6 +124,17 @@ def _stock_to_wide(df: pd.DataFrame) -> pd.DataFrame:
     wide["Stock"] = wide["Stock"].astype(float)
     total = pd.DataFrame([{"Company": "Total", "Stock": float(wide["Stock"].sum())}])
     return pd.concat([wide, total], ignore_index=True)
+
+
+def _combine_stock(chain_df: pd.DataFrame, marked_df: pd.DataFrame) -> pd.DataFrame:
+    """Sum chain-stock and marked-stock per company into one long-form df
+    (co_id, co_name, stock_value)."""
+    frames = [d for d in (chain_df, marked_df)
+              if d is not None and not d.empty]
+    if not frames:
+        return chain_df if chain_df is not None else marked_df
+    combined = pd.concat(frames, ignore_index=True)[["co_id", "co_name", "stock_value"]]
+    return combined.groupby(["co_id", "co_name"], as_index=False)["stock_value"].sum()
 
 
 def _align_for_pnl(
@@ -194,11 +207,12 @@ def company_pl_dashboard_page() -> None:
     fy_options = _current_and_previous_fy_labels()
     fy_label = st.selectbox("Financial Year", options=fy_options, index=0)
 
-    sales_df, purchases_df, stock_df = _load_fy_data(fy_label)
+    sales_df, purchases_df, stock_df, marked_df = _load_fy_data(fy_label)
 
     sales_wide = _pivot_to_fy_months(sales_df, "net_sales")
     purchases_wide = _pivot_to_fy_months(purchases_df, "net_purchases")
-    stock_wide = _stock_to_wide(stock_df)
+    stock_wide = _stock_to_wide(_combine_stock(stock_df, marked_df))
+    marked_wide = _stock_to_wide(marked_df)
     pnl_wide = _align_for_pnl(sales_wide, purchases_wide, stock_wide)
 
     # Extract totals for KPI cards
@@ -217,6 +231,7 @@ def company_pl_dashboard_page() -> None:
         (sales_df is None or sales_df.empty)
         and (purchases_df is None or purchases_df.empty)
         and (stock_df is None or stock_df.empty)
+        and (marked_df is None or marked_df.empty)
     ):
         st.info(f"No data for FY {fy_label}.")
 
@@ -235,3 +250,4 @@ def company_pl_dashboard_page() -> None:
     _render_grid(f"Purchases — FY {fy_label}", purchases_wide, month_cols)
     _render_grid(f"Net P&L — FY {fy_label}", pnl_wide, pnl_cols)
     _render_grid(f"Current Stock — FY {fy_label}", stock_wide, ["Stock"])
+    _render_grid(f"Marked Godown Stock — FY {fy_label}", marked_wide, ["Stock"])

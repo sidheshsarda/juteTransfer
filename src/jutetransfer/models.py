@@ -122,6 +122,7 @@ class JuteMR(Base):
     bill_pass_complete = Column(Integer)
     approval_level = Column(Integer)
     src_jute_mr_id = Column(Integer)
+    transfer_mode = Column(Integer, nullable=False, default=0)
 
 
 class JuteMRLineItem(Base):

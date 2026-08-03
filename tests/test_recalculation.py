@@ -1,5 +1,5 @@
 """Tests for _recalculate_chain with rounding rules."""
-from src.jutetransfer.pages.jute_mr import _recalculate_chain
+from src.jutetransfer.jute_mr_chain_helpers import _recalculate_chain
 
 
 def _make_line_items(items):
@@ -73,7 +73,7 @@ def test_rounding_creates_roundoff():
 
     raw_total = 8328.33 + 16668.33  # 24996.66
     assert steps[0]["total_amount"] == 24997  # round(24996.66, 0)
-    assert abs(steps[0]["roundoff"] - (24996.66 - 24997)) < 0.01
+    assert abs(steps[0]["roundoff"] - (24997 - 24996.66)) < 0.01
 
 
 def test_claim_unaffected_by_pct():
