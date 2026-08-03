@@ -231,8 +231,12 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
              for p in prov),
             key=lambda t: t[0],
         )
-        src_mr_ids = set()
-        for src_li_id, qty, aq_delta, aw_delta in restore:
+
+        # Lock + fetch all source lines first, and chain-guard every source MR
+        # BEFORE any UPDATE runs (fail-fast; the transaction would roll back
+        # anyway, but this avoids partial mutation attempts).
+        srcs = {}
+        for src_li_id, _qty, _aq, _aw in restore:
             src = conn.execute(text("""
                 SELECT jute_mr_li_id, jute_mr_id, accepted_weight, rate,
                        actual_qty, actual_weight
@@ -240,7 +244,23 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
             """), {"id": src_li_id}).fetchone()
             if not src:
                 raise ValueError(f"Source line {src_li_id} vanished; cannot restore")
-            s = src._mapping
+            srcs[src_li_id] = src._mapping
+
+        checked_mrs = set()
+        for s in srcs.values():
+            mr_id = int(s["jute_mr_id"])
+            if mr_id in checked_mrs:
+                continue
+            if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": mr_id}).fetchone():
+                raise ValueError(
+                    f"Source MR {mr_id} now feeds a vertical chain; "
+                    "cannot restore weights onto it"
+                )
+            checked_mrs.add(mr_id)
+
+        src_mr_ids = set()
+        for src_li_id, qty, aq_delta, aw_delta in restore:
+            s = srcs[src_li_id]
             new_w, new_aw, new_aq = restore_amounts(
                 s["accepted_weight"], s["actual_weight"], s["actual_qty"],
                 qty, aq_delta, aw_delta,

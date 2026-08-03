@@ -70,6 +70,12 @@ _BALANCE_SQL = """
     SELECT bal_weight FROM vw_jute_stock_outstanding WHERE jute_mr_li_id = :id
 """
 
+_CHAIN_CHILD_SQL = """
+    SELECT 1 FROM jute_mr
+    WHERE src_jute_mr_id = :sid AND transfer_mode = 0 AND jute_mr_id <> :sid
+    LIMIT 1
+"""
+
 
 def _available_kg(conn, li_id: int, accepted: float) -> float:
     """Balance-aware available kg: LEAST(view balance, accepted_weight).
@@ -168,11 +174,9 @@ def save_marked_move(
         if int(r["transfer_mode"] or 0) != 0:
             raise ValueError("Can only mark-move from normal (transfer_mode=0) stock")
         new_source_weight, moved = split_weights(available, float(moved_qty))
-        chain_child = conn.execute(text("""
-            SELECT 1 FROM jute_mr
-            WHERE src_jute_mr_id = :sid AND transfer_mode = 0 AND jute_mr_id <> :sid
-            LIMIT 1
-        """), {"sid": source_mr_id}).fetchone()
+        chain_child = conn.execute(
+            text(_CHAIN_CHILD_SQL), {"sid": source_mr_id}
+        ).fetchone()
         if chain_child:
             raise ValueError(
                 "This MR is part of a vertical transfer chain; "
@@ -322,12 +326,9 @@ def save_marked_batch(
             mr_id = int(r["jute_mr_id"])
             if mr_id in checked:
                 continue
-            chain_child = conn.execute(text("""
-                SELECT 1 FROM jute_mr
-                WHERE src_jute_mr_id = :sid AND transfer_mode = 0
-                  AND jute_mr_id <> :sid
-                LIMIT 1
-            """), {"sid": mr_id}).fetchone()
+            chain_child = conn.execute(
+                text(_CHAIN_CHILD_SQL), {"sid": mr_id}
+            ).fetchone()
             if chain_child:
                 raise ValueError(
                     f"MR {mr_id} is part of a vertical transfer chain; "
@@ -465,19 +466,44 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
             FOR UPDATE
         """), {"id": child_mr_id}).fetchall()
         if prov:
-            src_mr_ids = set()
-            for p in sorted(prov, key=lambda p: int(p._mapping["src_jute_mr_li_id"])):
+            ordered_prov = sorted(
+                prov, key=lambda p: int(p._mapping["src_jute_mr_li_id"])
+            )
+
+            # Lock + fetch all source lines first, and chain-guard every source
+            # MR BEFORE any UPDATE runs (fail-fast; the transaction would roll
+            # back anyway, but this avoids partial mutation attempts).
+            srcs = {}
+            for p in ordered_prov:
                 m = p._mapping
+                src_li_id = int(m["src_jute_mr_li_id"])
                 src = conn.execute(text("""
                     SELECT jute_mr_li_id, jute_mr_id, accepted_weight, rate,
                            actual_qty, actual_weight
                     FROM jute_mr_li WHERE jute_mr_li_id = :id FOR UPDATE
-                """), {"id": int(m["src_jute_mr_li_id"])}).fetchone()
+                """), {"id": src_li_id}).fetchone()
                 if not src:
                     raise ValueError(
-                        f"Source line {m['src_jute_mr_li_id']} vanished; cannot restore"
+                        f"Source line {src_li_id} vanished; cannot restore"
                     )
-                s = src._mapping
+                srcs[src_li_id] = src._mapping
+
+            checked_mrs = set()
+            for s in srcs.values():
+                mr_id = int(s["jute_mr_id"])
+                if mr_id in checked_mrs:
+                    continue
+                if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": mr_id}).fetchone():
+                    raise ValueError(
+                        f"Source MR {mr_id} now feeds a vertical chain; "
+                        "cannot restore weights onto it"
+                    )
+                checked_mrs.add(mr_id)
+
+            src_mr_ids = set()
+            for p in ordered_prov:
+                m = p._mapping
+                s = srcs[int(m["src_jute_mr_li_id"])]
                 qty = float(m["qty_kg"] or 0)
                 new_w, new_aw, new_aq = restore_amounts(
                     s["accepted_weight"], s["actual_weight"], s["actual_qty"],
