@@ -310,6 +310,79 @@ def get_quality_availability_summary(co_id: int, branch_id: int, year: int, mont
     )
 
 
+def get_marked_stock_with_balance(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
+    """Marked (mode-1) stock lines with remaining balance from the ERP stock
+    view (bal_weight = actual_weight - issued). consumed=1 when balance <= 0.
+    One row per line; value prices the REMAINING balance."""
+    query = """
+        SELECT
+            mr.jute_mr_id,
+            li.jute_mr_li_id,
+            mr.branch_mr_no AS mr_no,
+            mr.jute_mr_date AS mr_date,
+            im.item_name AS quality,
+            li.accepted_weight AS kg,
+            ROUND(GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0), 3) AS balance_kg,
+            li.rate AS rate,
+            ROUND(GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0)
+                  * COALESCE(li.rate, 0) / 100, 2) AS value,
+            wh.warehouse_name AS godown,
+            mr.src_jute_mr_id,
+            (COALESCE(v.bal_weight, li.accepted_weight) <= 0) AS consumed
+        FROM jute_mr mr
+        JOIN branch_mst bm ON bm.branch_id = mr.branch_id
+        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
+        LEFT JOIN item_mst im ON im.item_id = li.actual_item_id
+        LEFT JOIN warehouse_mst wh ON wh.warehouse_id = li.warehouse_id
+        WHERE mr.transfer_mode = 1
+          AND mr.status_id = 3
+          AND bm.co_id = :co_id
+          AND mr.branch_id = :branch_id
+          AND YEAR(mr.jute_gate_entry_date) = :year
+          AND MONTH(mr.jute_gate_entry_date) = :month
+        ORDER BY mr.jute_mr_date, mr.jute_mr_id, li.jute_mr_li_id
+    """
+    return DatabaseConnection.execute_query(
+        query, {"co_id": co_id, "branch_id": branch_id, "year": year, "month": month}
+    )
+
+
+def get_lot_provenance(jute_mr_id: int) -> pd.DataFrame:
+    """Walk jute_lot_src from a lot MR's lines back to gate-entry origins.
+
+    depth 1 = direct source; deeper = re-lotted lots. Empty DataFrame if the
+    MR is not a lot MR."""
+    query = """
+        WITH RECURSIVE prov AS (
+            SELECT ls.new_jute_mr_li_id AS lot_li,
+                   ls.src_jute_mr_li_id,
+                   ls.qty_kg,
+                   1 AS depth
+            FROM jute_lot_src ls
+            JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
+            WHERE li.jute_mr_id = :mr_id
+            UNION ALL
+            SELECT p.lot_li, ls2.src_jute_mr_li_id, ls2.qty_kg, p.depth + 1
+            FROM prov p
+            JOIN jute_lot_src ls2 ON ls2.new_jute_mr_li_id = p.src_jute_mr_li_id
+        )
+        SELECT p.lot_li,
+               p.src_jute_mr_li_id,
+               p.qty_kg,
+               p.depth,
+               smr.jute_mr_id AS src_mr_id,
+               smr.branch_mr_no AS src_mr_no,
+               im.item_name AS quality
+        FROM prov p
+        JOIN jute_mr_li sli ON sli.jute_mr_li_id = p.src_jute_mr_li_id
+        JOIN jute_mr smr ON smr.jute_mr_id = sli.jute_mr_id
+        LEFT JOIN item_mst im ON im.item_id = sli.actual_item_id
+        ORDER BY p.lot_li, p.depth, p.src_jute_mr_li_id
+    """
+    return DatabaseConnection.execute_query(query, {"mr_id": jute_mr_id})
+
+
 def get_source_mr_full(jute_mr_id: int, conn=None) -> Optional[dict]:
     """Fetch complete jute_mr record + line items for copying during transfer.
 
@@ -572,17 +645,25 @@ def get_company_wise_unsold_stock(fy_start, fy_end) -> pd.DataFrame:
 
 
 def get_company_wise_marked_stock(fy_start, fy_end) -> pd.DataFrame:
-    """Return per-company warehouse-marked stock value (net_total of
-    transfer_mode=1 MRs). Columns: co_id, co_name, stock_value (float)."""
+    """Return per-company warehouse-marked stock value, revalued from the
+    remaining balance (ERP stock view bal_weight, falling back to
+    accepted_weight) x rate — not the original net_total. Consumed stock
+    (balance <= 0) drops out naturally since GREATEST(...,0) zeroes its
+    contribution. Columns: co_id, co_name, stock_value (float)."""
     return DatabaseConnection.execute_query(
         """
         SELECT
             cm.co_id   AS co_id,
             cm.co_name AS co_name,
-            COALESCE(SUM(mr.net_total), 0) AS stock_value
+            COALESCE(SUM(
+                GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0)
+                * COALESCE(li.rate, 0) / 100
+            ), 0) AS stock_value
         FROM jute_mr mr
         JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         JOIN co_mst    cm ON bm.co_id = cm.co_id
+        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
         WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
           AND mr.status_id = 3
           AND mr.transfer_mode = 1
