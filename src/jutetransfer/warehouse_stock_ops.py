@@ -20,6 +20,7 @@ from typing import Tuple
 from sqlalchemy import text
 
 from .database import DatabaseConnection
+from .lot_helpers import apply_pct, line_price
 from .transfer import (
     _ensure_company_as_party,
     _ensure_item,
@@ -63,6 +64,65 @@ def _recompute_mr_header(conn, jute_mr_id: int, updated_by: int) -> None:
             updated_date_time = NOW()
         WHERE jute_mr_id = :id
     """), {"id": jute_mr_id, "updated_by": updated_by})
+
+
+_BALANCE_SQL = """
+    SELECT bal_weight FROM vw_jute_stock_outstanding WHERE jute_mr_li_id = :id
+"""
+
+
+def _available_kg(conn, li_id: int, accepted: float) -> float:
+    """Balance-aware available kg: LEAST(view balance, accepted_weight).
+
+    The view row can be missing (e.g. freshly created line inside this
+    transaction) — fall back to accepted_weight."""
+    row = conn.execute(text(_BALANCE_SQL), {"id": li_id}).fetchone()
+    bal = row._mapping["bal_weight"] if row else None
+    return round(min(float(bal), accepted), 3) if bal is not None else accepted
+
+
+def _reduce_source_line(conn, r: dict, qty: float, available: float) -> tuple:
+    """Reduce a locked source line by qty kg across accepted AND actual fields.
+
+    Returns (actual_qty_delta, actual_weight_delta) for provenance storage."""
+    accepted = float(r["accepted_weight"] or 0)
+    actual_w = float(r["actual_weight"] or 0)
+    actual_q = float(r["actual_qty"] or 0)
+    frac = qty / available if available > 0 else 1.0
+    aw_delta = round(min(qty, actual_w), 3)
+    aq_delta = round(actual_q * frac, 3)
+    new_accepted = round(accepted - qty, 3)
+    conn.execute(text("""
+        UPDATE jute_mr_li
+        SET accepted_weight = :w, total_price = :p,
+            actual_weight = :aw, actual_qty = :aq,
+            updated_date_time = NOW()
+        WHERE jute_mr_li_id = :id
+    """), {
+        "w": new_accepted,
+        "p": line_price(new_accepted, float(r["rate"] or 0)),
+        "aw": round(max(0.0, actual_w - aw_delta), 3),
+        "aq": round(max(0.0, actual_q - aq_delta), 3),
+        "id": int(r["jute_mr_li_id"]),
+    })
+    return aq_delta, aw_delta
+
+
+_LI_INSERT_SQL = """
+    INSERT INTO jute_mr_li (
+        jute_mr_id, actual_item_id, actual_quality, challan_quality_id,
+        accepted_weight, rate, claim_rate, total_price, warehouse_id,
+        actual_qty, actual_weight, actual_rate,
+        marka, crop_year, active, updated_date_time, unit_conversion
+    ) VALUES (
+        :mr_id, :actual_item_id, :actual_quality, :challan_quality_id,
+        :w, :rate, 0, :price, :warehouse_id,
+        :actual_qty, :w, :rate,
+        :marka, :crop_year, 1, NOW(), :unit_conversion
+    )
+"""
+# actual_weight = accepted kg and actual_rate = rate on app-created lines, so
+# the ERP stock view computes balances for them (bal = actual_weight - issued).
 
 
 def save_marked_move(
