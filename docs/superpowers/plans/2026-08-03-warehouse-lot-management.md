@@ -19,6 +19,8 @@
 - Eligibility everywhere: `transfer_mode = 0 AND status_id = 3 AND accepted_weight > 0` and the MR has no mode-0 children (chain guard).
 - `status_id` semantics: 1 Open, 3 Approved, 13 Pending. Never use the 0/1/2 labels from `get_jute_mr_with_line_items`.
 - Rates are per quintal: value = kg × rate / 100. Kg rounds to 3 dp, money to 2 dp.
+- Stock truth is the ERP view `vw_jute_stock_outstanding` (`bal_weight = actual_weight − SUM(jute_issue.weight WHERE status_id <> 4)` per `jute_mr_li_id`, MRs status 3/13). Available kg = `LEAST(COALESCE(v.bal_weight, li.accepted_weight), li.accepted_weight)`; consumed = balance ≤ 0. Never detect consumption via `sales_invoice_jute.mr_id` (owner ruling 2026-08-03 — the ERP UI never populates it).
+- Every line this app creates must set `actual_weight` (= moved kg), `actual_rate` (= rate), and `actual_qty` (source `actual_qty` × take-fraction, 3 dp); every source reduction/restore adjusts `actual_weight`/`actual_qty` alongside `accepted_weight`. Exact deltas live in `jute_lot_src.actual_qty_delta`/`actual_weight_delta`.
 - Pure math modules import nothing from pages/DB (pattern: `jute_mr_chain_helpers.py`).
 - Streamlit widgets: key-based session state, never pass `value=` for persistent inputs (CLAUDE.md widget lesson).
 - Run pytest from repo root: `pytest tests/ -v`. Import check: `python -c "from src.jutetransfer import ..."`.
@@ -151,12 +153,23 @@ CREATE TABLE IF NOT EXISTS jute_lot_src (
     new_jute_mr_li_id  BIGINT NOT NULL,
     src_jute_mr_li_id  BIGINT NOT NULL,
     qty_kg             DECIMAL(12,3) NOT NULL,
+    actual_qty_delta   DECIMAL(12,3) NULL,
+    actual_weight_delta DECIMAL(12,3) NULL,
     created_by         INT NULL,
     created_date_time  DATETIME NULL,
     KEY idx_lot_src_new (new_jute_mr_li_id),
     KEY idx_lot_src_src (src_jute_mr_li_id)
 )
 """
+```
+
+Rows are written for every app-created line — lot-MR lines AND marked child
+lines — recording exactly what was taken from which source line
+(`qty_kg` = accepted kg moved, `actual_qty_delta`/`actual_weight_delta` = the
+amounts subtracted from the source's `actual_qty`/`actual_weight`), so deletes
+restore sources exactly with no quality matching.
+
+```python
 
 if __name__ == "__main__":
     DatabaseConnection.execute_non_query(DDL)
@@ -343,9 +356,11 @@ Write the FROM/WHERE block twice, fully inlined in each function (no string spli
 
 ```python
 def get_available_lots(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
-    """Transferable lots: mode 0, Approved (status 3), kg > 0, not feeding a
-    live vertical chain. One row per jute_mr_li line. is_lot=1 marks app-created
-    lot-MR lines (provenance exists in jute_lot_src)."""
+    """Transferable lots: mode 0, Approved (status 3), available kg > 0, not
+    feeding a live vertical chain. One row per jute_mr_li line. Available kg is
+    balance-aware: LEAST(view balance, accepted_weight) — weight already issued
+    to production is not movable. is_lot=1 marks app-created lines (provenance
+    exists in jute_lot_src)."""
     query = """
         SELECT
             mr.jute_mr_id,
@@ -353,7 +368,8 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int) -> pd.
             mr.branch_mr_no AS mr_no,
             mr.jute_mr_date AS mr_date,
             im.item_name AS quality,
-            li.accepted_weight AS remaining_kg,
+            ROUND(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                        li.accepted_weight), 3) AS remaining_kg,
             li.rate AS rate,
             wh.warehouse_name AS warehouse,
             COALESCE(s.supplier_name, pm.supp_name) AS party,
@@ -364,13 +380,15 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int) -> pd.
         FROM jute_mr mr
         JOIN branch_mst bm ON bm.branch_id = mr.branch_id
         JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
         LEFT JOIN item_mst im ON im.item_id = li.actual_item_id
         LEFT JOIN warehouse_mst wh ON wh.warehouse_id = li.warehouse_id
         LEFT JOIN jute_supplier_mst s ON s.supplier_id = mr.jute_supplier_id
         LEFT JOIN party_mst pm ON pm.party_id = mr.party_id AND pm.co_id = bm.co_id
         WHERE mr.transfer_mode = 0
           AND mr.status_id = 3
-          AND COALESCE(li.accepted_weight, 0) > 0
+          AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                    COALESCE(li.accepted_weight, 0)) > 0
           AND bm.co_id = :co_id
           AND mr.branch_id = :branch_id
           AND YEAR(mr.jute_gate_entry_date) = :year
@@ -394,16 +412,21 @@ def get_quality_availability_summary(co_id: int, branch_id: int, year: int, mont
         SELECT
             im.item_name AS quality,
             COUNT(*) AS lots,
-            ROUND(SUM(li.accepted_weight), 2) AS total_kg,
-            ROUND(SUM(li.accepted_weight * li.rate)
-                  / NULLIF(SUM(li.accepted_weight), 0), 2) AS avg_rate
+            ROUND(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                            li.accepted_weight)), 2) AS total_kg,
+            ROUND(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                            li.accepted_weight) * li.rate)
+                  / NULLIF(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                                     li.accepted_weight)), 0), 2) AS avg_rate
         FROM jute_mr mr
         JOIN branch_mst bm ON bm.branch_id = mr.branch_id
         JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
         LEFT JOIN item_mst im ON im.item_id = li.actual_item_id
         WHERE mr.transfer_mode = 0
           AND mr.status_id = 3
-          AND COALESCE(li.accepted_weight, 0) > 0
+          AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
+                    COALESCE(li.accepted_weight, 0)) > 0
           AND bm.co_id = :co_id
           AND mr.branch_id = :branch_id
           AND YEAR(mr.jute_gate_entry_date) = :year
@@ -445,40 +468,38 @@ git commit -m "feat(queries): available-lots and quality availability summary (s
 - Modify: `src/jutetransfer/queries.py` — append two functions; edit `get_company_wise_marked_stock` (~line 484)
 
 **Interfaces:**
-- Consumes: `jute_lot_src` (Task 2); invoice-join pattern from `get_company_wise_unsold_stock` (`queries.py:467-474`).
+- Consumes: `jute_lot_src` (Task 2); ERP view `vw_jute_stock_outstanding` (exists at sls; `bal_weight` per `jute_mr_li_id`).
 - Produces (used by Tasks 7, 8, 10):
-  - `get_marked_stock_with_sold(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame` — columns: `jute_mr_id, mr_no, mr_date, quality, kg, rate, value, godown, src_jute_mr_id, sold`.
+  - `get_marked_stock_with_balance(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame` — columns: `jute_mr_id, jute_mr_li_id, mr_no, mr_date, quality, kg, balance_kg, rate, value, godown, src_jute_mr_id, consumed`.
   - `get_lot_provenance(jute_mr_id: int) -> pd.DataFrame` — columns: `lot_li, src_jute_mr_li_id, qty_kg, depth, src_mr_id, src_mr_no, quality`.
-  - `get_company_wise_marked_stock` — same signature/columns as today, sold MRs excluded.
+  - `get_company_wise_marked_stock` — same signature/columns as today, revalued from remaining balance.
 
-- [ ] **Step 1: Implement `get_marked_stock_with_sold`**
+- [ ] **Step 1: Implement `get_marked_stock_with_balance`**
 
 ```python
-def get_marked_stock_with_sold(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
-    """Marked (mode-1) stock lines with sold flag (active raw-jute invoice
-    referencing the MR). One row per line."""
+def get_marked_stock_with_balance(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
+    """Marked (mode-1) stock lines with remaining balance from the ERP stock
+    view (bal_weight = actual_weight - issued). consumed=1 when balance <= 0.
+    One row per line; value prices the REMAINING balance."""
     query = """
         SELECT
             mr.jute_mr_id,
+            li.jute_mr_li_id,
             mr.branch_mr_no AS mr_no,
             mr.jute_mr_date AS mr_date,
             im.item_name AS quality,
             li.accepted_weight AS kg,
+            ROUND(GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0), 3) AS balance_kg,
             li.rate AS rate,
-            ROUND(COALESCE(li.accepted_weight, 0) * COALESCE(li.rate, 0) / 100, 2) AS value,
+            ROUND(GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0)
+                  * COALESCE(li.rate, 0) / 100, 2) AS value,
             wh.warehouse_name AS godown,
             mr.src_jute_mr_id,
-            EXISTS(
-                SELECT 1
-                FROM sales_invoice_jute sij
-                JOIN sales_invoice si ON si.invoice_id = sij.invoice_id
-                WHERE sij.mr_id = mr.jute_mr_id
-                  AND si.active = 1
-                  AND si.invoice_type = 5
-            ) AS sold
+            (COALESCE(v.bal_weight, li.accepted_weight) <= 0) AS consumed
         FROM jute_mr mr
         JOIN branch_mst bm ON bm.branch_id = mr.branch_id
         JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
         LEFT JOIN item_mst im ON im.item_id = li.actual_item_id
         LEFT JOIN warehouse_mst wh ON wh.warehouse_id = li.warehouse_id
         WHERE mr.transfer_mode = 1
@@ -532,26 +553,45 @@ def get_lot_provenance(jute_mr_id: int) -> pd.DataFrame:
     return DatabaseConnection.execute_query(query, {"mr_id": jute_mr_id})
 ```
 
-- [ ] **Step 3: Exclude sold MRs from `get_company_wise_marked_stock`**
+- [ ] **Step 3: Revalue `get_company_wise_marked_stock` from remaining balance**
 
-In the existing function (`queries.py` ~line 496), after `AND mr.transfer_mode = 1` add:
+Replace the existing function's SQL (`queries.py` ~line 487) with:
 
-```sql
-          AND NOT EXISTS (
-              SELECT 1
-              FROM sales_invoice_jute sij
-              JOIN sales_invoice si ON si.invoice_id = sij.invoice_id
-              WHERE sij.mr_id = mr.jute_mr_id
-                AND si.active = 1
-                AND si.invoice_type = 5
-          )
+```python
+    return DatabaseConnection.execute_query(
+        """
+        SELECT
+            cm.co_id   AS co_id,
+            cm.co_name AS co_name,
+            COALESCE(SUM(
+                GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0)
+                * COALESCE(li.rate, 0) / 100
+            ), 0) AS stock_value
+        FROM jute_mr mr
+        JOIN branch_mst bm ON mr.branch_id = bm.branch_id
+        JOIN co_mst    cm ON bm.co_id = cm.co_id
+        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
+        WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
+          AND mr.status_id = 3
+          AND mr.transfer_mode = 1
+        GROUP BY cm.co_id, cm.co_name
+        """,
+        {
+            "fy_start": fy_start.strftime("%Y-%m-%d"),
+            "fy_end": fy_end.strftime("%Y-%m-%d"),
+        },
+    )
 ```
+
+(Docstring: update to say value = remaining balance × rate; consumed stock
+drops out naturally.)
 
 - [ ] **Step 4: Smoke-test (read-only)**
 
 Run:
 ```bash
-python -c "from src.jutetransfer.queries import get_marked_stock_with_sold, get_lot_provenance, get_company_wise_marked_stock, get_companies, _get_financial_year_bounds; import datetime as d; co=list(get_companies().values())[0]; n=d.datetime.now(); m=get_marked_stock_with_sold(co,1,n.year,n.month); print(list(m.columns)); print(list(get_lot_provenance(1).columns)); fs,fe=_get_financial_year_bounds(); print(get_company_wise_marked_stock(fs,fe).columns.tolist())"
+python -c "from src.jutetransfer.queries import get_marked_stock_with_balance, get_lot_provenance, get_company_wise_marked_stock, get_companies, _get_financial_year_bounds; import datetime as d; co=list(get_companies().values())[0]; n=d.datetime.now(); m=get_marked_stock_with_balance(co,1,n.year,n.month); print(list(m.columns)); print(list(get_lot_provenance(1).columns)); fs,fe=_get_financial_year_bounds(); print(get_company_wise_marked_stock(fs,fe).columns.tolist())"
 ```
 Expected: the three column lists as specified in Interfaces, no exception.
 
@@ -564,16 +604,27 @@ git commit -m "feat(queries): marked stock with sold flag, lot provenance CTE, s
 
 ---
 
-### Task 6: `lot_ops.py` — create_lot / delete_lot
+### Task 6: `lot_ops.py` — create_lot / delete_lot (+ shared helpers in warehouse_stock_ops)
 
 **Files:**
 - Create: `src/jutetransfer/lot_ops.py`
+- Modify: `src/jutetransfer/warehouse_stock_ops.py` (append shared helpers)
 
 **Interfaces:**
 - Consumes: `lot_helpers.validate_takes/line_price/primary_source_mr` (Task 3); `DatabaseConnection.get_transaction/execute_insert_returning_id`; from `transfer.py`: `_get_next_gate_entry_no(conn, branch_id)`, `_get_next_mr_number_in_txn(conn, branch_id, mr_date)`, `_get_next_bill_pass_no_in_txn(conn, branch_id)`; from `warehouse_stock_ops.py`: `_recompute_mr_header(conn, jute_mr_id, updated_by)`.
-- Produces (used by Task 8):
+- Produces (used by Tasks 7, 8):
   - `create_lot(takes: list[tuple[int, float]], mr_date: date, updated_by: int) -> int` — returns new lot MR id.
   - `delete_lot(lot_mr_id: int, updated_by: int) -> None`.
+  - In `warehouse_stock_ops.py`: `_BALANCE_SQL`, `_available_kg(conn, li_id, accepted) -> float`, `_reduce_source_line(conn, r, qty, available) -> tuple[aq_delta, aw_delta]`, `_LI_INSERT_SQL` — Task 7's batch transfer reuses these.
+
+**File placement:** the block below defines `_BALANCE_SQL`, `_available_kg`,
+`_reduce_source_line`, and `_LI_INSERT_SQL` — those four go into
+`warehouse_stock_ops.py`, appended after `_recompute_mr_header`, together with
+a new top-of-file import `from .lot_helpers import apply_pct, line_price`
+(apply_pct is used by Task 7). Everything else goes in the new `lot_ops.py`,
+which imports them:
+`from .warehouse_stock_ops import _recompute_mr_header, _available_kg, _reduce_source_line, _LI_INSERT_SQL`
+(replacing the plain `_recompute_mr_header` import shown in the block).
 
 - [ ] **Step 1: Write the module**
 
@@ -605,6 +656,7 @@ _LOCK_LINE_SQL = """
     SELECT li.jute_mr_li_id, li.accepted_weight, li.rate, li.actual_item_id,
            li.actual_quality, li.challan_quality_id, li.marka, li.crop_year,
            li.unit_conversion, li.warehouse_id, li.jute_mr_id,
+           li.actual_qty, li.actual_weight, li.actual_rate,
            mr.branch_id, mr.transfer_mode, mr.status_id,
            mr.party_id, mr.party_branch_id, bm.co_id
     FROM jute_mr_li li
@@ -613,6 +665,47 @@ _LOCK_LINE_SQL = """
     WHERE li.jute_mr_li_id = :id
     FOR UPDATE
 """
+
+_BALANCE_SQL = """
+    SELECT bal_weight FROM vw_jute_stock_outstanding WHERE jute_mr_li_id = :id
+"""
+
+
+def _available_kg(conn, li_id: int, accepted: float) -> float:
+    """Balance-aware available kg: LEAST(view balance, accepted_weight).
+
+    The view row can be missing (e.g. freshly created line inside this
+    transaction) — fall back to accepted_weight."""
+    row = conn.execute(text(_BALANCE_SQL), {"id": li_id}).fetchone()
+    bal = row._mapping["bal_weight"] if row else None
+    return round(min(float(bal), accepted), 3) if bal is not None else accepted
+
+
+def _reduce_source_line(conn, r: dict, qty: float, available: float) -> tuple:
+    """Reduce a locked source line by qty kg across accepted AND actual fields.
+
+    Returns (actual_qty_delta, actual_weight_delta) for provenance storage."""
+    accepted = float(r["accepted_weight"] or 0)
+    actual_w = float(r["actual_weight"] or 0)
+    actual_q = float(r["actual_qty"] or 0)
+    frac = qty / available if available > 0 else 1.0
+    aw_delta = round(min(qty, actual_w), 3)
+    aq_delta = round(actual_q * frac, 3)
+    new_accepted = round(accepted - qty, 3)
+    conn.execute(text("""
+        UPDATE jute_mr_li
+        SET accepted_weight = :w, total_price = :p,
+            actual_weight = :aw, actual_qty = :aq,
+            updated_date_time = NOW()
+        WHERE jute_mr_li_id = :id
+    """), {
+        "w": new_accepted,
+        "p": line_price(new_accepted, float(r["rate"] or 0)),
+        "aw": round(max(0.0, actual_w - aw_delta), 3),
+        "aq": round(max(0.0, actual_q - aq_delta), 3),
+        "id": int(r["jute_mr_li_id"]),
+    })
+    return aq_delta, aw_delta
 
 _CHAIN_CHILD_SQL = """
     SELECT 1 FROM jute_mr
@@ -624,13 +717,17 @@ _LI_INSERT_SQL = """
     INSERT INTO jute_mr_li (
         jute_mr_id, actual_item_id, actual_quality, challan_quality_id,
         accepted_weight, rate, claim_rate, total_price, warehouse_id,
+        actual_qty, actual_weight, actual_rate,
         marka, crop_year, active, updated_date_time, unit_conversion
     ) VALUES (
         :mr_id, :actual_item_id, :actual_quality, :challan_quality_id,
         :w, :rate, 0, :price, :warehouse_id,
+        :actual_qty, :w, :rate,
         :marka, :crop_year, 1, NOW(), :unit_conversion
     )
 """
+# actual_weight = accepted kg and actual_rate = rate on app-created lines, so
+# the ERP stock view computes balances for them (bal = actual_weight - issued).
 
 
 def create_lot(takes, mr_date: date, updated_by: int) -> int:
@@ -649,9 +746,11 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
                 raise ValueError(f"Source line {li_id} not found")
             rows[li_id] = dict(row._mapping)
 
-        norm = validate_takes(
-            takes, {i: float(r["accepted_weight"] or 0) for i, r in rows.items()}
-        )
+        available = {
+            i: _available_kg(conn, i, float(r["accepted_weight"] or 0))
+            for i, r in rows.items()
+        }
+        norm = validate_takes(takes, available)
 
         branches = {int(r["branch_id"]) for r in rows.values()}
         if len(branches) != 1:
@@ -672,17 +771,12 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
                     )
                 checked.add(mr_id)
 
-        # Reduce each source line; collect per-MR take totals.
-        mr_totals = {}
+        # Reduce each source line (accepted + actual fields); collect per-MR
+        # take totals and the per-take actual deltas for provenance.
+        mr_totals, deltas = {}, {}
         for li_id, qty in norm:
             r = rows[li_id]
-            new_w = round(float(r["accepted_weight"]) - qty, 3)
-            conn.execute(text("""
-                UPDATE jute_mr_li
-                SET accepted_weight = :w, total_price = :p, updated_date_time = NOW()
-                WHERE jute_mr_li_id = :id
-            """), {"w": new_w, "p": line_price(new_w, float(r["rate"] or 0)),
-                   "id": li_id})
+            deltas[li_id] = _reduce_source_line(conn, r, qty, available[li_id])
             mr_totals[int(r["jute_mr_id"])] = (
                 mr_totals.get(int(r["jute_mr_id"]), 0.0) + qty
             )
@@ -726,6 +820,7 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
         # copy over unchanged.
         for li_id, qty in norm:
             r = rows[li_id]
+            aq_delta, aw_delta = deltas[li_id]
             new_li_id = DatabaseConnection.execute_insert_returning_id(
                 conn, _LI_INSERT_SQL, {
                     "mr_id": lot_mr_id,
@@ -736,6 +831,7 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
                     "rate": float(r["rate"] or 0),
                     "price": line_price(qty, float(r["rate"] or 0)),
                     "warehouse_id": r["warehouse_id"],
+                    "actual_qty": aq_delta,
                     "marka": r["marka"],
                     "crop_year": r["crop_year"],
                     "unit_conversion": r["unit_conversion"],
@@ -743,10 +839,11 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
             conn.execute(text("""
                 INSERT INTO jute_lot_src
                     (new_jute_mr_li_id, src_jute_mr_li_id, qty_kg,
+                     actual_qty_delta, actual_weight_delta,
                      created_by, created_date_time)
-                VALUES (:new_li, :src_li, :qty, :by, NOW())
+                VALUES (:new_li, :src_li, :qty, :aq, :aw, :by, NOW())
             """), {"new_li": new_li_id, "src_li": li_id, "qty": qty,
-                   "by": updated_by})
+                   "aq": aq_delta, "aw": aw_delta, "by": updated_by})
 
         _recompute_mr_header(conn, lot_mr_id, updated_by)
         return lot_mr_id
@@ -769,7 +866,8 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
             raise ValueError("Not a lot MR (transfer_mode != 0)")
 
         prov = conn.execute(text("""
-            SELECT ls.lot_src_id, ls.new_jute_mr_li_id, ls.src_jute_mr_li_id, ls.qty_kg
+            SELECT ls.lot_src_id, ls.new_jute_mr_li_id, ls.src_jute_mr_li_id,
+                   ls.qty_kg, ls.actual_qty_delta, ls.actual_weight_delta
             FROM jute_lot_src ls
             JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
             WHERE li.jute_mr_id = :id
@@ -777,6 +875,17 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
         """), {"id": lot_mr_id}).fetchall()
         if not prov:
             raise ValueError(f"MR {lot_mr_id} is not an app-created lot MR")
+
+        issued = conn.execute(text("""
+            SELECT 1 FROM jute_issue ji
+            JOIN jute_mr_li li ON li.jute_mr_li_id = ji.jute_mr_li_id
+            WHERE li.jute_mr_id = :id AND COALESCE(ji.status_id, 0) <> 4
+            LIMIT 1
+        """), {"id": lot_mr_id}).fetchone()
+        if issued:
+            raise ValueError(
+                "Lot has issue entries against it in the ERP; cannot delete"
+            )
 
         if conn.execute(text("""
             SELECT 1 FROM jute_mr
@@ -792,16 +901,20 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
         if conn.execute(feeds_stmt, {"ids": lot_line_ids}).fetchone():
             raise ValueError("Lot lines feed a newer lot; delete that lot first")
 
-        # Restore sources exactly (no quality matching) in ascending line order.
+        # Restore sources exactly from provenance (no quality matching), in
+        # ascending line order; put back accepted AND actual amounts.
         restore = sorted(
-            ((int(p._mapping["src_jute_mr_li_id"]), float(p._mapping["qty_kg"]))
+            ((int(p._mapping["src_jute_mr_li_id"]), float(p._mapping["qty_kg"]),
+              float(p._mapping["actual_qty_delta"] or 0),
+              float(p._mapping["actual_weight_delta"] or 0))
              for p in prov),
             key=lambda t: t[0],
         )
         src_mr_ids = set()
-        for src_li_id, qty in restore:
+        for src_li_id, qty, aq_delta, aw_delta in restore:
             src = conn.execute(text("""
-                SELECT jute_mr_li_id, jute_mr_id, accepted_weight, rate
+                SELECT jute_mr_li_id, jute_mr_id, accepted_weight, rate,
+                       actual_qty, actual_weight
                 FROM jute_mr_li WHERE jute_mr_li_id = :id FOR UPDATE
             """), {"id": src_li_id}).fetchone()
             if not src:
@@ -810,9 +923,13 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
             new_w = round(float(s["accepted_weight"] or 0) + qty, 3)
             conn.execute(text("""
                 UPDATE jute_mr_li
-                SET accepted_weight = :w, total_price = :p, updated_date_time = NOW()
+                SET accepted_weight = :w, total_price = :p,
+                    actual_weight = :aw, actual_qty = :aq,
+                    updated_date_time = NOW()
                 WHERE jute_mr_li_id = :id
             """), {"w": new_w, "p": line_price(new_w, float(s["rate"] or 0)),
+                   "aw": round(float(s["actual_weight"] or 0) + aw_delta, 3),
+                   "aq": round(float(s["actual_qty"] or 0) + aq_delta, 3),
                    "id": src_li_id})
             src_mr_ids.add(int(s["jute_mr_id"]))
         for mr_id in sorted(src_mr_ids):
@@ -847,7 +964,7 @@ git commit -m "feat: lot_ops - create_lot/delete_lot with jute_lot_src provenanc
 
 ---
 
-### Task 7: Batch marked transfer + sold-block on delete
+### Task 7: Batch marked transfer + consumption-block on delete
 
 **Files:**
 - Modify: `src/jutetransfer/warehouse_stock_ops.py` (append `save_marked_batch`; edit `delete_marked_move` ~line 209)
@@ -856,15 +973,13 @@ git commit -m "feat: lot_ops - create_lot/delete_lot with jute_lot_src provenanc
 - Consumes: `lot_helpers.apply_pct/line_price` (Task 3); existing `_recompute_mr_header`, `_ensure_company_as_party`, `_ensure_item`, `_get_next_*` helpers (already imported at top of file).
 - Produces (used by Task 9):
   - `save_marked_batch(lot_li_ids: list[int], pct_change: float, target_co_id: int, target_branch_id: int, warehouse_id: int, mr_date: date, updated_by: int) -> list[int]` — returns created child MR ids, one per source MR.
-  - `delete_marked_move` — unchanged signature, now raises `ValueError` if the marked MR is sold.
+  - `delete_marked_move` — unchanged signature, now raises `ValueError` if ERP issue entries exist against the child (consumption started), and restores sources exactly via `jute_lot_src` provenance when present.
 
-- [ ] **Step 1: Add import**
+- [ ] **Step 1: Verify shared helpers exist**
 
-At the top of `warehouse_stock_ops.py`, after the existing imports:
-
-```python
-from .lot_helpers import apply_pct, line_price
-```
+Task 6 added `from .lot_helpers import apply_pct, line_price` plus
+`_BALANCE_SQL` / `_available_kg` / `_reduce_source_line` / `_LI_INSERT_SQL` to
+`warehouse_stock_ops.py`. Verify they are present before starting.
 
 - [ ] **Step 2: Implement `save_marked_batch`**
 
@@ -882,8 +997,10 @@ def save_marked_batch(
 
     Selected lines are grouped by source MR; each source MR gets ONE child MR
     (transfer_mode=1) holding its selected lines at rate * (1 + pct/100).
-    Source lines drop to 0 kg (whole-lot move; split first for partials).
-    Returns the created child MR ids.
+    The moved amount per line is the balance-aware available kg
+    (LEAST(view balance, accepted_weight)) — weight already issued to
+    production stays behind. Provenance rows are written to jute_lot_src so
+    deletion restores sources exactly. Returns the created child MR ids.
     """
     if not lot_li_ids:
         raise ValueError("no lots selected")
@@ -896,6 +1013,7 @@ def save_marked_batch(
                 SELECT li.jute_mr_li_id, li.accepted_weight, li.rate,
                        li.actual_item_id, li.actual_quality, li.challan_quality_id,
                        li.marka, li.crop_year, li.unit_conversion,
+                       li.actual_qty, li.actual_weight, li.actual_rate,
                        li.jute_mr_id, mr.branch_id AS src_branch_id,
                        mr.transfer_mode, mr.status_id, bm.co_id AS src_co_id
                 FROM jute_mr_li li
@@ -911,8 +1029,11 @@ def save_marked_batch(
                 raise ValueError("Can only mark-move from normal (transfer_mode=0) stock")
             if int(r["status_id"] or 0) != 3:
                 raise ValueError("Can only mark-move Approved (status 3) MRs")
-            if float(r["accepted_weight"] or 0) <= 0:
-                raise ValueError(f"Line {li_id} has no remaining weight")
+            r["moved_kg"] = _available_kg(
+                conn, li_id, float(r["accepted_weight"] or 0)
+            )
+            if r["moved_kg"] <= 0:
+                raise ValueError(f"Line {li_id} has no available weight")
             rows.append(r)
 
         checked = set()
@@ -973,41 +1094,39 @@ def save_marked_batch(
             })
 
             for r in grp:
-                moved = float(r["accepted_weight"])
+                moved = float(r["moved_kg"])
                 new_rate = apply_pct(float(r["rate"] or 0), pct_change)
                 src_item_id = r["actual_item_id"]
                 target_item_id = (
                     _ensure_item(conn, int(src_item_id), target_co_id, updated_by)
                     if src_item_id else None
                 )
+                aq_delta, aw_delta = _reduce_source_line(conn, r, moved, moved)
+                child_li_id = DatabaseConnection.execute_insert_returning_id(
+                    conn, _LI_INSERT_SQL, {
+                        "mr_id": child_mr_id,
+                        "actual_item_id": target_item_id,
+                        "actual_quality": r["actual_quality"],
+                        "challan_quality_id": r["challan_quality_id"],
+                        "w": moved,
+                        "rate": new_rate,
+                        "price": line_price(moved, new_rate),
+                        "warehouse_id": warehouse_id,
+                        "actual_qty": aq_delta,
+                        "marka": r["marka"],
+                        "crop_year": r["crop_year"],
+                        "unit_conversion": r["unit_conversion"],
+                    })
                 conn.execute(text("""
-                    INSERT INTO jute_mr_li (
-                        jute_mr_id, actual_item_id, actual_quality, challan_quality_id,
-                        accepted_weight, rate, claim_rate, total_price, warehouse_id,
-                        marka, crop_year, active, updated_date_time, unit_conversion
-                    ) VALUES (
-                        :mr_id, :actual_item_id, :actual_quality, :challan_quality_id,
-                        :w, :rate, 0, :price, :warehouse_id,
-                        :marka, :crop_year, 1, NOW(), :unit_conversion
-                    )
-                """), {
-                    "mr_id": child_mr_id,
-                    "actual_item_id": target_item_id,
-                    "actual_quality": r["actual_quality"],
-                    "challan_quality_id": r["challan_quality_id"],
-                    "w": moved,
-                    "rate": new_rate,
-                    "price": line_price(moved, new_rate),
-                    "warehouse_id": warehouse_id,
-                    "marka": r["marka"],
-                    "crop_year": r["crop_year"],
-                    "unit_conversion": r["unit_conversion"],
-                })
-                conn.execute(text("""
-                    UPDATE jute_mr_li
-                    SET accepted_weight = 0, total_price = 0, updated_date_time = NOW()
-                    WHERE jute_mr_li_id = :id
-                """), {"id": int(r["jute_mr_li_id"])})
+                    INSERT INTO jute_lot_src
+                        (new_jute_mr_li_id, src_jute_mr_li_id, qty_kg,
+                         actual_qty_delta, actual_weight_delta,
+                         created_by, created_date_time)
+                    VALUES (:new_li, :src_li, :qty, :aq, :aw, :by, NOW())
+                """), {"new_li": child_li_id,
+                       "src_li": int(r["jute_mr_li_id"]),
+                       "qty": moved, "aq": aq_delta, "aw": aw_delta,
+                       "by": updated_by})
 
             _recompute_mr_header(conn, src_mr_id, updated_by)
             _recompute_mr_header(conn, child_mr_id, updated_by)
@@ -1016,23 +1135,88 @@ def save_marked_batch(
         return child_ids
 ```
 
-- [ ] **Step 3: Sold-block in `delete_marked_move`**
+- [ ] **Step 3: Consumption-block + exact restore in `delete_marked_move`**
 
-In `delete_marked_move`, right after the `grandchild` guard (~line 226), add:
+Two changes to `delete_marked_move`:
+
+**(a)** Right after the `grandchild` guard (~line 226), add a consumption
+block — deletion is forbidden once ERP issue entries exist against the child:
 
 ```python
-        sold = conn.execute(text("""
-            SELECT 1
-            FROM sales_invoice_jute sij
-            JOIN sales_invoice si ON si.invoice_id = sij.invoice_id
-            WHERE sij.mr_id = :id AND si.active = 1 AND si.invoice_type = 5
+        issued = conn.execute(text("""
+            SELECT 1 FROM jute_issue ji
+            JOIN jute_mr_li li ON li.jute_mr_li_id = ji.jute_mr_li_id
+            WHERE li.jute_mr_id = :id AND COALESCE(ji.status_id, 0) <> 4
             LIMIT 1
         """), {"id": child_mr_id}).fetchone()
-        if sold:
+        if issued:
             raise ValueError(
-                "This marked MR is already sold via an ERP invoice; cannot delete"
+                "This marked MR has ERP issue entries (consumption started); "
+                "cannot delete"
             )
 ```
+
+**(b)** Before the legacy quality-match restore block, add a provenance-based
+exact restore: if `jute_lot_src` rows exist for the child's lines (all batches
+created by `save_marked_batch` write them), restore each source line exactly
+and skip the quality-match path entirely. The legacy path remains only for
+pre-provenance marked MRs (none exist in production — mode-1 count is 0).
+
+```python
+        prov = conn.execute(text("""
+            SELECT ls.src_jute_mr_li_id, ls.qty_kg,
+                   ls.actual_qty_delta, ls.actual_weight_delta,
+                   ls.new_jute_mr_li_id
+            FROM jute_lot_src ls
+            JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
+            WHERE li.jute_mr_id = :id
+            FOR UPDATE
+        """), {"id": child_mr_id}).fetchall()
+        if prov:
+            src_mr_ids = set()
+            for p in sorted(prov, key=lambda p: int(p._mapping["src_jute_mr_li_id"])):
+                m = p._mapping
+                src = conn.execute(text("""
+                    SELECT jute_mr_li_id, jute_mr_id, accepted_weight, rate,
+                           actual_qty, actual_weight
+                    FROM jute_mr_li WHERE jute_mr_li_id = :id FOR UPDATE
+                """), {"id": int(m["src_jute_mr_li_id"])}).fetchone()
+                if not src:
+                    raise ValueError(
+                        f"Source line {m['src_jute_mr_li_id']} vanished; cannot restore"
+                    )
+                s = src._mapping
+                qty = float(m["qty_kg"] or 0)
+                new_w = round(float(s["accepted_weight"] or 0) + qty, 3)
+                conn.execute(text("""
+                    UPDATE jute_mr_li
+                    SET accepted_weight = :w, total_price = :p,
+                        actual_weight = :aw, actual_qty = :aq,
+                        updated_date_time = NOW()
+                    WHERE jute_mr_li_id = :id
+                """), {"w": new_w,
+                       "p": _round2(new_w * float(s["rate"] or 0) / 100.0),
+                       "aw": round(float(s["actual_weight"] or 0)
+                                   + float(m["actual_weight_delta"] or 0), 3),
+                       "aq": round(float(s["actual_qty"] or 0)
+                                   + float(m["actual_qty_delta"] or 0), 3),
+                       "id": int(s["jute_mr_li_id"])})
+                src_mr_ids.add(int(s["jute_mr_id"]))
+            for mr_id in sorted(src_mr_ids):
+                _recompute_mr_header(conn, mr_id, updated_by)
+            conn.execute(text("""
+                DELETE ls FROM jute_lot_src ls
+                JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
+                WHERE li.jute_mr_id = :id
+            """), {"id": child_mr_id})
+            conn.execute(text("DELETE FROM jute_mr_li WHERE jute_mr_id = :id"),
+                         {"id": child_mr_id})
+            conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"),
+                         {"id": child_mr_id})
+            return
+```
+
+(The existing quality-match code then runs only when `prov` is empty.)
 
 - [ ] **Step 4: Validate**
 
@@ -1085,7 +1269,7 @@ from ..queries import (
     get_company_branch_options,
     get_available_lots,
     get_quality_availability_summary,
-    get_marked_stock_with_sold,
+    get_marked_stock_with_balance,
     get_lot_provenance,
     get_warehouses_by_branch,
     get_marked_warehouses_by_branch,
@@ -1399,41 +1583,44 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
                 st.success("Godown tags updated.")
                 st.rerun()
 
-    mk = get_marked_stock_with_sold(co_id, branch_id, year, month)
+    mk = get_marked_stock_with_balance(co_id, branch_id, year, month)
     st.subheader("Marked stock here")
     if mk is None or mk.empty:
         st.info("No marked stock for this filter.")
         return
 
-    unsold_val = mk.loc[mk["sold"] == 0, "value"].sum()
-    sold_val = mk.loc[mk["sold"] == 1, "value"].sum()
+    in_stock_val = mk.loc[mk["consumed"] == 0, "value"].sum()
     st.markdown(
-        f"**Unsold value: {unsold_val:,.2f}** — sold (dropped from P&L): {sold_val:,.2f}"
+        f"**Remaining marked value: {in_stock_val:,.2f}** "
+        f"(balance-priced; consumed lots drop out of P&L automatically)"
     )
 
     for mr_id, grp in mk.groupby("jute_mr_id", sort=True):
         mr_id = int(mr_id)
-        sold = bool(grp["sold"].iloc[0])
+        consumed = bool((grp["consumed"] == 1).all())
+        partially = bool((grp["balance_kg"] < grp["kg"]).any()) and not consumed
         src_raw = grp["src_jute_mr_id"].iloc[0]
         src_label = int(src_raw) if pd.notna(src_raw) else "-"
         head = (
             f"MR {mr_id} (no. {grp['mr_no'].iloc[0]}, {grp['mr_date'].iloc[0]}) "
             f"— source MR {src_label}"
         )
+        if partially:
+            head += " — **partially consumed**"
         c1, c2 = st.columns([5, 1])
         with c1:
-            st.markdown(("~~" + head + "~~ **SOLD**") if sold else head)
+            st.markdown(("~~" + head + "~~ **CONSUMED**") if consumed else head)
             st.dataframe(
-                grp[["quality", "kg", "rate", "value", "godown"]],
+                grp[["quality", "kg", "balance_kg", "rate", "value", "godown"]],
                 use_container_width=True, hide_index=True,
             )
-            if pd.notna(src_raw):
-                prov = get_lot_provenance(int(src_raw))
-                if not prov.empty:
-                    with st.expander(f"Provenance of source MR {int(src_raw)}"):
-                        st.dataframe(prov, use_container_width=True, hide_index=True)
+            prov = get_lot_provenance(mr_id)
+            if not prov.empty:
+                with st.expander("Source provenance"):
+                    st.dataframe(prov, use_container_width=True, hide_index=True)
         with c2:
-            if st.button("Delete", key=f"del_mk_{mr_id}", disabled=sold):
+            can_delete = bool((grp["balance_kg"] >= grp["kg"]).all())
+            if st.button("Delete", key=f"del_mk_{mr_id}", disabled=not can_delete):
                 try:
                     delete_marked_move(mr_id, user_id)
                     st.success("Deleted; source restored.")
@@ -1441,6 +1628,11 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
                 except Exception as e:
                     st.error(str(e))
 ```
+
+(Marked children now carry provenance rows themselves, so
+`get_lot_provenance(mr_id)` works directly on the marked MR. Delete is
+disabled the moment any weight has been issued — matching the ops-level
+consumption block.)
 
 - [ ] **Step 2: Import validation + full import sweep**
 
@@ -1452,13 +1644,13 @@ Expected: `OK`.
 
 - [ ] **Step 3: Manual check**
 
-Run: `streamlit run app.py` → Marked Stock tab: godown tagging works; marked MRs grouped with lines; sold MRs struck through with Delete disabled; deleting an unsold marked MR restores the source lot.
+Run: `streamlit run app.py` → Marked Stock tab: godown tagging works; marked MRs grouped with lines showing kg vs balance_kg; consumed MRs struck through with Delete disabled; deleting an untouched marked MR restores the source lot exactly.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add src/jutetransfer/pages/warehouse_stock.py
-git commit -m "feat(page): marked stock tab - sold detection, provenance drill-down, guarded delete"
+git commit -m "feat(page): marked stock tab - balance-based consumption, provenance drill-down, guarded delete"
 ```
 
 ---
@@ -1473,13 +1665,13 @@ git commit -m "feat(page): marked stock tab - sold detection, provenance drill-d
 
 1. In **Database integration facts**, extend the juteTransfer-only bullet: add `jute_lot_src` as an app-owned sls-only *table* (line-level lot provenance).
 2. Replace the constraint sentence "Root MRs are created by VoWERP gate entry, never by this app." with: "Gate-entry root MRs are created by VoWERP, never by this app. App-created **lot MRs** (re-allocations at the same company) are the one exception: `transfer_mode=0`, `status_id=3`, `src_jute_mr_id` NULL, always traceable via `jute_lot_src`."
-3. In the **Type 2** column of the two-transfer-types table, update Status to "Built: lot management (split/merge via lot MRs), batch transfer with common % change, auto sold detection via raw-jute invoice join" and the Ops row to `warehouse_stock_ops.py` + `lot_ops.py`.
+3. In the **Type 2** column of the two-transfer-types table, update Status to "Built: lot management (split/merge via lot MRs), batch transfer with common % change, balance-based consumption via `vw_jute_stock_outstanding` (ERP issue entries reduce balance; consumed = balance ≤ 0)" and the Ops row to `warehouse_stock_ops.py` + `lot_ops.py`.
 4. In **Module Organization**, add `lot_helpers.py` (pure lot math) and `lot_ops.py` (lot MR create/delete) lines.
 5. Update the **Key Constraints** footer line to the amended root-MR rule, and bump **Last Updated**.
 
 - [ ] **Step 2: TRANSFER_PROCESS_UNDERSTANDING.md edit**
 
-Append a section "2026-08-03: Lot management & batch transfer" summarising: lot MR concept, `jute_lot_src`, whole-lot batch transfer (one child per source MR), auto-only sold detection decision, and close the doc's open question 2 with the Task 1 verification result.
+Append a section "2026-08-03: Lot management & batch transfer" summarising: lot MR concept, `jute_lot_src` (incl. actual-weight deltas), whole-lot batch transfer (one child per source MR), the stop-gate result (`sales_invoice_jute.mr_id` unusable — 0/2,980 in 2025-26) and the owner's balance-based consumption ruling (`vw_jute_stock_outstanding`), closing the doc's open question 2.
 
 - [ ] **Step 3: Commit**
 
@@ -1510,11 +1702,12 @@ Expected: all PASS / OK.
 - [ ] Cross-MR merge: create one lot from lines of two different MRs → one lot MR, two lines, provenance shows both sources.
 - [ ] Batch transfer: select lots from ≥2 source MRs → one child MR per source MR; rates = old × (1+pct/100); source lines at 0 kg vanish from availability.
 - [ ] Negative %: preview and saved rates go down.
-- [ ] Undo lot: delete unused lot MR → sources restored to exact weights.
-- [ ] Undo marked move: delete unsold marked MR → lot restored.
-- [ ] Delete blocked: lot with transferred lines; marked MR that is sold.
+- [ ] Undo lot: delete unused lot MR → sources restored to exact weights (accepted AND actual).
+- [ ] Undo marked move: delete untouched marked MR → source lots restored exactly via provenance.
+- [ ] Delete blocked: lot with transferred lines; marked MR (or lot) with ERP issue entries.
 - [ ] Chain guard: line of an MR feeding a live chain is absent from availability.
-- [ ] P&L: marked stock value excludes sold marked MRs (`Company P&L` page unchanged otherwise).
+- [ ] Balance: a jute_issue entry against a marked line reduces its balance_kg on the Marked Stock tab and its value in P&L marked stock (view-driven, no app write needed).
+- [ ] P&L: `Company P&L` page loads; marked stock values remaining balance only.
 
 - [ ] **Step 3: Final commit if fixes were needed, then push**
 

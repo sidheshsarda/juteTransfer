@@ -113,16 +113,24 @@ Guards for create: every source line's MR must be `transfer_mode = 0`,
 1. Grid of mode-1 MRs for the filtered company/branch: MR, quality, kg, rate,
    value, godown, source MR (via `src_jute_mr_id`) with provenance drill-down,
    and **Sold** status.
-2. **Auto-only sold detection** (no manual button, no status flip):
-   a marked MR is *sold* iff an active raw-jute invoice references it —
-   `EXISTS (sales_invoice_jute sij JOIN sales_invoice si ON si.invoice_id =
-   sij.invoice_id WHERE sij.mr_id = mr.jute_mr_id AND si.active = 1 AND
-   si.invoice_type = 5)` (mirror of `get_company_wise_unsold_stock`).
-   - Sold lots: shown greyed/badged in the grid, excluded from availability
-     anywhere, and **excluded from `get_company_wise_marked_stock`** (P&L) by
-     adding the same `NOT EXISTS`.
-3. **Delete marked move**: keep `delete_marked_move`; additionally block deletion
-   of a sold marked MR (invoice exists).
+2. **Balance-based consumption detection** (owner ruling 2026-08-03, replaces
+   the original invoice-join design): stock truth is the ERP's own
+   `vw_jute_stock_outstanding` view (verified present at sls, dev3 definition:
+   `bal_weight = actual_weight − SUM(jute_issue.weight WHERE status_id <> 4)`
+   per `jute_mr_li_id`, MRs status 3/13). A marked line is *consumed* when its
+   view balance ≤ 0; partially consumed lines show their remaining balance. A
+   marked MR leaves the stock list when no line has balance > 0. No manual
+   button, no status flip. Rationale: the ERP invoice UI never populates
+   `sales_invoice_jute.mr_id` (0/2,980 rows in 2025-26 — Task 1 verification),
+   while `jute_issue` is line-linked on 100% of rows; at sls, jute leaves
+   stock via issue entries, covering both production use and sale.
+   - Fully consumed MRs: greyed/badged, excluded from availability, and
+     excluded from `get_company_wise_marked_stock` (P&L values remaining
+     balance, not header net_total).
+3. **Delete marked move**: keep `delete_marked_move`; additionally block
+   deletion when any `jute_issue` row (status_id <> 4) references one of the
+   child's lines — consumption has started, reversal would corrupt the ERP
+   issue trail.
 4. Godown tagging expander moves here unchanged.
 
 ## 5. Queries (new/changed in `queries.py`)
@@ -130,15 +138,22 @@ Guards for create: every source line's MR must be `transfer_mode = 0`,
 - `get_available_lots(co_id, branch_id, year, month)` — replaces the page's use
   of `get_jute_mr_with_line_items`: proper `status_id = 3` filter, kg > 0,
   chain exclusion, lot-MR badge column, correct status semantics (1 Open /
-  3 Approved / 13 Pending). `get_jute_mr_with_line_items` itself is left
-  untouched for other callers.
+  3 Approved / 13 Pending). **Available kg per line =
+  `LEAST(COALESCE(v.bal_weight, li.accepted_weight), li.accepted_weight)`**
+  via LEFT JOIN `vw_jute_stock_outstanding v ON v.jute_mr_li_id =
+  li.jute_mr_li_id` — production-issued weight is not movable.
+  `get_jute_mr_with_line_items` itself is left untouched for other callers.
 - `get_quality_availability_summary(co_id, branch_id, year, month)` — the Tab 1
   aggregate.
-- `get_marked_stock_with_sold(co_id, branch_id, year, month)` — Tab 3 grid incl.
-  sold flag and source MR join.
+- `get_marked_stock_with_balance(co_id, branch_id, year, month)` — Tab 3 grid:
+  per-line original kg, remaining balance kg (view join), consumed flag
+  (balance ≤ 0), value = remaining balance × rate / 100, source MR join.
 - `get_lot_provenance(jute_mr_id)` — recursive walk of `jute_lot_src` to
   gate-entry origins (MySQL 8 recursive CTE).
-- `get_company_wise_marked_stock` — add sold `NOT EXISTS`.
+- `get_company_wise_marked_stock` — revalue from remaining balance:
+  `SUM(GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0) * li.rate / 100)`
+  over mode-1 status-3 MR lines (replaces header `net_total` sum, so partially
+  and fully consumed marked stock drops out of P&L correctly).
 
 ## 6. Ops (new module functions)
 
@@ -159,21 +174,31 @@ In `warehouse_stock_ops.py`:
 All writes inside `DatabaseConnection.get_transaction()`, `FOR UPDATE` locks on
 every touched line.
 
+**Actual-weight maintenance (required by the balance mechanism):** the ERP view
+computes balances from `actual_weight`/`actual_qty`, so every line this app
+creates or reduces must keep those in step:
+
+- Lines created (lot lines, marked child lines): `actual_weight` = moved kg,
+  `actual_rate` = line rate, `actual_qty` = source `actual_qty` ×
+  (take ÷ available kg shown), rounded 3 dp (Float column — fractional OK).
+- Source reductions: `accepted_weight` −= take; `actual_weight` = GREATEST(0,
+  actual_weight − take); `actual_qty` reduced by the same proportion, 3 dp.
+- Restores (delete lot / delete marked move): add the same amounts back.
+- The legacy `save_marked_move` is NOT retrofitted (page no longer calls it).
+
 Pure-python allocation math (take validation, weight conservation, rate rounding)
 lives in a DB-free helper section/module mirroring `split_weights`, unit-tested.
 
-## 7. Verification task (first implementation step)
+## 7. Verification task — RESOLVED 2026-08-03
 
-Against the sls DB, verify with read-only queries:
-
-1. Do existing `invoice_type = 5` invoices against **mode-1** MRs populate
-   `sales_invoice_jute.mr_id` with the marked child MR id?
-2. Does `jute_issue` at sls reference MRs in any usable way (`mr_no` + branch)?
-
-If (1) fails, auto-only sold detection cannot work as designed — **stop and
-report back to the owner** before building any fallback. (2) is informational:
-issue-to-production is currently out of detection scope by owner decision
-("for all practical purposes this would be considered as a sale").
+Verification ran (`scripts/verify_sold_detection.py`, commit 06c9d65) and
+**tripped the stop gate**: `sales_invoice_jute.mr_id` is 0/2,980 on 2025-26
+invoices (the ERP invoice UI has only a free-text MR No field; `mrId` is never
+sent). Owner ruled: use the ERP's own stock-balance mechanism instead —
+`vw_jute_stock_outstanding` (verified present at sls; `jute_issue` is
+dev3-style, `jute_mr_li_id` set on 47,795/47,795 rows). Consumption = view
+balance ≤ 0 per line. Full probe: `.superpowers/sdd/…/db-probe-stock-view.md`
+(session artifact) and `docs/TRANSFER_PROCESS_UNDERSTANDING.md` addendum.
 
 ## 8. Edge cases
 
@@ -201,7 +226,7 @@ issue-to-production is currently out of detection scope by owner decision
 
 ## 10. Out of scope
 
-- Manual mark-consumed button (owner chose auto-only).
-- Issue-to-production consumption detection.
-- Re-transfer of marked (mode-1) stock onward (stays terminal until sold).
+- Manual mark-consumed button (owner chose auto-only; balance mechanism).
+- Re-transfer of marked (mode-1) stock onward (stays terminal until consumed).
 - Any change to vertical-chain (Type 1) logic or pages.
+- Retrofitting `actual_weight` maintenance onto legacy `save_marked_move`.
