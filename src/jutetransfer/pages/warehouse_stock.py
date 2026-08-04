@@ -1,7 +1,7 @@
 """Warehouse-marked stock page: Lots / Transfer / Marked Stock tabs.
 
-Lots: quality-wise availability + split/merge into app-created lot MRs
-(jute_lot_src provenance). Transfer: multi-lot whole-lot batch move into a
+Lots: quality-wise availability + split/merge of jute_mr_li lines IN PLACE —
+no new MRs, jute_lot_src provenance. Transfer: multi-lot whole-lot batch move into a
 marked godown with a common % rate change. Marked Stock: mode-1 stock with
 balance-based consumption tracking (ERP stock view vw_jute_stock_outstanding;
 consumed when remaining balance <= 0).
@@ -21,11 +21,12 @@ from ..queries import (
     get_quality_availability_summary,
     get_marked_stock_with_balance,
     get_lot_provenance,
+    get_lot_line_provenance,
     get_warehouses_by_branch,
     get_marked_warehouses_by_branch,
     set_warehouse_marked,
 )
-from ..lot_ops import create_lot, delete_lot
+from ..lot_ops import create_lot, delete_lot_line
 from ..lot_helpers import apply_pct, line_price, combine_takes
 from ..warehouse_stock_ops import save_marked_batch, delete_marked_move
 
@@ -95,7 +96,8 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
     st.subheader("Lots")
     sel = _lot_grid(lots, key="lots_grid")
 
-    st.markdown("**Create a new lot** — take quantities from the selected lines")
+    st.markdown("**Split lots** — take quantities from the selected lines "
+                "into new lines within their own MRs")
     if sel.empty:
         st.caption("Select one or more lines above.")
     else:
@@ -111,13 +113,12 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
                 min_value=0.0, max_value=avail, step=100.0, key=k,
             )
             takes.append((li_id, float(qty)))
-        lot_date = st.date_input("Lot date", value=date.today(), key="lot_date")
-        if st.button("Create lot", type="primary", key="btn_create_lot"):
+        if st.button("Split into new lot lines", type="primary", key="btn_create_lot"):
             try:
-                new_id = create_lot(takes, lot_date, user_id)
+                new_ids = create_lot(takes, user_id)
                 for li_id, _ in takes:
                     st.session_state.pop(f"take_{li_id}", None)
-                st.success(f"Lot MR {new_id} created.")
+                st.success(f"{len(new_ids)} lot line(s) created.")
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
@@ -141,37 +142,39 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
                 f"{len(sel)} lines → one {sel['quality'].iloc[0]} line: "
                 f"{kg:,.2f} kg @ avg rate {avg_rate:,.2f} (value {price:,.2f})"
             )
-            if st.button("Merge into one lot", key="btn_merge_lot"):
+            if st.button("Merge into one line", key="btn_merge_lot"):
                 try:
-                    new_id = create_lot(merges, lot_date, user_id, merge=True)
+                    new_ids = create_lot(merges, user_id, merge=True)
                     for li_id, _ in merges:
                         st.session_state.pop(f"take_{li_id}", None)
-                    st.success(f"Merged into lot MR {new_id}.")
+                    st.success(f"Merged into line {new_ids[0]}.")
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
 
-    lot_mrs = (
-        all_lots[all_lots["is_lot"] == 1][["jute_mr_id", "mr_no", "mr_date"]]
-        .drop_duplicates("jute_mr_id")
+    lot_lines = (
+        all_lots[all_lots["is_lot"] == 1]
         if not all_lots.empty else pd.DataFrame()
     )
-    with st.expander(f"App-created lot MRs ({len(lot_mrs)})"):
-        if lot_mrs.empty:
+    with st.expander(f"App-created lot lines ({len(lot_lines)})"):
+        if lot_lines.empty:
             st.caption("None in this filter.")
-        for _, lr in lot_mrs.iterrows():
-            mr_id = int(lr["jute_mr_id"])
+        for _, lr in lot_lines.iterrows():
+            li_id = int(lr["jute_mr_li_id"])
             c1, c2 = st.columns([5, 1])
             with c1:
-                st.markdown(f"Lot MR **{mr_id}** (no. {lr['mr_no']}, {lr['mr_date']})")
-                prov = get_lot_provenance(mr_id)
+                st.markdown(
+                    f"Line **{li_id}** — {lr['quality']} — MR {lr['mr_no']} "
+                    f"({lr['mr_date']}) — {float(lr['remaining_kg']):,.2f} kg"
+                )
+                prov = get_lot_line_provenance(li_id)
                 if not prov.empty:
                     st.dataframe(prov, use_container_width=True, hide_index=True)
             with c2:
-                if st.button("Delete", key=f"del_lot_{mr_id}"):
+                if st.button("Delete", key=f"del_lot_{li_id}"):
                     try:
-                        delete_lot(mr_id, user_id)
-                        st.success("Lot deleted; sources restored.")
+                        delete_lot_line(li_id, user_id)
+                        st.success("Lot line deleted; sources restored.")
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
