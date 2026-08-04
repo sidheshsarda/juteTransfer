@@ -34,7 +34,7 @@ from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
 # 4. Line items are non-editable (by design: transfers preserve original items)
 
 # Constants
-COMPACT_COLUMNS = ["Jute Gate Entry No", "Jute Supplier", "Total Amount", "Claim Amount", "Net Total"]
+COMPACT_COLUMNS = ["Jute Gate Entry No", "Jute Supplier", "Party Name", "Total Amount", "Claim Amount", "Net Total"]
 
 
 def transfer_chain_page():
