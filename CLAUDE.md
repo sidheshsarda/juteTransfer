@@ -65,6 +65,7 @@ Mutual exclusion is enforced in code: a line feeding a live chain can't be mark-
 - `save_marked_move`: reduces source `jute_mr_li.accepted_weight`/`total_price` (recomputes source header), INSERTs child MR at target branch/warehouse with `transfer_mode=1`, possibly different rate.
 - `save_marked_batch`: also books one seller Raw-Jute `sales_invoice` per child MR at the source branch (buyer = target company's party, auto-created if missing), stamps the child MR with invoice no/date/amount, and links via `sales_invoice_jute.mr_id` = child MR id (deletion linkage — different semantics from Type 1's hop linkage). `delete_marked_move` cascades the invoice.
 - P&L counts marked stock: `transfer_mode=1` MRs at status 3 (`get_company_wise_marked_stock`).
+- **Resale (2026-08-04):** marked stock held at a company can be resold onward — `get_available_lots(include_marked=True)` lists mode-1 lines on the Transfer tab and `save_marked_batch` accepts mode-1 sources. Each hop creates a new mode-1 child MR + seller invoice at the current holder's branch; `src_jute_mr_id` = direct parent per hop; `delete_marked_move` enforces leaf-first undo. Split/merge (lot ops) remain mode-0 only, so resale always moves a line's full remaining balance.
 
 ### P&L dashboard (`pages/company_pl_dashboard.py`)
 

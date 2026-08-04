@@ -57,10 +57,13 @@ def _round2(x: float) -> float:
 
 
 def _recompute_mr_header(conn, jute_mr_id: int, updated_by: int) -> None:
-    """Recompute total_amount/roundoff/net_total from the MR's line items.
+    """Recompute total_amount/roundoff/net_total/mr_weight from the MR's lines.
 
     Mirrors transfer._update_original_mr's SUM(total_price) pattern; claim_amount
     is left as stored (matches chain behaviour). net_total = ROUND(SUM,0) - claim.
+    mr_weight = ROUND(SUM(accepted_weight)), the same rule (and integer
+    format) the ERP's MR-edit endpoint applies — keeps the MR-screen weight
+    truthful after app-side reductions/additions.
     """
     conn.execute(text("""
         UPDATE jute_mr SET
@@ -69,10 +72,42 @@ def _recompute_mr_header(conn, jute_mr_id: int, updated_by: int) -> None:
                        (SELECT COALESCE(SUM(total_price),0) FROM jute_mr_li WHERE jute_mr_id = :id),
             net_total = (SELECT ROUND(COALESCE(SUM(total_price),0),0) FROM jute_mr_li WHERE jute_mr_id = :id)
                         - COALESCE(claim_amount,0),
+            mr_weight = (SELECT ROUND(COALESCE(SUM(accepted_weight),0)) FROM jute_mr_li WHERE jute_mr_id = :id),
             updated_by = :updated_by,
             updated_date_time = NOW()
         WHERE jute_mr_id = :id
     """), {"id": jute_mr_id, "updated_by": updated_by})
+
+
+def _parent_header(conn, jute_mr_id: int) -> dict:
+    """Header fields copied from a source MR onto app-created MRs so the ERP
+    MR screen renders them fully (supplier, mukam, challan, vehicle...).
+
+    Walks src_jute_mr_id ancestry to fill NULLs: legacy app-created mode-1
+    parents (pre header-copy fix) have these fields empty, but their mode-0
+    origin always carries them."""
+    fields = ["challan_no", "mukam_id", "jute_supplier_id", "unit_conversion",
+              "vehicle_no", "transporter", "driver_name"]
+    out = dict.fromkeys(fields)
+    mr_id, found = jute_mr_id, False
+    for _ in range(10):  # ancestry is short; hard cap against id cycles
+        row = conn.execute(text(f"""
+            SELECT {', '.join(fields)}, src_jute_mr_id
+            FROM jute_mr WHERE jute_mr_id = :id
+        """), {"id": mr_id}).fetchone()
+        if not row:
+            break
+        found = found or mr_id == jute_mr_id
+        m = row._mapping
+        for k in fields:
+            if out[k] is None:
+                out[k] = m[k]
+        if all(out[k] is not None for k in fields) or m["src_jute_mr_id"] is None:
+            break
+        mr_id = int(m["src_jute_mr_id"])
+    if not found:
+        raise ValueError(f"Source MR {jute_mr_id} not found")
+    return out
 
 
 _BALANCE_SQL = """
@@ -105,8 +140,14 @@ def _available_kg(conn, li_id: int, accepted: float) -> float:
     return round(min(float(bal), accepted), 3) if bal is not None else accepted
 
 
-def _reduce_source_line(conn, r: dict, qty: float, available: float) -> tuple:
+def _reduce_source_line(conn, r: dict, qty: float, available: float,
+                        keep_accepted: bool = False) -> tuple:
     """Reduce a locked source line by qty kg across accepted AND actual fields.
+
+    keep_accepted=True (mode-1 resale) drains only the actual fields — the
+    stock-view balance moves to the buyer while accepted_weight/total_price
+    (and thus the holder's purchase net_total in the P&L) stay intact, exactly
+    as an ERP sale of the stock would have left them.
 
     Returns (actual_qty_delta, actual_weight_delta) for provenance storage.
     Raises ValueError (via reduce_amounts) if actual_weight is missing or
@@ -115,6 +156,17 @@ def _reduce_source_line(conn, r: dict, qty: float, available: float) -> tuple:
     new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta = reduce_amounts(
         r["accepted_weight"], r["actual_weight"], r["actual_qty"], qty, available
     )
+    if keep_accepted:
+        conn.execute(text("""
+            UPDATE jute_mr_li
+            SET actual_weight = :aw, actual_qty = :aq, updated_date_time = NOW()
+            WHERE jute_mr_li_id = :id
+        """), {
+            "aw": new_actual_w,
+            "aq": new_actual_q,
+            "id": int(r["jute_mr_li_id"]),
+        })
+        return aq_delta, aw_delta
     conn.execute(text("""
         UPDATE jute_mr_li
         SET accepted_weight = :w, total_price = :p,
@@ -152,7 +204,7 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
                                  src_branch_id: int,
                                  buyer_party_id: int, buyer_party_branch_id,
                                  inv_lines: list, mr_date: date,
-                                 updated_by: int) -> dict:
+                                 updated_by: int, hdr_fallback: dict = None) -> dict:
     """Seller-side Raw-Jute invoice for one marked child MR (owner amendment
     2026-08-03): the batch transfer IS the inter-company sale, so the source
     branch bills the target company at the child's (marked-up) rates. One
@@ -177,10 +229,15 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
         invoice_no, co_prefix, branch_prefix, mr_date, document_type="SI",
     )
 
-    src = conn.execute(text("""
+    src = dict(conn.execute(text("""
         SELECT branch_mr_no, mukam_id, unit_conversion
         FROM jute_mr WHERE jute_mr_id = :id
-    """), {"id": src_mr_id}).fetchone()._mapping
+    """), {"id": src_mr_id}).fetchone()._mapping)
+    # Legacy mode-1 parents (pre header-copy fix) have NULL mukam/unit; the
+    # caller's ancestry-walked header fills them so the invoice prints whole.
+    for k in ("mukam_id", "unit_conversion"):
+        if src[k] is None and hdr_fallback:
+            src[k] = hdr_fallback.get(k)
 
     invoice_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO sales_invoice (
@@ -407,6 +464,11 @@ def save_marked_batch(
 ) -> list:
     """Move N whole lots into a marked godown in one transaction.
 
+    Sources may be normal mode-0 stock or mode-1 marked stock held here
+    (resale: each onward hop creates its own child MR + seller invoice at the
+    current holder's branch; src_jute_mr_id chains to the direct parent, and
+    delete_marked_move enforces leaf-first undo).
+
     Selected lines are grouped by source MR; each source MR gets ONE child MR
     (transfer_mode=1) holding its selected lines at rate * (1 + pct/100).
     The moved amount per line is the balance-aware available kg
@@ -444,11 +506,17 @@ def save_marked_batch(
             if not row:
                 raise ValueError(f"Source line {li_id} not found")
             r = dict(row._mapping)
-            if int(r["transfer_mode"] or 0) != 0:
-                raise ValueError("Can only mark-move from normal (transfer_mode=0) stock")
+            mode = int(r["transfer_mode"] or 0)
+            if mode not in (0, 1):
+                raise ValueError(
+                    "Can only mark-move normal (mode 0) or marked (mode 1) stock"
+                )
             if int(r["status_id"] or 0) != 3:
                 raise ValueError("Can only mark-move Approved (status 3) MRs")
-            if r["src_jute_mr_id"] is not None:
+            # Mode-0 rows with src_jute_mr_id set are chain hops — blocked.
+            # Mode-1 rows legitimately carry their direct parent there and may
+            # be resold onward (each hop books its own seller invoice).
+            if mode == 0 and r["src_jute_mr_id"] is not None:
                 raise ValueError(
                     f"MR {int(r['jute_mr_id'])} is a chain-hop MR "
                     "(src_jute_mr_id set); re-lot disabled"
@@ -487,19 +555,38 @@ def save_marked_batch(
             party_id, party_branch_id = _ensure_company_as_party(
                 conn, src_co_id, src_branch_id, target_co_id, updated_by
             )
+            # ERP-visibility columns: the MR screen hard-filters
+            # out_time IS NOT NULL, the issue screen needs out_date
+            # (view inward_date), and qc_check=1 keeps app rows off the
+            # pending-QC list. Supplier/mukam/challan/vehicle copied from
+            # the parent so the ERP detail renders fully.
+            hdr = _parent_header(conn, src_mr_id)
+            moved_total = round(sum(float(r["moved_kg"]) for r in grp), 3)
             child_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
                 INSERT INTO jute_mr (
                     jute_gate_entry_no, branch_mr_no, jute_gate_entry_date, jute_mr_date,
                     status_id, transfer_mode, updated_by, updated_date_time,
                     branch_id, party_id, party_branch_id, src_com_id, src_jute_mr_id,
                     total_amount, claim_amount, roundoff, net_total,
-                    bill_pass_no, bill_pass_date
+                    bill_pass_no, bill_pass_date,
+                    challan_no, challan_date, challan_weight,
+                    gross_weight, tare_weight, net_weight, variable_shortage,
+                    actual_weight, in_time, out_date, out_time, qc_check,
+                    mukam_id, jute_supplier_id, unit_conversion,
+                    vehicle_no, transporter, driver_name,
+                    tds_amount, marketing_slip, remarks
                 ) VALUES (
                     :gate_no, :mr_no, :mr_date, :mr_date,
                     3, 1, :updated_by, NOW(),
                     :branch_id, :party_id, :party_branch_id, :src_com_id, :src_jute_mr_id,
                     0, 0, 0, 0,
-                    :bill_pass_no, :mr_date
+                    :bill_pass_no, :mr_date,
+                    :challan_no, :mr_date, :moved_kg,
+                    :moved_kg, 0, :moved_kg, 0,
+                    :moved_kg, NOW(), :mr_date, NOW(), 1,
+                    :mukam_id, :jute_supplier_id, :unit_conversion,
+                    :vehicle_no, :transporter, :driver_name,
+                    0, 0, :remarks
                 )
             """, {
                 "gate_no": _get_next_gate_entry_no(conn, target_branch_id, mr_date),
@@ -512,6 +599,15 @@ def save_marked_batch(
                 "src_com_id": src_co_id,
                 "src_jute_mr_id": src_mr_id,  # direct parent (mode-1 semantics)
                 "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id, mr_date),
+                "challan_no": hdr["challan_no"],
+                "moved_kg": moved_total,
+                "mukam_id": hdr["mukam_id"],
+                "jute_supplier_id": hdr["jute_supplier_id"],
+                "unit_conversion": hdr["unit_conversion"],
+                "vehicle_no": hdr["vehicle_no"],
+                "transporter": hdr["transporter"],
+                "driver_name": hdr["driver_name"],
+                "remarks": f"Inter-company transfer from MR {src_mr_id}",
             })
 
             inv_lines = []
@@ -523,7 +619,10 @@ def save_marked_batch(
                     _ensure_item(conn, int(src_item_id), target_co_id, updated_by)
                     if src_item_id else None
                 )
-                aq_delta, aw_delta = _reduce_source_line(conn, r, moved, moved)
+                aq_delta, aw_delta = _reduce_source_line(
+                    conn, r, moved, moved,
+                    keep_accepted=(int(r["transfer_mode"] or 0) == 1),
+                )
                 child_li_id = DatabaseConnection.execute_insert_returning_id(
                     conn, _LI_INSERT_SQL, {
                         "mr_id": child_mr_id,
@@ -572,7 +671,7 @@ def save_marked_batch(
             invoice = _create_marked_sales_invoice(
                 conn, child_mr_id, src_mr_id, src_branch_id,
                 buyer_party_id, buyer_party_branch_id, inv_lines,
-                mr_date, updated_by,
+                mr_date, updated_by, hdr_fallback=hdr,
             )
             conn.execute(text("""
                 UPDATE jute_mr
@@ -677,9 +776,12 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
                 m = p._mapping
                 src_li_id = int(m["src_jute_mr_li_id"])
                 src = conn.execute(text("""
-                    SELECT jute_mr_li_id, jute_mr_id, accepted_weight, rate,
-                           actual_qty, actual_weight
-                    FROM jute_mr_li WHERE jute_mr_li_id = :id FOR UPDATE
+                    SELECT li.jute_mr_li_id, li.jute_mr_id, li.accepted_weight,
+                           li.rate, li.actual_qty, li.actual_weight,
+                           mr.transfer_mode
+                    FROM jute_mr_li li
+                    JOIN jute_mr mr ON mr.jute_mr_id = li.jute_mr_id
+                    WHERE li.jute_mr_li_id = :id FOR UPDATE
                 """), {"id": src_li_id}).fetchone()
                 if not src:
                     raise ValueError(
@@ -708,17 +810,28 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
                     s["accepted_weight"], s["actual_weight"], s["actual_qty"],
                     qty, m["actual_qty_delta"], m["actual_weight_delta"],
                 )
-                conn.execute(text("""
-                    UPDATE jute_mr_li
-                    SET accepted_weight = :w, total_price = :p,
-                        actual_weight = :aw, actual_qty = :aq,
-                        updated_date_time = NOW()
-                    WHERE jute_mr_li_id = :id
-                """), {"w": new_w,
-                       "p": _round2(new_w * float(s["rate"] or 0) / 100.0),
-                       "aw": new_aw,
-                       "aq": new_aq,
-                       "id": int(s["jute_mr_li_id"])})
+                if int(s["transfer_mode"] or 0) == 1:
+                    # Resale undo: accepted/total_price were never reduced
+                    # (keep_accepted) — restore only the actual fields.
+                    conn.execute(text("""
+                        UPDATE jute_mr_li
+                        SET actual_weight = :aw, actual_qty = :aq,
+                            updated_date_time = NOW()
+                        WHERE jute_mr_li_id = :id
+                    """), {"aw": new_aw, "aq": new_aq,
+                           "id": int(s["jute_mr_li_id"])})
+                else:
+                    conn.execute(text("""
+                        UPDATE jute_mr_li
+                        SET accepted_weight = :w, total_price = :p,
+                            actual_weight = :aw, actual_qty = :aq,
+                            updated_date_time = NOW()
+                        WHERE jute_mr_li_id = :id
+                    """), {"w": new_w,
+                           "p": _round2(new_w * float(s["rate"] or 0) / 100.0),
+                           "aw": new_aw,
+                           "aq": new_aq,
+                           "id": int(s["jute_mr_li_id"])})
                 src_mr_ids.add(int(s["jute_mr_id"]))
             for mr_id in sorted(src_mr_ids):
                 _recompute_mr_header(conn, mr_id, updated_by)
