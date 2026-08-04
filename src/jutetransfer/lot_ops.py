@@ -13,7 +13,9 @@ from datetime import date
 from sqlalchemy import bindparam, text
 
 from .database import DatabaseConnection
-from .lot_helpers import validate_takes, line_price, primary_source_mr, restore_amounts
+from .lot_helpers import (
+    validate_takes, line_price, primary_source_mr, restore_amounts, combine_takes,
+)
 from .transfer import (
     _get_next_gate_entry_no,
     _get_next_mr_number_in_txn,
@@ -21,6 +23,7 @@ from .transfer import (
 )
 from .warehouse_stock_ops import (
     _recompute_mr_header,
+    _parent_header,
     _available_kg,
     _reduce_source_line,
     _LI_INSERT_SQL,
@@ -47,11 +50,16 @@ _CHAIN_CHILD_SQL = """
 """
 
 
-def create_lot(takes, mr_date: date, updated_by: int) -> int:
+def create_lot(takes, mr_date: date, updated_by: int, merge: bool = False) -> int:
     """Create one lot MR from (src_jute_mr_li_id, qty_kg) takes.
 
     All sources must be mode-0, status-3, same-branch lines not feeding a live
     chain. Returns the new lot MR id.
+
+    merge=True combines all takes into ONE line (join lots): sources must
+    share a single quality (actual_item_id); the merged line carries the
+    summed kg at the weighted-average rate (value conserved). Provenance and
+    delete_lot undo work unchanged — one jute_lot_src row per source take.
     """
     if not takes:
         raise ValueError("no lots selected")
@@ -68,6 +76,18 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
             for i, r in rows.items()
         }
         norm = validate_takes(takes, available)
+
+        if merge:
+            if len(norm) < 2:
+                raise ValueError("Merging needs at least two source lines")
+            if any(rows[li]["actual_item_id"] is None for li, _ in norm):
+                raise ValueError(
+                    "Cannot merge lines without an assigned quality (item)"
+                )
+            if len({rows[li]["actual_item_id"] for li, _ in norm}) != 1:
+                raise ValueError("Can only merge lines of a single quality")
+            if len({rows[li]["warehouse_id"] for li, _ in norm}) != 1:
+                raise ValueError("Can only merge lines in the same godown")
 
         branches = {int(r["branch_id"]) for r in rows.values()}
         if len(branches) != 1:
@@ -106,25 +126,42 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
 
         # Lot MR header: party copied from the primary source MR (same company,
         # no remap needed); src_com_id / src_jute_mr_id NULL — this is a
-        # re-allocation at the same company, not a transfer.
+        # re-allocation at the same company, not a transfer. ERP-visibility
+        # columns (out_time filter on the MR screen, out_date -> stock-view
+        # inward_date, qc_check off the pending-QC list) plus supplier/mukam/
+        # challan/vehicle are copied from the primary source MR.
         primary_mr_id = primary_source_mr(mr_totals)
         primary = next(
             rows[li] for li, _ in norm
             if int(rows[li]["jute_mr_id"]) == primary_mr_id
         )
+        hdr = _parent_header(conn, primary_mr_id)
+        total_kg = round(sum(qty for _, qty in norm), 3)
         lot_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
             INSERT INTO jute_mr (
                 jute_gate_entry_no, branch_mr_no, jute_gate_entry_date, jute_mr_date,
                 status_id, transfer_mode, updated_by, updated_date_time,
                 branch_id, party_id, party_branch_id, src_com_id, src_jute_mr_id,
                 total_amount, claim_amount, roundoff, net_total,
-                bill_pass_no, bill_pass_date
+                bill_pass_no, bill_pass_date,
+                challan_no, challan_date, challan_weight,
+                gross_weight, tare_weight, net_weight, variable_shortage,
+                actual_weight, in_time, out_date, out_time, qc_check,
+                mukam_id, jute_supplier_id, unit_conversion,
+                vehicle_no, transporter, driver_name,
+                tds_amount, marketing_slip, remarks
             ) VALUES (
                 :gate_no, :mr_no, :mr_date, :mr_date,
                 3, 0, :updated_by, NOW(),
                 :branch_id, :party_id, :party_branch_id, NULL, NULL,
                 0, 0, 0, 0,
-                :bill_pass_no, :mr_date
+                :bill_pass_no, :mr_date,
+                :challan_no, :mr_date, :total_kg,
+                :total_kg, 0, :total_kg, 0,
+                :total_kg, NOW(), :mr_date, NOW(), 1,
+                :mukam_id, :jute_supplier_id, :unit_conversion,
+                :vehicle_no, :transporter, :driver_name,
+                0, 0, :remarks
             )
         """, {
             "gate_no": _get_next_gate_entry_no(conn, branch_id, mr_date),
@@ -135,7 +172,54 @@ def create_lot(takes, mr_date: date, updated_by: int) -> int:
             "party_id": primary["party_id"],
             "party_branch_id": primary["party_branch_id"],
             "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, branch_id, mr_date),
+            "challan_no": hdr["challan_no"],
+            "total_kg": total_kg,
+            "mukam_id": hdr["mukam_id"],
+            "jute_supplier_id": hdr["jute_supplier_id"],
+            "unit_conversion": hdr["unit_conversion"],
+            "vehicle_no": hdr["vehicle_no"],
+            "transporter": hdr["transporter"],
+            "driver_name": hdr["driver_name"],
+            "remarks": ("Lot merge" if merge else "Lot re-allocation")
+                       + f" from MR {primary_mr_id}",
         })
+
+        if merge:
+            # ONE combined line: summed kg, weighted-average rate (value
+            # conserved); attributes from the largest take's line. Provenance
+            # still one row per source take, all pointing at the merged line.
+            big_li = max(norm, key=lambda t: t[1])[0]
+            r = rows[big_li]
+            parts = [(qty, float(rows[li]["rate"] or 0)) for li, qty in norm]
+            kg, price, avg_rate = combine_takes(parts)
+            merged_aq = round(sum(deltas[li][0] for li, _ in norm), 3)
+            merged_li_id = DatabaseConnection.execute_insert_returning_id(
+                conn, _LI_INSERT_SQL, {
+                    "mr_id": lot_mr_id,
+                    "actual_item_id": r["actual_item_id"],
+                    "actual_quality": r["actual_quality"],
+                    "challan_quality_id": r["challan_quality_id"],
+                    "w": kg,
+                    "rate": avg_rate,
+                    "price": price,
+                    "warehouse_id": r["warehouse_id"],
+                    "actual_qty": merged_aq,
+                    "marka": r["marka"],
+                    "crop_year": r["crop_year"],
+                    "unit_conversion": r["unit_conversion"],
+                })
+            for li_id, qty in norm:
+                aq_delta, aw_delta = deltas[li_id]
+                conn.execute(text("""
+                    INSERT INTO jute_lot_src
+                        (new_jute_mr_li_id, src_jute_mr_li_id, qty_kg,
+                         actual_qty_delta, actual_weight_delta,
+                         created_by, created_date_time)
+                    VALUES (:new_li, :src_li, :qty, :aq, :aw, :by, NOW())
+                """), {"new_li": merged_li_id, "src_li": li_id, "qty": qty,
+                       "aq": aq_delta, "aw": aw_delta, "by": updated_by})
+            _recompute_mr_header(conn, lot_mr_id, updated_by)
+            return lot_mr_id
 
         # One lot line + one provenance row per take. Same company: item ids
         # copy over unchanged.

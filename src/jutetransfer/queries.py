@@ -220,13 +220,25 @@ def get_jute_mr_with_line_items(
     return DatabaseConnection.execute_query(query, params)
 
 
-def get_available_lots(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
-    """Transferable lots: mode 0, Approved (status 3), available kg > 0, not
-    feeding a live vertical chain. One row per jute_mr_li line. Available kg is
+def get_available_lots(co_id: int, branch_id: int, year: int, month: int,
+                       include_marked: bool = False) -> pd.DataFrame:
+    """Transferable lots: Approved (status 3), available kg > 0, not feeding a
+    live vertical chain. One row per jute_mr_li line. Available kg is
     balance-aware: LEAST(view balance, accepted_weight) — weight already issued
     to production is not movable. is_lot=1 marks app-created lines (provenance
-    exists in jute_lot_src)."""
-    query = """
+    exists in jute_lot_src).
+
+    Mode-0 lines only by default (src_jute_mr_id NULL keeps chain hops out);
+    include_marked=True also lists mode-1 marked stock held here so it can be
+    resold onward (its src_jute_mr_id is legitimately the direct parent)."""
+    # actual_weight > 0 keeps out legacy mode-1 lines (created before actual
+    # fields were written) — reduce_amounts would reject them and poison the
+    # whole batch save.
+    marked_clause = (
+        "OR (mr.transfer_mode = 1 AND COALESCE(li.actual_weight, 0) > 0)"
+        if include_marked else ""
+    )
+    query = f"""
         SELECT
             mr.jute_mr_id,
             li.jute_mr_li_id,
@@ -237,7 +249,13 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int) -> pd.
                         li.accepted_weight), 3) AS remaining_kg,
             li.rate AS rate,
             wh.warehouse_name AS warehouse,
-            COALESCE(s.supplier_name, pm.supp_name) AS party,
+            CASE WHEN mr.transfer_mode = 1
+                 -- marked stock: party_id is the SELLING company's party here;
+                 -- the copied jute_supplier_id is the root gate supplier and
+                 -- would mislabel who this was bought from
+                 THEN COALESCE(pm.supp_name, s.supplier_name)
+                 ELSE COALESCE(s.supplier_name, pm.supp_name)
+            END AS party,
             EXISTS(
                 SELECT 1 FROM jute_lot_src ls
                 WHERE ls.new_jute_mr_li_id = li.jute_mr_li_id
@@ -250,9 +268,9 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int) -> pd.
         LEFT JOIN warehouse_mst wh ON wh.warehouse_id = li.warehouse_id
         LEFT JOIN jute_supplier_mst s ON s.supplier_id = mr.jute_supplier_id
         LEFT JOIN party_mst pm ON pm.party_id = mr.party_id AND pm.co_id = bm.co_id
-        WHERE mr.transfer_mode = 0
-          AND mr.status_id = 3
-          AND mr.src_jute_mr_id IS NULL
+        WHERE mr.status_id = 3
+          AND ((mr.transfer_mode = 0 AND mr.src_jute_mr_id IS NULL)
+               {marked_clause})
           AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
                     COALESCE(li.accepted_weight, 0)) > 0
           AND bm.co_id = :co_id
@@ -330,7 +348,13 @@ def get_marked_stock_with_balance(co_id: int, branch_id: int, year: int, month: 
                   * COALESCE(li.rate, 0) / 100, 2) AS value,
             wh.warehouse_name AS godown,
             mr.src_jute_mr_id,
-            (COALESCE(v.bal_weight, li.accepted_weight) <= 0) AS consumed
+            (COALESCE(v.bal_weight, li.accepted_weight) <= 0) AS consumed,
+            EXISTS(
+                SELECT 1 FROM jute_mr c
+                WHERE c.src_jute_mr_id = mr.jute_mr_id
+                  AND c.transfer_mode = 1
+                  AND c.jute_mr_id <> mr.jute_mr_id
+            ) AS resold
         FROM jute_mr mr
         JOIN branch_mst bm ON bm.branch_id = mr.branch_id
         JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id

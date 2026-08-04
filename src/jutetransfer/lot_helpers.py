@@ -40,6 +40,22 @@ def line_price(weight_kg, rate):
     return round(float(weight_kg) * float(rate) / 100.0, 2)
 
 
+def combine_takes(parts):
+    """Combine (qty_kg, rate) parts into one merged line.
+
+    Returns (total_kg, total_price, avg_rate). Value is conserved exactly
+    (price = sum of part prices); the weighted-average rate is derived back
+    from it, money-rounded — so kg * rate / 100 may differ from price by
+    rounding pennies. Raises ValueError on empty/zero total.
+    """
+    total_kg = round(sum(float(q) for q, _ in parts), 3)
+    if total_kg <= 0:
+        raise ValueError("nothing to merge")
+    total_price = round(sum(line_price(q, r) for q, r in parts), 2)
+    avg_rate = round(total_price * 100.0 / total_kg, 2)
+    return total_kg, total_price, avg_rate
+
+
 def primary_source_mr(mr_take_totals):
     """MR contributing the largest take qty; ties -> lowest jute_mr_id."""
     if not mr_take_totals:

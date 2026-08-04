@@ -26,13 +26,23 @@ from ..queries import (
     set_warehouse_marked,
 )
 from ..lot_ops import create_lot, delete_lot
-from ..lot_helpers import apply_pct, line_price
+from ..lot_helpers import apply_pct, line_price, combine_takes
 from ..warehouse_stock_ops import save_marked_batch, delete_marked_move
 
 
 def _lot_grid(df: pd.DataFrame, key: str) -> pd.DataFrame:
     """Multi-select grid over available lots. Returns selected rows as a
     DataFrame (empty if none)."""
+    # st-aggrid keeps checkbox state positionally under a fixed key, so a
+    # data swap (quality filter / month change) would silently keep or remap
+    # selections onto different lines. Deriving the key from the visible
+    # line-id set remounts the grid with a clean selection instead.
+    ids = tuple(df["jute_mr_li_id"]) if "jute_mr_li_id" in df.columns else ()
+    key = f"{key}_{hash(ids) & 0xFFFFFFFF:x}"
+    if "mr_date" in df.columns:
+        # st_aggrid serialises date objects to JS Dates which AG Grid renders
+        # as "[object Object]" — show them as plain ISO strings instead.
+        df = df.assign(mr_date=df["mr_date"].astype(str))
     gb = GridOptionsBuilder.from_dataframe(df)
     gb.configure_default_column(resizable=True, filterable=True, sortable=True)
     # use_checkbox=True would attach the checkbox to the FIRST column def
@@ -61,6 +71,16 @@ def _lot_grid(df: pd.DataFrame, key: str) -> pd.DataFrame:
     return pd.DataFrame(sel)  # handles list[dict] and DataFrame variants
 
 
+def _quality_filter(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """Quality multiselect over the lots grid; empty selection = all."""
+    if df is None or df.empty:
+        return df
+    quals = sorted(df["quality"].dropna().unique().tolist())
+    chosen = st.multiselect("Quality", options=quals, key=key,
+                            help="Leave empty to show all qualities")
+    return df[df["quality"].isin(chosen)] if chosen else df
+
+
 def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
                      user_id: int) -> None:
     summary = get_quality_availability_summary(co_id, branch_id, year, month)
@@ -70,7 +90,8 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
         return
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    lots = get_available_lots(co_id, branch_id, year, month)
+    all_lots = get_available_lots(co_id, branch_id, year, month)
+    lots = _quality_filter(all_lots, key="lots_qual")
     st.subheader("Lots")
     sel = _lot_grid(lots, key="lots_grid")
 
@@ -101,10 +122,39 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
             except Exception as e:
                 st.error(str(e))
 
+        st.markdown("**Merge selected into one lot** — drains each selected "
+                    "line fully into a single combined line")
+        if len(sel) < 2:
+            st.caption("Select at least two lines of the same quality to merge.")
+        elif sel["quality"].nunique(dropna=False) != 1:
+            st.caption("Merging requires all selected lines to share one quality.")
+        elif sel["warehouse"].nunique(dropna=False) != 1:
+            st.caption("Merging requires all selected lines in the same godown.")
+        else:
+            merges = [(int(row["jute_mr_li_id"]), float(row["remaining_kg"]))
+                      for _, row in sel.iterrows()]
+            parts = [(float(row["remaining_kg"]),
+                      float(row["rate"]) if pd.notna(row["rate"]) else 0.0)
+                     for _, row in sel.iterrows()]
+            kg, price, avg_rate = combine_takes(parts)
+            st.caption(
+                f"{len(sel)} lines → one {sel['quality'].iloc[0]} line: "
+                f"{kg:,.2f} kg @ avg rate {avg_rate:,.2f} (value {price:,.2f})"
+            )
+            if st.button("Merge into one lot", key="btn_merge_lot"):
+                try:
+                    new_id = create_lot(merges, lot_date, user_id, merge=True)
+                    for li_id, _ in merges:
+                        st.session_state.pop(f"take_{li_id}", None)
+                    st.success(f"Merged into lot MR {new_id}.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
     lot_mrs = (
-        lots[lots["is_lot"] == 1][["jute_mr_id", "mr_no", "mr_date"]]
+        all_lots[all_lots["is_lot"] == 1][["jute_mr_id", "mr_no", "mr_date"]]
         .drop_duplicates("jute_mr_id")
-        if not lots.empty else pd.DataFrame()
+        if not all_lots.empty else pd.DataFrame()
     )
     with st.expander(f"App-created lot MRs ({len(lot_mrs)})"):
         if lot_mrs.empty:
@@ -129,11 +179,13 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
 
 def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
                          user_id: int) -> None:
-    lots = get_available_lots(co_id, branch_id, year, month)
+    lots = get_available_lots(co_id, branch_id, year, month, include_marked=True)
     if lots is None or lots.empty:
         st.info("No available lots for this filter.")
         return
-    st.subheader("Select lots to transfer (whole lots — split first for partials)")
+    lots = _quality_filter(lots, key="xfer_qual")
+    st.subheader("Select lots to transfer (whole lots — split first for partials; "
+                 "marked stock held here can be resold onward)")
     sel = _lot_grid(lots, key="transfer_grid")
     if sel.empty:
         st.caption("Select one or more lots above.")
@@ -240,6 +292,7 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
     for mr_id, grp in mk.groupby("jute_mr_id", sort=True):
         mr_id = int(mr_id)
         consumed = bool((grp["consumed"] == 1).all())
+        resold = bool((grp["resold"] == 1).any())
         partially = bool((grp["balance_kg"] < grp["kg"]).any()) and not consumed
         src_raw = grp["src_jute_mr_id"].iloc[0]
         src_label = int(src_raw) if pd.notna(src_raw) else "-"
@@ -248,10 +301,15 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
             f"— source MR {src_label}"
         )
         if partially:
-            head += " — **partially consumed**"
+            head += (" — **partially resold**" if resold
+                     else " — **partially consumed**")
         c1, c2 = st.columns([5, 1])
         with c1:
-            st.markdown(("~~" + head + "~~ **CONSUMED**") if consumed else head)
+            if consumed:
+                st.markdown("~~" + head + "~~ "
+                            + ("**RESOLD**" if resold else "**CONSUMED**"))
+            else:
+                st.markdown(head)
             st.dataframe(
                 grp[["quality", "kg", "balance_kg", "rate", "value", "godown"]],
                 use_container_width=True, hide_index=True,
@@ -261,7 +319,10 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
                 with st.expander("Source provenance"):
                     st.dataframe(prov, use_container_width=True, hide_index=True)
         with c2:
-            can_delete = bool((grp["balance_kg"] >= grp["kg"]).all())
+            # A resold MR can't be deleted until its resale children are
+            # (leaf-first guard) — disable rather than offer a doomed button.
+            can_delete = (bool((grp["balance_kg"] >= grp["kg"]).all())
+                          and not resold)
             if st.button("Delete", key=f"del_mk_{mr_id}", disabled=not can_delete):
                 try:
                     delete_marked_move(mr_id, user_id)

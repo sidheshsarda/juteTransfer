@@ -2,7 +2,7 @@
 import pytest
 from src.jutetransfer.lot_helpers import (
     validate_takes, apply_pct, line_price, primary_source_mr,
-    reduce_amounts, restore_amounts,
+    reduce_amounts, restore_amounts, combine_takes,
 )
 
 
@@ -53,6 +53,26 @@ def test_primary_source_mr_largest_then_lowest_id():
     assert primary_source_mr({9: 300.0, 5: 300.0}) == 5
     with pytest.raises(ValueError):
         primary_source_mr({})
+
+
+def test_combine_takes_weighted_average():
+    # 5000 kg @ 2500 + 3000 kg @ 2600 -> one 8000 kg line, value conserved
+    kg, price, rate = combine_takes([(5000.0, 2500.0), (3000.0, 2600.0)])
+    assert kg == 8000.0
+    assert price == 125000.0 + 78000.0
+    assert rate == 2537.5  # 203000 * 100 / 8000
+
+
+def test_combine_takes_same_rate_keeps_rate():
+    kg, price, rate = combine_takes([(5000.0, 2500.0), (3000.0, 2500.0)])
+    assert (kg, price, rate) == (8000.0, 200000.0, 2500.0)
+
+
+def test_combine_takes_empty_or_zero_raises():
+    with pytest.raises(ValueError):
+        combine_takes([])
+    with pytest.raises(ValueError):
+        combine_takes([(0.0, 2500.0)])
 
 
 # ---------------------------------------------------------------------------
