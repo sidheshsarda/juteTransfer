@@ -1,29 +1,22 @@
-"""Lot restructuring ops: create/delete app-created lot MRs.
+"""Lot restructuring ops: split/merge jute_mr_li lines IN PLACE.
 
-A lot MR re-allocates quantities from existing mode-0 lines at the SAME
-company/branch. Line-level provenance lives in jute_lot_src; source lines are
-reduced in place (weight conserved). Lot MRs have transfer_mode=0, status 3,
-src_jute_mr_id NULL — downstream transfer logic treats them as ordinary MRs.
+Splits and merges never create jute_mr headers: new lines are inserted into
+an EXISTING MR (split -> the source line's own MR; merge -> the MR of the
+largest take) and source lines are reduced in place (weight conserved
+overall). Line-level provenance lives in jute_lot_src; delete_lot_line
+restores it exactly.
 
 Kept separate from warehouse_stock_ops (marked moves) and transfer (chains).
 """
 
-from datetime import date
-
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 
 from .database import DatabaseConnection
 from .lot_helpers import (
     validate_takes, line_price, primary_source_mr, restore_amounts, combine_takes,
 )
-from .transfer import (
-    _get_next_gate_entry_no,
-    _get_next_mr_number_in_txn,
-    _get_next_bill_pass_no_in_txn,
-)
 from .warehouse_stock_ops import (
     _recompute_mr_header,
-    _parent_header,
     _available_kg,
     _reduce_source_line,
     _LI_INSERT_SQL,
@@ -49,17 +42,27 @@ _CHAIN_CHILD_SQL = """
     LIMIT 1
 """
 
+_PROV_INSERT_SQL = """
+    INSERT INTO jute_lot_src
+        (new_jute_mr_li_id, src_jute_mr_li_id, qty_kg,
+         actual_qty_delta, actual_weight_delta,
+         created_by, created_date_time)
+    VALUES (:new_li, :src_li, :qty, :aq, :aw, :by, NOW())
+"""
 
-def create_lot(takes, mr_date: date, updated_by: int, merge: bool = False) -> int:
-    """Create one lot MR from (src_jute_mr_li_id, qty_kg) takes.
 
-    All sources must be mode-0, status-3, same-branch lines not feeding a live
-    chain. Returns the new lot MR id.
+def create_lot(takes, updated_by: int, merge: bool = False) -> list:
+    """Split/merge (src_jute_mr_li_id, qty_kg) takes into new lines in place.
+
+    No jute_mr is created: split lines land inside their source line's own MR;
+    a merged line lands inside the MR contributing the largest take. All
+    sources must be mode-0, status-3, same-branch lines not feeding a live
+    chain. Returns the new jute_mr_li ids (a single-element list for merge).
 
     merge=True combines all takes into ONE line (join lots): sources must
-    share a single quality (actual_item_id); the merged line carries the
-    summed kg at the weighted-average rate (value conserved). Provenance and
-    delete_lot undo work unchanged — one jute_lot_src row per source take.
+    share a single quality (actual_item_id) and godown; the merged line
+    carries the summed kg at the weighted-average rate (value conserved).
+    One jute_lot_src row per source take either way.
     """
     if not takes:
         raise ValueError("no lots selected")
@@ -92,7 +95,6 @@ def create_lot(takes, mr_date: date, updated_by: int, merge: bool = False) -> in
         branches = {int(r["branch_id"]) for r in rows.values()}
         if len(branches) != 1:
             raise ValueError("All source lines must belong to the same branch")
-        branch_id = branches.pop()
 
         checked = set()
         for r in rows.values():
@@ -101,7 +103,7 @@ def create_lot(takes, mr_date: date, updated_by: int, merge: bool = False) -> in
             if int(r["status_id"] or 0) != 3:
                 raise ValueError("Can only re-lot Approved (status 3) MRs")
             mr_id = int(r["jute_mr_id"])
-            if int(r["transfer_mode"] or 0) == 0 and r["src_jute_mr_id"] is not None:
+            if r["src_jute_mr_id"] is not None:
                 raise ValueError(
                     f"MR {mr_id} is a chain-hop MR (src_jute_mr_id set); re-lot disabled"
                 )
@@ -121,73 +123,13 @@ def create_lot(takes, mr_date: date, updated_by: int, merge: bool = False) -> in
             mr_totals[int(r["jute_mr_id"])] = (
                 mr_totals.get(int(r["jute_mr_id"]), 0.0) + qty
             )
-        for mr_id in sorted(mr_totals):
-            _recompute_mr_header(conn, mr_id, updated_by)
-
-        # Lot MR header: party copied from the primary source MR (same company,
-        # no remap needed); src_com_id / src_jute_mr_id NULL — this is a
-        # re-allocation at the same company, not a transfer. ERP-visibility
-        # columns (out_time filter on the MR screen, out_date -> stock-view
-        # inward_date, qc_check off the pending-QC list) plus supplier/mukam/
-        # challan/vehicle are copied from the primary source MR.
-        primary_mr_id = primary_source_mr(mr_totals)
-        primary = next(
-            rows[li] for li, _ in norm
-            if int(rows[li]["jute_mr_id"]) == primary_mr_id
-        )
-        hdr = _parent_header(conn, primary_mr_id)
-        total_kg = round(sum(qty for _, qty in norm), 3)
-        lot_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
-            INSERT INTO jute_mr (
-                jute_gate_entry_no, branch_mr_no, jute_gate_entry_date, jute_mr_date,
-                status_id, transfer_mode, updated_by, updated_date_time,
-                branch_id, party_id, party_branch_id, src_com_id, src_jute_mr_id,
-                total_amount, claim_amount, roundoff, net_total,
-                bill_pass_no, bill_pass_date,
-                challan_no, challan_date, challan_weight,
-                gross_weight, tare_weight, net_weight, variable_shortage,
-                actual_weight, in_time, out_date, out_time, qc_check,
-                mukam_id, jute_supplier_id, unit_conversion,
-                vehicle_no, transporter, driver_name,
-                tds_amount, marketing_slip, remarks
-            ) VALUES (
-                :gate_no, :mr_no, :mr_date, :mr_date,
-                3, 0, :updated_by, NOW(),
-                :branch_id, :party_id, :party_branch_id, NULL, NULL,
-                0, 0, 0, 0,
-                :bill_pass_no, :mr_date,
-                :challan_no, :mr_date, :total_kg,
-                :total_kg, 0, :total_kg, 0,
-                :total_kg, NOW(), :mr_date, NOW(), 1,
-                :mukam_id, :jute_supplier_id, :unit_conversion,
-                :vehicle_no, :transporter, :driver_name,
-                0, 0, :remarks
-            )
-        """, {
-            "gate_no": _get_next_gate_entry_no(conn, branch_id, mr_date),
-            "mr_no": _get_next_mr_number_in_txn(conn, branch_id, mr_date),
-            "mr_date": mr_date,
-            "updated_by": updated_by,
-            "branch_id": branch_id,
-            "party_id": primary["party_id"],
-            "party_branch_id": primary["party_branch_id"],
-            "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, branch_id, mr_date),
-            "challan_no": hdr["challan_no"],
-            "total_kg": total_kg,
-            "mukam_id": hdr["mukam_id"],
-            "jute_supplier_id": hdr["jute_supplier_id"],
-            "unit_conversion": hdr["unit_conversion"],
-            "vehicle_no": hdr["vehicle_no"],
-            "transporter": hdr["transporter"],
-            "driver_name": hdr["driver_name"],
-            "remarks": ("Lot merge" if merge else "Lot re-allocation")
-                       + f" from MR {primary_mr_id}",
-        })
 
         if merge:
-            # ONE combined line: summed kg, weighted-average rate (value
-            # conserved); attributes from the largest take's line. Provenance
-            # still one row per source take, all pointing at the merged line.
+            # ONE combined line inside the MR contributing the largest take:
+            # summed kg, weighted-average rate (value conserved); attributes
+            # from the largest take's line. Cross-MR merges shift weight
+            # between real MR headers — same practice as marked moves.
+            target_mr_id = primary_source_mr(mr_totals)
             big_li = max(norm, key=lambda t: t[1])[0]
             r = rows[big_li]
             parts = [(qty, float(rows[li]["rate"] or 0)) for li, qty in norm]
@@ -195,7 +137,7 @@ def create_lot(takes, mr_date: date, updated_by: int, merge: bool = False) -> in
             merged_aq = round(sum(deltas[li][0] for li, _ in norm), 3)
             merged_li_id = DatabaseConnection.execute_insert_returning_id(
                 conn, _LI_INSERT_SQL, {
-                    "mr_id": lot_mr_id,
+                    "mr_id": target_mr_id,
                     "actual_item_id": r["actual_item_id"],
                     "actual_quality": r["actual_quality"],
                     "challan_quality_id": r["challan_quality_id"],
@@ -210,104 +152,92 @@ def create_lot(takes, mr_date: date, updated_by: int, merge: bool = False) -> in
                 })
             for li_id, qty in norm:
                 aq_delta, aw_delta = deltas[li_id]
-                conn.execute(text("""
-                    INSERT INTO jute_lot_src
-                        (new_jute_mr_li_id, src_jute_mr_li_id, qty_kg,
-                         actual_qty_delta, actual_weight_delta,
-                         created_by, created_date_time)
-                    VALUES (:new_li, :src_li, :qty, :aq, :aw, :by, NOW())
-                """), {"new_li": merged_li_id, "src_li": li_id, "qty": qty,
-                       "aq": aq_delta, "aw": aw_delta, "by": updated_by})
-            _recompute_mr_header(conn, lot_mr_id, updated_by)
-            return lot_mr_id
+                conn.execute(text(_PROV_INSERT_SQL), {
+                    "new_li": merged_li_id, "src_li": li_id, "qty": qty,
+                    "aq": aq_delta, "aw": aw_delta, "by": updated_by})
+            new_ids = [merged_li_id]
+        else:
+            # One new line per take inside its own source MR (weight conserved
+            # per MR; header recompute only settles rounding).
+            new_ids = []
+            for li_id, qty in norm:
+                r = rows[li_id]
+                aq_delta, aw_delta = deltas[li_id]
+                new_li_id = DatabaseConnection.execute_insert_returning_id(
+                    conn, _LI_INSERT_SQL, {
+                        "mr_id": int(r["jute_mr_id"]),
+                        "actual_item_id": r["actual_item_id"],
+                        "actual_quality": r["actual_quality"],
+                        "challan_quality_id": r["challan_quality_id"],
+                        "w": qty,
+                        "rate": float(r["rate"] or 0),
+                        "price": line_price(qty, float(r["rate"] or 0)),
+                        "warehouse_id": r["warehouse_id"],
+                        "actual_qty": aq_delta,
+                        "marka": r["marka"],
+                        "crop_year": r["crop_year"],
+                        "unit_conversion": r["unit_conversion"],
+                    })
+                conn.execute(text(_PROV_INSERT_SQL), {
+                    "new_li": new_li_id, "src_li": li_id, "qty": qty,
+                    "aq": aq_delta, "aw": aw_delta, "by": updated_by})
+                new_ids.append(new_li_id)
 
-        # One lot line + one provenance row per take. Same company: item ids
-        # copy over unchanged.
-        for li_id, qty in norm:
-            r = rows[li_id]
-            aq_delta, aw_delta = deltas[li_id]
-            new_li_id = DatabaseConnection.execute_insert_returning_id(
-                conn, _LI_INSERT_SQL, {
-                    "mr_id": lot_mr_id,
-                    "actual_item_id": r["actual_item_id"],
-                    "actual_quality": r["actual_quality"],
-                    "challan_quality_id": r["challan_quality_id"],
-                    "w": qty,
-                    "rate": float(r["rate"] or 0),
-                    "price": line_price(qty, float(r["rate"] or 0)),
-                    "warehouse_id": r["warehouse_id"],
-                    "actual_qty": aq_delta,
-                    "marka": r["marka"],
-                    "crop_year": r["crop_year"],
-                    "unit_conversion": r["unit_conversion"],
-                })
-            conn.execute(text("""
-                INSERT INTO jute_lot_src
-                    (new_jute_mr_li_id, src_jute_mr_li_id, qty_kg,
-                     actual_qty_delta, actual_weight_delta,
-                     created_by, created_date_time)
-                VALUES (:new_li, :src_li, :qty, :aq, :aw, :by, NOW())
-            """), {"new_li": new_li_id, "src_li": li_id, "qty": qty,
-                   "aq": aq_delta, "aw": aw_delta, "by": updated_by})
-
-        _recompute_mr_header(conn, lot_mr_id, updated_by)
-        return lot_mr_id
+        for mr_id in sorted(mr_totals):
+            _recompute_mr_header(conn, mr_id, updated_by)
+        return new_ids
 
 
-def delete_lot(lot_mr_id: int, updated_by: int) -> None:
-    """Undo a lot MR: restore every source line exactly from jute_lot_src,
-    then delete provenance rows, lines, and header.
+def delete_lot_line(li_id: int, updated_by: int) -> None:
+    """Undo one app-created lot line: restore every source exactly from
+    jute_lot_src, delete provenance + the line, recompute headers. An MR left
+    with zero lines must be an app-created husk (legacy lot MR — ERP lines can
+    never be app-deleted) and its header is deleted too.
 
-    Blocks if any MR references the lot as source (marked move or chain), or
-    if any lot line feeds a newer lot."""
+    Blocks if the line has ERP issue entries, feeds a newer lot or marked
+    move, is not mode-0, or its MR / any restore-target MR feeds a chain."""
     with DatabaseConnection.get_transaction() as conn:
-        header = conn.execute(text("""
-            SELECT jute_mr_id, transfer_mode FROM jute_mr
-            WHERE jute_mr_id = :id FOR UPDATE
-        """), {"id": lot_mr_id}).fetchone()
-        if not header:
-            raise ValueError(f"MR {lot_mr_id} not found")
-        if int(header._mapping["transfer_mode"] or 0) != 0:
-            raise ValueError("Not a lot MR (transfer_mode != 0)")
+        row = conn.execute(text(_LOCK_LINE_SQL), {"id": li_id}).fetchone()
+        if not row:
+            raise ValueError(f"Line {li_id} not found")
+        r = dict(row._mapping)
+        if int(r["transfer_mode"] or 0) != 0:
+            raise ValueError(
+                "Not a mode-0 line; undo marked moves from the Marked Stock tab"
+            )
 
         prov = conn.execute(text("""
-            SELECT ls.lot_src_id, ls.new_jute_mr_li_id, ls.src_jute_mr_li_id,
-                   ls.qty_kg, ls.actual_qty_delta, ls.actual_weight_delta
-            FROM jute_lot_src ls
-            JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
-            WHERE li.jute_mr_id = :id
+            SELECT lot_src_id, src_jute_mr_li_id, qty_kg,
+                   actual_qty_delta, actual_weight_delta
+            FROM jute_lot_src WHERE new_jute_mr_li_id = :id
             FOR UPDATE
-        """), {"id": lot_mr_id}).fetchall()
+        """), {"id": li_id}).fetchall()
         if not prov:
-            raise ValueError(f"MR {lot_mr_id} is not an app-created lot MR")
+            raise ValueError(f"Line {li_id} is not an app-created lot line")
 
         issued = conn.execute(text("""
-            SELECT 1 FROM jute_issue ji
-            JOIN jute_mr_li li ON li.jute_mr_li_id = ji.jute_mr_li_id
-            WHERE li.jute_mr_id = :id AND COALESCE(ji.status_id, 0) <> 4
+            SELECT 1 FROM jute_issue
+            WHERE jute_mr_li_id = :id AND COALESCE(status_id, 0) <> 4
             LIMIT 1
-        """), {"id": lot_mr_id}).fetchone()
+        """), {"id": li_id}).fetchone()
         if issued:
             raise ValueError(
-                "Lot has issue entries against it in the ERP; cannot delete"
+                "Line has issue entries against it in the ERP; cannot delete"
             )
 
         if conn.execute(text("""
-            SELECT 1 FROM jute_mr
-            WHERE src_jute_mr_id = :id AND jute_mr_id <> :id LIMIT 1
-        """), {"id": lot_mr_id}).fetchone():
-            raise ValueError("Lot has dependent MRs (transfer exists); delete those first")
+            SELECT 1 FROM jute_lot_src WHERE src_jute_mr_li_id = :id LIMIT 1
+        """), {"id": li_id}).fetchone():
+            raise ValueError(
+                "Line feeds a newer lot or marked move; undo that first"
+            )
 
-        lot_line_ids = sorted({int(p._mapping["new_jute_mr_li_id"]) for p in prov})
-        feeds_stmt = text("""
-            SELECT 1 FROM jute_lot_src
-            WHERE src_jute_mr_li_id IN :ids LIMIT 1
-        """).bindparams(bindparam("ids", expanding=True))
-        if conn.execute(feeds_stmt, {"ids": lot_line_ids}).fetchone():
-            raise ValueError("Lot lines feed a newer lot; delete that lot first")
+        mr_id = int(r["jute_mr_id"])
+        if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": mr_id}).fetchone():
+            raise ValueError(
+                f"MR {mr_id} feeds a vertical transfer chain; cannot undo"
+            )
 
-        # Restore sources exactly from provenance (no quality matching), in
-        # ascending line order; put back accepted AND actual amounts.
         restore = sorted(
             ((int(p._mapping["src_jute_mr_li_id"]), float(p._mapping["qty_kg"]),
               float(p._mapping["actual_qty_delta"] or 0),
@@ -330,19 +260,16 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
                 raise ValueError(f"Source line {src_li_id} vanished; cannot restore")
             srcs[src_li_id] = src._mapping
 
-        checked_mrs = set()
-        for s in srcs.values():
-            mr_id = int(s["jute_mr_id"])
-            if mr_id in checked_mrs:
-                continue
-            if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": mr_id}).fetchone():
+        for src_mr_id in {int(s["jute_mr_id"]) for s in srcs.values()}:
+            if src_mr_id == mr_id:
+                continue  # already guarded above
+            if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": src_mr_id}).fetchone():
                 raise ValueError(
-                    f"Source MR {mr_id} now feeds a vertical chain; "
+                    f"Source MR {src_mr_id} now feeds a vertical chain; "
                     "cannot restore weights onto it"
                 )
-            checked_mrs.add(mr_id)
 
-        src_mr_ids = set()
+        touched = {mr_id}
         for src_li_id, qty, aq_delta, aw_delta in restore:
             s = srcs[src_li_id]
             new_w, new_aw, new_aq = restore_amounts(
@@ -359,15 +286,18 @@ def delete_lot(lot_mr_id: int, updated_by: int) -> None:
                    "aw": new_aw,
                    "aq": new_aq,
                    "id": src_li_id})
-            src_mr_ids.add(int(s["jute_mr_id"]))
-        for mr_id in sorted(src_mr_ids):
-            _recompute_mr_header(conn, mr_id, updated_by)
+            touched.add(int(s["jute_mr_id"]))
 
-        del_prov = text(
-            "DELETE FROM jute_lot_src WHERE new_jute_mr_li_id IN :ids"
-        ).bindparams(bindparam("ids", expanding=True))
-        conn.execute(del_prov, {"ids": lot_line_ids})
-        conn.execute(text("DELETE FROM jute_mr_li WHERE jute_mr_id = :id"),
-                     {"id": lot_mr_id})
-        conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"),
-                     {"id": lot_mr_id})
+        conn.execute(text(
+            "DELETE FROM jute_lot_src WHERE new_jute_mr_li_id = :id"
+        ), {"id": li_id})
+        conn.execute(text(
+            "DELETE FROM jute_mr_li WHERE jute_mr_li_id = :id"
+        ), {"id": li_id})
+        for m in sorted(touched):
+            _recompute_mr_header(conn, m, updated_by)
+        if not conn.execute(text(
+            "SELECT 1 FROM jute_mr_li WHERE jute_mr_id = :id LIMIT 1"
+        ), {"id": mr_id}).fetchone():
+            conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"),
+                         {"id": mr_id})

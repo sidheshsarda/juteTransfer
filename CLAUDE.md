@@ -29,9 +29,9 @@ Full process explanation + evidence: **`docs/TRANSFER_PROCESS_UNDERSTANDING.md`*
 - This app bypasses the VoWERP API/auth/tenancy entirely — raw SQL reads/writes into the shared `sls` DB.
 - Shared tables: `jute_mr`, `jute_mr_li`, `sales_invoice(+_dtl)`, `sales_invoice_jute(+_dtl)`, `warehouse_mst`, `co_mst`, `branch_mst`, `party_mst`, `party_branch_mst`, `item_mst`, `item_grp_mst`, `status_mst`.
 - **juteTransfer-only columns** on `jute_mr`: `src_jute_mr_id`, `transfer_mode` (and the write-path of `src_com_id`). They exist in the sls DB but are absent from vowerp3be's ORM and migrations — treat them as **sls-only**; never assume them on other tenants.
-- **juteTransfer-only table** `jute_lot_src` (`lot_src_id, new_jute_mr_li_id, src_jute_mr_li_id, qty_kg, actual_qty_delta, actual_weight_delta, created_by, created_date_time`) — line-level provenance for every app-created line (lot-MR lines and marked child lines), sls-only, created by `scripts/migrate_jute_lot_src.py`.
+- **juteTransfer-only table** `jute_lot_src` (`lot_src_id, new_jute_mr_li_id, src_jute_mr_li_id, qty_kg, actual_qty_delta, actual_weight_delta, created_by, created_date_time`) — line-level provenance for every app-created line (in-place lot lines, legacy lot-MR lines, and marked child lines), sls-only, created by `scripts/migrate_jute_lot_src.py`.
 - `jute_mr.status_id` semantics: `1` Open, `3` Approved (eligible for transfer), `13` Pending — documented by vowerp3be itself as "terminal on MR screen, handed off to external system" (= this app). Status 13 on a chain root means the origin company is consuming the jute (chain closed).
-- Gate-entry root MRs are created by VoWERP, never by this app. App-created **lot MRs** (re-allocations at the same company) are the one exception: `transfer_mode=0`, `status_id=3`, `src_jute_mr_id` NULL, always traceable via `jute_lot_src`.
+- Gate-entry root MRs are created by VoWERP, never by this app — and since 2026-08-04 the app creates **no mode-0 MRs at all**: lot split/merge edits `jute_mr_li` lines IN PLACE inside existing MRs, traceable via `jute_lot_src`. Legacy app-created **lot MRs** (pre-2026-08-04: `transfer_mode=0`, `status_id=3`, `src_jute_mr_id` NULL) may still exist in the sls DB; their lines carry provenance and per-line undo removes the empty header when the last line goes.
 - Legacy caveat: ~10.8k historic `jute_mr` rows carry migration-era `src_com_id` values that do NOT match live `co_mst.co_id` — never key logic on `src_com_id` alone; chain queries must keep filtering on `src_jute_mr_id`.
 
 ## The Two Transfer Types
@@ -41,7 +41,7 @@ Both live on `jute_mr` and are kept disjoint by `jute_mr.transfer_mode`:
 | | **Type 1 — Vertical Transfer Chain** | **Type 2 — Marked Warehouse Stock** |
 |---|---|---|
 | `transfer_mode` | 0 | 1 |
-| Status | **Built, tested, working** | **Built:** lot management (split/merge via lot MRs), batch transfer with common % change, balance-based consumption via `vw_jute_stock_outstanding` (ERP issue entries reduce balance; consumed = balance ≤ 0) |
+| Status | **Built, tested, working** | **Built:** lot management (split/merge of `jute_mr_li` lines in place — no new MRs), batch transfer with common % change, balance-based consumption via `vw_jute_stock_outstanding` (ERP issue entries reduce balance; consumed = balance ≤ 0) |
 | Shape | Circular: gate entry at Co A → sold B → C → … → back to A; % markup per hop; manual finalize | One-shot: partial qty of a purchased line moved to a MARKED godown at another company; stays there until sold |
 | Per hop | New `jute_mr`+`jute_mr_li` at buyer + Raw-Jute `sales_invoice` (`invoice_type=5`); final hop UPDATEs the root in place | Single child `jute_mr`+`jute_mr_li` **+ seller Raw-Jute `sales_invoice` (`invoice_type=5`) at the source branch**; no chain, no return leg |
 | `src_jute_mr_id` | Always the chain ROOT (star topology); hops linked via `src_com_id` | The DIRECT parent MR (different semantics!) |
@@ -87,7 +87,7 @@ src/jutetransfer/
 ├── lot_helpers.py                    # Pure lot math (no Streamlit/DB imports)
 ├── transfer.py                       # Type 1 DB writes: save/delete/finalize/revert
 ├── warehouse_stock_ops.py            # Type 2 DB writes: save/delete marked moves
-├── lot_ops.py                        # Lot MR create/delete (split/merge, provenance)
+├── lot_ops.py                        # In-place lot split/merge on jute_mr_li (provenance + per-line undo)
 ├── queries.py                        # All read queries + P&L aggregations
 ├── models.py                         # ORM mirror of sls tables (reference only — queries use raw SQL)
 ├── database.py                       # Cached engine, execute helpers, get_transaction()
@@ -177,5 +177,5 @@ Integration checklist when touching chain logic: rate cascade (10% on step 2 →
 
 ---
 
-**Last Updated:** 2026-08-03
-**Key Constraints:** sls tenant only; `transfer_mode` keeps the two transfer types disjoint; the vertical chain page is the sole chain-editing UI; gate-entry root MRs come from VoWERP, never from this app — app-created lot MRs are the one exception, always traceable via `jute_lot_src`
+**Last Updated:** 2026-08-04
+**Key Constraints:** sls tenant only; `transfer_mode` keeps the two transfer types disjoint; the vertical chain page is the sole chain-editing UI; gate-entry root MRs come from VoWERP, never from this app — lot split/merge edits `jute_mr_li` in place (no new mode-0 MRs), always traceable via `jute_lot_src`

@@ -409,6 +409,39 @@ def get_lot_provenance(jute_mr_id: int) -> pd.DataFrame:
     return DatabaseConnection.execute_query(query, {"mr_id": jute_mr_id})
 
 
+def get_lot_line_provenance(jute_mr_li_id: int) -> pd.DataFrame:
+    """Walk jute_lot_src from ONE app-created line back to gate-entry origins.
+
+    Same walk as get_lot_provenance, seeded from a single line. Empty
+    DataFrame if the line is not app-created."""
+    query = """
+        WITH RECURSIVE prov AS (
+            SELECT ls.new_jute_mr_li_id AS lot_li,
+                   ls.src_jute_mr_li_id,
+                   ls.qty_kg,
+                   1 AS depth
+            FROM jute_lot_src ls
+            WHERE ls.new_jute_mr_li_id = :li_id
+            UNION ALL
+            SELECT p.lot_li, ls2.src_jute_mr_li_id, ls2.qty_kg, p.depth + 1
+            FROM prov p
+            JOIN jute_lot_src ls2 ON ls2.new_jute_mr_li_id = p.src_jute_mr_li_id
+        )
+        SELECT p.src_jute_mr_li_id,
+               p.qty_kg,
+               p.depth,
+               smr.jute_mr_id AS src_mr_id,
+               smr.branch_mr_no AS src_mr_no,
+               im.item_name AS quality
+        FROM prov p
+        JOIN jute_mr_li sli ON sli.jute_mr_li_id = p.src_jute_mr_li_id
+        JOIN jute_mr smr ON smr.jute_mr_id = sli.jute_mr_id
+        LEFT JOIN item_mst im ON im.item_id = sli.actual_item_id
+        ORDER BY p.depth, p.src_jute_mr_li_id
+    """
+    return DatabaseConnection.execute_query(query, {"li_id": jute_mr_li_id})
+
+
 def get_source_mr_full(jute_mr_id: int, conn=None) -> Optional[dict]:
     """Fetch complete jute_mr record + line items for copying during transfer.
 
