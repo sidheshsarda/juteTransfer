@@ -6,6 +6,32 @@ from decimal import Decimal, ROUND_HALF_UP
 
 
 # ---------------------------------------------------------------------------
+# ERP status vocabulary / new-chain root eligibility (decision D1, 2026-09-03)
+# ---------------------------------------------------------------------------
+
+# Real ERP status ids (see vowerp3be src/juteProcurement/mr.py MR_STATUS_*),
+# not the stale local 0/1/2 vocabulary this app used to assume.
+ROOT_STATUS_LABELS = {
+    21: "Draft", 1: "Open", 13: "Pending (Transfer)", 20: "Pending Approval",
+    17: "Pending Approval", 3: "Approved", 4: "Rejected", 6: "Cancelled", 48: "Returned",
+}
+
+NEW_CHAIN_ROOT_STATUS = 13  # decision D1: only an ERP-Pending MR may start a NEW chain
+
+
+def is_root_eligible_for_new_chain(status_id) -> bool:
+    """True only for status 13 (Pending) — the ERP hand-off state.
+
+    Existing chains (root already has children) keep working regardless of
+    root status; this only gates starting a brand-new chain.
+    """
+    try:
+        return int(status_id) == NEW_CHAIN_ROOT_STATUS
+    except (TypeError, ValueError):
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Shared rounding helpers (used by live display, chain recalc, and posting)
 # ---------------------------------------------------------------------------
 
