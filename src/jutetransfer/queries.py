@@ -179,10 +179,11 @@ def get_jute_mr_with_line_items(
             li.accepted_weight AS `Weight (KG)`,
             mr.invoice_no AS `Invoice No`,
             DATE(mr.invoice_date) AS `Invoice Date`,
+            mr.status_id AS `status_id_raw`,
             CASE mr.status_id
-                WHEN 0 THEN 'Pending'
-                WHEN 1 THEN 'Approved'
-                WHEN 2 THEN 'Completed'
+                WHEN 21 THEN 'Draft' WHEN 1 THEN 'Open' WHEN 13 THEN 'Pending (Transfer)'
+                WHEN 20 THEN 'Pending Approval' WHEN 17 THEN 'Pending Approval'
+                WHEN 3 THEN 'Approved' WHEN 4 THEN 'Rejected' WHEN 6 THEN 'Cancelled' WHEN 48 THEN 'Returned'
                 ELSE CONCAT('Status-', mr.status_id)
             END AS `Status`,
             li.rate AS `MR Rate`,
@@ -658,11 +659,13 @@ def get_company_wise_unsold_stock(fy_start, fy_end) -> pd.DataFrame:
       - status_id = 3 (active intermediate transfer MR; excludes pending
         gate entries at status 0 and finalized roots at status 1)
       - Its chain root (src_jute_mr_id -> jute_mr) is NOT in a closed
-        state (root.status_id NOT IN (1, 13)). Status 13 is set by the
-        upstream ERP on roots whose source company is consuming the
-        material rather than reselling it; status 1 is set by this app
-        on finalization. Both indicate the chain is closed and any
-        return MR sitting at the source company should not be counted.
+        state (root.status_id NOT IN (1, 13)). Decision D3 (2026-09-03):
+        this app writes 13 (Pending) on the root for both an in-progress
+        chain and any rollback (partial or full) — never 0, never 1;
+        finalize (chain returns to origin) writes 3 (Approved) instead.
+        Status 1 here is retained only for legacy roots that predate the
+        D3 fix. Both values mean the chain is not a finalized/closed loop,
+        so any return MR sitting at the source company should not be counted.
       - Not referenced by an active raw-jute sales_invoice_jute row
         (i.e., the seller has not yet invoiced this MR forward).
 

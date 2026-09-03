@@ -854,6 +854,11 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
         child_quality = child_li._mapping["q"]
 
         if source_mr_id and moved:
+            if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": int(source_mr_id)}).fetchone():
+                raise ValueError(
+                    f"Source MR {source_mr_id} now feeds a vertical chain; "
+                    "cannot restore weights onto it"
+                )
             # Match the source line by quality (jute_qlty_id copied unchanged);
             # fall back to the first line if quality is null.
             src_line = conn.execute(text("""

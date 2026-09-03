@@ -23,6 +23,7 @@ from ..jute_mr_chain_helpers import (
     _empty_transfer_step,
     _cascade_rate,
     _calculate_line_item_amount,
+    is_root_eligible_for_new_chain,
 )
 from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
 
@@ -34,7 +35,7 @@ from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
 # 4. Line items are non-editable (by design: transfers preserve original items)
 
 # Constants
-COMPACT_COLUMNS = ["Jute Gate Entry No", "Jute Gate Entry Date", "Jute Supplier", "Party Name", "Total Amount", "Claim Amount", "Net Total"]
+COMPACT_COLUMNS = ["Jute Gate Entry No", "Jute Gate Entry Date", "Jute Supplier", "Party Name", "Status", "Total Amount", "Claim Amount", "Net Total"]
 
 
 def transfer_chain_page():
@@ -344,6 +345,21 @@ def _render_chain_editor(filter_key):
 
         # Load saved chain if exists
         chain_data = chains_map.get(mr_id)
+
+        # Decision D1 (2026-09-03): a NEW chain may only start from an
+        # ERP root at status 13 (Pending). Existing chains (root already
+        # has children) keep working regardless of root status.
+        is_new_chain = chain_data is None or chain_data.empty
+        if is_new_chain and not is_finalized:
+            root_status = row.get("status_id_raw")
+            if not is_root_eligible_for_new_chain(root_status):
+                st.warning(
+                    f"This MR is '{row.get('Status')}' in the ERP. Only MRs set to "
+                    "Pending (Transfer) can start a new chain; Approved rows are shown "
+                    "for reference."
+                )
+                return
+
         if chain_data is not None and not chain_data.empty:
             try:
                 chain_mrs = chain_data.to_dict("records") if hasattr(chain_data, 'to_dict') else chain_data

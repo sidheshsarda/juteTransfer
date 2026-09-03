@@ -13,7 +13,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from .database import DatabaseConnection
-from .jute_mr_chain_helpers import _calculate_line_item_amount
+from .jute_mr_chain_helpers import _calculate_line_item_amount, is_root_eligible_for_new_chain
 from .queries import get_source_mr_full, _get_financial_year_bounds
 
 # Fixed invoice type for raw jute transfers
@@ -232,6 +232,11 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
         # Ensure existing party has correct party types
         _ensure_party_types(conn, existing, updated_by)
         branch_id = _get_party_branch_id(conn, existing)
+        if branch_id is None:
+            raise ValueError(
+                f"Party {existing} (from company {company_co_id}) has no branch in "
+                f"party_branch_mst — decision D4 requires a party branch. Add one in Party Master."
+            )
         return existing, branch_id
 
     # Create party from company master
@@ -286,6 +291,11 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
             "updated_by": updated_by,
         })
 
+    if new_branch_id is None:
+        raise ValueError(
+            f"branch_mst {company_branch_id} (company {company_co_id}) has no data to create "
+            f"a party branch from — decision D4 requires a party branch. Add one in Party Master."
+        )
     return new_party_id, new_branch_id
 
 
@@ -385,6 +395,11 @@ def _ensure_supplier_party(conn, source_mr: dict, target_co_id: int,
         # Ensure existing party has correct party types
         _ensure_party_types(conn, existing, updated_by)
         branch_id = _get_party_branch_id(conn, existing)
+        if branch_id is None:
+            raise ValueError(
+                f"Supplier party {existing} in company {target_co_id} has no branch in "
+                f"party_branch_mst — decision D4 requires a party branch. Add one in Party Master."
+            )
         _ensure_supplier_party_map(conn, jute_supplier_id, target_co_id, existing, updated_by)
         return existing, branch_id
 
@@ -392,6 +407,11 @@ def _ensure_supplier_party(conn, source_mr: dict, target_co_id: int,
     new_party_id, new_branch_id = _create_party_from_source(
         conn, source_party_id, source_co_id, target_co_id, updated_by
     )
+    if new_branch_id is None:
+        raise ValueError(
+            f"Supplier party (copied from party {source_party_id}) has no branch to copy into "
+            f"company {target_co_id} — decision D4 requires a party branch. Add one in Party Master."
+        )
     _ensure_supplier_party_map(conn, jute_supplier_id, target_co_id, new_party_id, updated_by)
     return new_party_id, new_branch_id
 
@@ -1269,7 +1289,8 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
     Restores line item rates from Step 1 (the first transferred MR's snapshot,
     which is unaffected by finalization), clears branch_mr_no/bill_pass_*,
     clears invoice_no/invoice_date/invoice_amount (which finalization wrote
-    from the last seller's sales_invoice), sets status_id back to Pending.
+    from the last seller's sales_invoice), sets status_id back to Pending (13,
+    decision D3 2026-09-03 — never 0, never 1: 13 is the ERP hand-off state).
     Does NOT touch party_id/party_branch_id —
     the original supplier party is not reliably recoverable, and leaving the
     current party in place is safe (a re-finalize will overwrite it correctly).
@@ -1341,7 +1362,7 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             invoice_no = NULL,
             invoice_date = NULL,
             invoice_amount = NULL,
-            status_id = 0,
+            status_id = 13,
             total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
             roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) -
                        (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
@@ -1399,6 +1420,21 @@ def save_transfer_step(
         source_mr = get_source_mr_full(source_mr_id, conn=conn)
         if not source_mr:
             raise ValueError(f"Source MR {source_mr_id} not found")
+
+        # Decision D1 (2026-09-03): a NEW chain may only start from an ERP
+        # root at status 13 (Pending). Backend enforcement behind the UI
+        # guard in pages/new_transfer_chain.py — the UI can be bypassed on
+        # a rerun, this cannot.
+        if is_first_step:
+            root_status = conn.execute(
+                text("SELECT status_id FROM jute_mr WHERE jute_mr_id = :id"),
+                {"id": root_mr_id},
+            ).scalar()
+            if not is_root_eligible_for_new_chain(root_status):
+                raise ValueError(
+                    f"Root MR {root_mr_id} is not Pending (13) in the ERP; "
+                    f"cannot start a new transfer chain (status={root_status})"
+                )
 
         # Assign MR number inside transaction
         step.mr_no = _get_next_mr_number_in_txn(conn, step.branch_id, step.mr_date)
@@ -1532,6 +1568,14 @@ def delete_transfer_step(jute_mr_id: int, updated_by: int) -> None:
         if not mr_info:
             return
 
+        # Refuse when this step already has ERP issue entries drawn against
+        # it (consumption started) — deleting it would orphan the issues.
+        issued = conn.execute(text(
+            "SELECT 1 FROM jute_issue ji JOIN jute_mr_li li ON li.jute_mr_li_id = ji.jute_mr_li_id "
+            "WHERE li.jute_mr_id = :id AND COALESCE(ji.status_id, 0) <> 4 LIMIT 1"), {"id": jute_mr_id}).fetchone()
+        if issued:
+            raise ValueError("This transfer step has ERP issue entries (consumption started); cannot delete")
+
         root_mr_id, current_branch_id = mr_info
 
         # Find the previous MR in the chain (same root, different branch, most recent)
@@ -1662,11 +1706,11 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
         delete_transfer_step(mr["jute_mr_id"], updated_by)
 
     if from_idx == 0:
-        # Whole chain rolled back from Step 1: the root MR is a bare gate entry
-        # again, so return its status from "pending" (13) to "open" (1).
+        # Whole chain rolled back from Step 1: root returns to Pending (13) —
+        # the ERP hand-off state, never Open (decision D3 2026-09-03).
         with DatabaseConnection.get_transaction() as conn:
             conn.execute(
-                text("UPDATE jute_mr SET status_id = 1, updated_by = :uid, "
+                text("UPDATE jute_mr SET status_id = 13, updated_by = :uid, "
                      "updated_date_time = NOW() WHERE jute_mr_id = :id"),
                 {"uid": updated_by, "id": root_mr_id},
             )
