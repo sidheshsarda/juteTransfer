@@ -14,6 +14,7 @@ from sqlalchemy import text
 from .database import DatabaseConnection
 from .lot_helpers import (
     validate_takes, line_price, primary_source_mr, restore_amounts, combine_takes,
+    production_rate,
 )
 from .warehouse_stock_ops import (
     _recompute_mr_header,
@@ -143,6 +144,9 @@ def create_lot(takes, updated_by: int, merge: bool = False) -> list:
                     "challan_quality_id": r["challan_quality_id"],
                     "w": kg,
                     "rate": avg_rate,
+                    # production rate: kg-weighted average of the sources' actual_rate
+                    "actual_rate": combine_takes(
+                        [(qty, production_rate(rows[li])) for li, qty in norm])[2],
                     "price": price,
                     "warehouse_id": r["warehouse_id"],
                     "actual_qty": merged_aq,
@@ -171,6 +175,7 @@ def create_lot(takes, updated_by: int, merge: bool = False) -> list:
                         "challan_quality_id": r["challan_quality_id"],
                         "w": qty,
                         "rate": float(r["rate"] or 0),
+                        "actual_rate": production_rate(r),
                         "price": line_price(qty, float(r["rate"] or 0)),
                         "warehouse_id": r["warehouse_id"],
                         "actual_qty": aq_delta,

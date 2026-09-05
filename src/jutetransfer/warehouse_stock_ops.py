@@ -18,13 +18,16 @@ Run `python -m src.jutetransfer.warehouse_stock_ops` for the split_weights
 self-check (no DB required).
 """
 
+import math
 from datetime import date
 from typing import Tuple
 
 from sqlalchemy import text
 
 from .database import DatabaseConnection
-from .lot_helpers import apply_pct, line_price, reduce_amounts, restore_amounts
+from .lot_helpers import (
+    apply_pct, line_price, production_rate, reduce_amounts, restore_amounts, round_kg,
+)
 from .transfer import (
     RAW_JUTE_INVOICE_TYPE,
     _ensure_company_as_party,
@@ -42,14 +45,16 @@ from .transfer import (
 def split_weights(source: float, moved: float) -> Tuple[float, float]:
     """Split a source weight into (remaining_at_source, moved_to_child).
 
-    Raises ValueError if moved is not in (0, source]. Weight is conserved:
-    remaining + moved == source (to 3dp).
+    Raises ValueError if moved is not in (0, source]. Stock is whole kg: moved
+    is rounded to a whole kg first and the remainder is whole kg too, so
+    remaining + moved == round_kg(source).
     """
+    moved = float(round_kg(moved))
     if moved <= 0:
         raise ValueError(f"moved qty must be > 0, got {moved}")
     if moved > source:
         raise ValueError(f"moved qty {moved} exceeds available {source}")
-    return round(source - moved, 3), round(moved, 3)
+    return float(round_kg(source - moved)), moved
 
 
 def _round2(x: float) -> float:
@@ -137,7 +142,10 @@ def _available_kg(conn, li_id: int, accepted: float) -> float:
     """
     row = conn.execute(text(_BALANCE_SQL), {"id": li_id}).fetchone()
     bal = row._mapping["bal_weight"] if row else None
-    return round(min(float(bal), accepted), 3) if bal is not None else accepted
+    # Whole kg, FLOORED: a legacy 4811.65 kg balance offers 4811, never 4812,
+    # so a full take can't over-draw the ERP view by the rounding fraction.
+    avail = min(float(bal), accepted) if bal is not None else accepted
+    return float(math.floor(avail + 1e-9))
 
 
 def _reduce_source_line(conn, r: dict, qty: float, available: float,
@@ -192,12 +200,14 @@ _LI_INSERT_SQL = """
     ) VALUES (
         :mr_id, :actual_item_id, :actual_quality, :challan_quality_id,
         :w, :rate, 0, :price, :warehouse_id,
-        :actual_qty, :w, :rate,
+        :actual_qty, :w, :actual_rate,
         :marka, :crop_year, 1, NOW(), :unit_conversion
     )
 """
-# actual_weight = accepted kg and actual_rate = rate on app-created lines, so
-# the ERP stock view computes balances for them (bal = actual_weight - issued).
+# actual_weight = accepted kg on app-created lines, so the ERP stock view
+# computes balances for them (bal = actual_weight - issued). actual_rate is the
+# SOURCE line's production rate (see lot_helpers.production_rate) -- never the
+# marked-up transfer rate, which belongs to `rate` (accounting) only.
 
 
 def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
@@ -561,7 +571,7 @@ def save_marked_batch(
             # pending-QC list. Supplier/mukam/challan/vehicle copied from
             # the parent so the ERP detail renders fully.
             hdr = _parent_header(conn, src_mr_id)
-            moved_total = round(sum(float(r["moved_kg"]) for r in grp), 3)
+            moved_total = float(round_kg(sum(float(r["moved_kg"]) for r in grp)))
             child_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
                 INSERT INTO jute_mr (
                     jute_gate_entry_no, branch_mr_no, jute_gate_entry_date, jute_mr_date,
@@ -631,6 +641,7 @@ def save_marked_batch(
                         "challan_quality_id": r["challan_quality_id"],
                         "w": moved,
                         "rate": new_rate,
+                        "actual_rate": production_rate(r),
                         "price": line_price(moved, new_rate),
                         "warehouse_id": warehouse_id,
                         "actual_qty": aq_delta,
@@ -892,9 +903,9 @@ if __name__ == "__main__":
     # Self-check: weight conservation + over-transfer / non-positive rejection.
     assert split_weights(100.0, 30.0) == (70.0, 30.0)
     assert split_weights(100.0, 100.0) == (0.0, 100.0)
-    rem, mv = split_weights(50.5, 10.25)
-    assert round(rem + mv, 3) == 50.5, (rem, mv)
-    for bad in (0, -5, 100.001):
+    # whole kg: moved rounds to 10, remainder 40.5 rounds half-up to 41
+    assert split_weights(50.5, 10.25) == (41.0, 10.0)
+    for bad in (0, -5, 101):
         try:
             split_weights(100.0, bad)
         except ValueError:
