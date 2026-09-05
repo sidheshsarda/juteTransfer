@@ -2,13 +2,13 @@
 import pytest
 from src.jutetransfer.lot_helpers import (
     validate_takes, apply_pct, line_price, primary_source_mr,
-    reduce_amounts, restore_amounts, combine_takes,
+    reduce_amounts, restore_amounts, combine_takes, round_kg, production_rate,
 )
 
 
 def test_validate_takes_ok_and_rounding():
     out = validate_takes([(11, 4000.0), (12, 1999.9995)], {11: 6000.0, 12: 2000.0})
-    assert out == [(11, 4000.0), (12, 1999.999)]  # 3dp rounding; banker's rounding
+    assert out == [(11, 4000.0), (12, 2000.0)]  # whole kg, half-up
 
 
 def test_validate_takes_full_line_allowed():
@@ -33,7 +33,7 @@ def test_validate_takes_zero_and_negative():
 
 def test_validate_takes_over_available():
     with pytest.raises(ValueError):
-        validate_takes([(11, 6000.001)], {11: 6000.0})
+        validate_takes([(11, 6001)], {11: 6000.0})
 
 
 def test_apply_pct_up_down_zero():
@@ -133,3 +133,25 @@ def test_reduce_amounts_actual_weight_none_treated_as_zero_raises():
 def test_reduce_amounts_actual_weight_less_than_qty_raises():
     with pytest.raises(ValueError):
         reduce_amounts(6000.0, 50.0, 60.0, 100.0, 6000.0)
+
+
+# ---------------------------------------------------------------------------
+# whole-kg rule + production rate (owner rulings 2026-09-05)
+# ---------------------------------------------------------------------------
+
+def test_round_kg_half_up_int():
+    assert [round_kg(x) for x in (2.5, 1999.9995, 40.5, None, "106.5")] == [3, 2000, 41, 0, 107]
+    assert isinstance(round_kg(2.5), int)
+
+
+def test_combine_takes_and_reduce_stay_whole_kg():
+    kg, price, rate = combine_takes([(1000.5, 2500.0), (999.5, 2500.0)])
+    assert kg == 2000.0
+    new_a, new_aw, new_aq, aq_delta, aw_delta = reduce_amounts(4811.65, 4811.65, 60.0, 4811.0, 4811.0)
+    assert (new_a, new_aw, aw_delta) == (1.0, 1.0, 4811.0)   # legacy fraction rounds, never 0.65
+
+
+def test_production_rate_prefers_actual_rate_then_rate():
+    assert production_rate({"rate": 13065.0, "actual_rate": 13000.0}) == 13000.0
+    assert production_rate({"rate": 13065.0, "actual_rate": None}) == 13065.0
+    assert production_rate({"rate": None, "actual_rate": None}) == 0.0

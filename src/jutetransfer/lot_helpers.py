@@ -3,13 +3,35 @@
 No Streamlit/DB imports (same rule as jute_mr_chain_helpers.py).
 """
 
+from decimal import Decimal, ROUND_HALF_UP
+
 _EPS = 1e-9
+
+
+def round_kg(value) -> int:
+    """Jute stock is kept in WHOLE KG (owner rule 2026-09-05; same helper as
+    vowerp3be src/juteProcurement/totals.py::round_kg). Half-up, int."""
+    if value is None:
+        return 0
+    return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def production_rate(line) -> float:
+    """jute_mr_li carries two rates: `rate` (approved -> accounting) and
+    `actual_rate` (production -> jute stock / batch-cost reports). App-created
+    lines must carry the SOURCE line's production rate unchanged; the marked-up
+    transfer rate only ever goes into `rate`. Falls back to `rate` on legacy
+    lines that never had actual_rate set."""
+    ar = line.get("actual_rate") if hasattr(line, "get") else line["actual_rate"]
+    if ar is None:
+        ar = line.get("rate") if hasattr(line, "get") else line["rate"]
+    return float(ar or 0)
 
 
 def validate_takes(takes, available):
     """Validate (jute_mr_li_id, qty_kg) takes against available kg per line.
 
-    Returns normalised [(int_id, qty_rounded_3dp)]. Raises ValueError on empty
+    Returns normalised [(int_id, qty_whole_kg)]. Raises ValueError on empty
     input, duplicate line, qty <= 0, or qty > available.
     """
     if not takes:
@@ -17,7 +39,7 @@ def validate_takes(takes, available):
     seen, out = set(), []
     for li_id, qty in takes:
         li_id = int(li_id)
-        qty = round(float(qty), 3)
+        qty = float(round_kg(qty))
         if li_id in seen:
             raise ValueError(f"duplicate source line {li_id}")
         seen.add(li_id)
@@ -48,7 +70,7 @@ def combine_takes(parts):
     from it, money-rounded — so kg * rate / 100 may differ from price by
     rounding pennies. Raises ValueError on empty/zero total.
     """
-    total_kg = round(sum(float(q) for q, _ in parts), 3)
+    total_kg = float(round_kg(sum(float(q) for q, _ in parts)))
     if total_kg <= 0:
         raise ValueError("nothing to merge")
     total_price = round(sum(line_price(q, r) for q, r in parts), 2)
@@ -70,8 +92,8 @@ def reduce_amounts(accepted, actual_w, actual_q, qty, available):
     take fraction (qty/available) scales actual_qty, while actual_weight is
     reduced by min(qty, actual_w) directly.
 
-    Returns (new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta),
-    all rounded to 3dp. Raises ValueError if actual_w is missing/zero or
+    Returns (new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta);
+    kg fields are whole kg, actual_q (bales) keeps 3dp. Raises ValueError if actual_w is missing/zero or
     less than qty (moving more than the line's actual on-hand weight would
     mint balance the ERP stock view doesn't have).
     """
@@ -87,17 +109,17 @@ def reduce_amounts(accepted, actual_w, actual_q, qty, available):
             "- fix the line data first"
         )
     frac = qty / available if available > 0 else 1.0
-    aw_delta = round(min(qty, actual_w), 3)
+    aw_delta = float(round_kg(min(qty, actual_w)))
     aq_delta = round(actual_q * frac, 3)
-    new_accepted = round(accepted - qty, 3)
-    new_actual_w = round(max(0.0, actual_w - aw_delta), 3)
+    new_accepted = float(round_kg(accepted - qty))
+    new_actual_w = float(round_kg(max(0.0, actual_w - aw_delta)))
     new_actual_q = round(max(0.0, actual_q - aq_delta), 3)
     return new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta
 
 
 def restore_amounts(accepted, actual_w, actual_q, qty, aq_delta, aw_delta):
-    """Undo reduce_amounts: add qty/aq_delta/aw_delta back, 3dp rounded."""
-    new_accepted = round(float(accepted or 0) + float(qty), 3)
-    new_actual_w = round(float(actual_w or 0) + float(aw_delta), 3)
+    """Undo reduce_amounts: add qty/aq_delta/aw_delta back (kg whole, bales 3dp)."""
+    new_accepted = float(round_kg(float(accepted or 0) + float(qty)))
+    new_actual_w = float(round_kg(float(actual_w or 0) + float(aw_delta)))
     new_actual_q = round(float(actual_q or 0) + float(aq_delta), 3)
     return new_accepted, new_actual_w, new_actual_q

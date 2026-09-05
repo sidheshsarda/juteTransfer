@@ -14,6 +14,7 @@ from sqlalchemy import text
 
 from .database import DatabaseConnection
 from .jute_mr_chain_helpers import _calculate_line_item_amount, is_root_eligible_for_new_chain
+from .lot_helpers import production_rate
 from .queries import get_source_mr_full, _get_financial_year_bounds
 
 # Fixed invoice type for raw jute transfers
@@ -821,7 +822,8 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
             "marka": li.get("marka"),
             "crop_year": li.get("crop_year"),
             "unit_conversion": li.get("unit_conversion"),
-            "actual_rate": None,
+            # production rate rides along unchanged; the hop mark-up is `rate` only
+            "actual_rate": production_rate(li),
         })
 
     return new_mr_id
