@@ -269,6 +269,7 @@ def _fetch_step_line_items(jute_mr_id: int) -> list:
         FROM jute_mr_li li
         LEFT JOIN item_mst im ON li.actual_item_id = im.item_id
         WHERE li.jute_mr_id = :mr_id
+          AND (li.active = 1 OR li.active IS NULL)
         """,
         {"mr_id": jute_mr_id},
     )

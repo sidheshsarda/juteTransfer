@@ -1264,10 +1264,10 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             bill_pass_no = :bill_pass_no,
             bill_pass_date = :mr_date,
             status_id = :status_id,
-            total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
-            roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) -
-                       (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
-            net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) - claim_amount,
+            total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)),
+            roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)) -
+                       (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)),
+            net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)) - claim_amount,
             updated_by = :updated_by,
             updated_date_time = NOW()
             {optional_sql}
@@ -1310,7 +1310,7 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
     # Load root MR's line items in stable order for positional matching
     root_lis = conn.execute(
         text("SELECT jute_mr_li_id, accepted_weight FROM jute_mr_li "
-             "WHERE jute_mr_id = :id ORDER BY jute_mr_li_id"),
+             "WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL) ORDER BY jute_mr_li_id"),
         {"id": jute_mr_id},
     ).fetchall()
 
@@ -1365,10 +1365,10 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             invoice_date = NULL,
             invoice_amount = NULL,
             status_id = 13,
-            total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
-            roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) -
-                       (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id),
-            net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id) - claim_amount,
+            total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)),
+            roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)) -
+                       (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)),
+            net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)) - claim_amount,
             updated_by = :updated_by,
             updated_date_time = NOW()
             {revert_sql}
