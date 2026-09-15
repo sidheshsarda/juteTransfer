@@ -196,6 +196,7 @@ def get_jute_mr_with_line_items(
         FROM jute_mr mr
         INNER JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         INNER JOIN jute_mr_li li ON mr.jute_mr_id = li.jute_mr_id
+            AND (li.active = 1 OR li.active IS NULL)
         LEFT JOIN jute_po p ON mr.po_id = p.jute_po_id
         LEFT JOIN jute_supplier_mst s ON mr.jute_supplier_id = s.supplier_id
         LEFT JOIN party_mst pm ON pm.party_id = mr.party_id AND pm.co_id = bm.co_id
@@ -466,7 +467,7 @@ def get_source_mr_full(jute_mr_id: int, conn=None) -> Optional[dict]:
         mr_dict = dict(mr_row._mapping)
 
         li_rows = conn.execute(
-            sa_text("SELECT * FROM jute_mr_li WHERE jute_mr_id = :id"),
+            sa_text("SELECT * FROM jute_mr_li WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL)"),
             {"id": jute_mr_id},
         ).fetchall()
         mr_dict["line_items"] = [dict(r._mapping) for r in li_rows]
@@ -482,7 +483,7 @@ def get_source_mr_full(jute_mr_id: int, conn=None) -> Optional[dict]:
     mr_dict = mr_df.iloc[0].to_dict()
 
     li_df = DatabaseConnection.execute_query(
-        "SELECT * FROM jute_mr_li WHERE jute_mr_id = :id",
+        "SELECT * FROM jute_mr_li WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL)",
         {"id": jute_mr_id},
     )
     mr_dict["line_items"] = (
