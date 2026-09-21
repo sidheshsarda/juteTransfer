@@ -40,7 +40,10 @@ def test_apply_pct_up_down_zero():
     assert apply_pct(2500.0, 10.0) == 2750.0
     assert apply_pct(2500.0, -5.0) == 2375.0
     assert apply_pct(2500.0, 0.0) == 2500.0
-    assert apply_pct(2551.33, 2.5) == 2615.11  # verify against REPL; round half-even
+    assert apply_pct(2551.33, 2.5) == 2615.0  # 2615.113 -> whole rupee
+    # half-up on exact decimals: float 13300*1.005 = 13366.4999... must still go up
+    assert apply_pct(13300.0, 0.5) == 13367.0
+    assert apply_pct(13226.0, -1.5) == 13028.0  # 13027.61
 
 
 def test_line_price():
@@ -163,4 +166,4 @@ def test_net_rate_deducts_claim_rate():
     assert net_rate({"rate": 13306.0, "claim_rate": None}) == 13306.0
     assert net_rate({"rate": None, "claim_rate": None}) == 0.0
     # the transfer % applies to the post-claim rate
-    assert apply_pct(net_rate({"rate": 13306.0, "claim_rate": 80.0}), 2) == 13490.52
+    assert apply_pct(net_rate({"rate": 13306.0, "claim_rate": 80.0}), 2) == 13491.0
