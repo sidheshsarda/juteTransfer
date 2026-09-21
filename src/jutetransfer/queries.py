@@ -249,7 +249,9 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int,
             im.item_name AS quality,
             ROUND(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
                         li.accepted_weight), 3) AS remaining_kg,
-            li.rate AS rate,
+            -- post-claim stock rate (lot_helpers.net_rate): the ERP keeps
+            -- rate gross and books claim_rate separately
+            li.rate - COALESCE(li.claim_rate, 0) AS rate,
             wh.warehouse_name AS warehouse,
             CASE WHEN mr.transfer_mode = 1
                  -- marked stock: party_id is the SELLING company's party here;
@@ -293,7 +295,8 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int,
 
 
 def get_quality_availability_summary(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
-    """Quality-wise availability: lot count, total kg, weighted-avg rate."""
+    """Quality-wise availability: lot count, total kg, weighted-avg
+    post-claim rate (rate - claim_rate)."""
     query = """
         SELECT
             im.item_name AS quality,
@@ -301,7 +304,8 @@ def get_quality_availability_summary(co_id: int, branch_id: int, year: int, mont
             ROUND(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
                             li.accepted_weight)), 2) AS total_kg,
             ROUND(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
-                            li.accepted_weight) * li.rate)
+                            li.accepted_weight)
+                      * (li.rate - COALESCE(li.claim_rate, 0)))
                   / NULLIF(SUM(LEAST(COALESCE(v.bal_weight, li.accepted_weight),
                                      li.accepted_weight)), 0), 2) AS avg_rate
         FROM jute_mr mr

@@ -24,7 +24,8 @@ from .warehouse_stock_ops import (
 )
 
 _LOCK_LINE_SQL = """
-    SELECT li.jute_mr_li_id, li.accepted_weight, li.rate, li.actual_item_id,
+    SELECT li.jute_mr_li_id, li.accepted_weight, li.rate, li.claim_rate,
+           li.actual_item_id,
            li.actual_quality, li.challan_quality_id, li.marka, li.crop_year,
            li.unit_conversion, li.warehouse_id, li.jute_mr_id,
            li.actual_qty, li.actual_weight, li.actual_rate,
@@ -144,6 +145,10 @@ def create_lot(takes, updated_by: int, merge: bool = False) -> list:
                     "challan_quality_id": r["challan_quality_id"],
                     "w": kg,
                     "rate": avg_rate,
+                    # kg-weighted claim so the merged line nets like its sources
+                    "claim_rate": combine_takes(
+                        [(qty, float(rows[li]["claim_rate"] or 0))
+                         for li, qty in norm])[2],
                     # production rate: kg-weighted average of the sources' actual_rate
                     "actual_rate": combine_takes(
                         [(qty, production_rate(rows[li])) for li, qty in norm])[2],
@@ -175,6 +180,7 @@ def create_lot(takes, updated_by: int, merge: bool = False) -> list:
                         "challan_quality_id": r["challan_quality_id"],
                         "w": qty,
                         "rate": float(r["rate"] or 0),
+                        "claim_rate": float(r["claim_rate"] or 0),
                         "actual_rate": production_rate(r),
                         "price": line_price(qty, float(r["rate"] or 0)),
                         "warehouse_id": r["warehouse_id"],
