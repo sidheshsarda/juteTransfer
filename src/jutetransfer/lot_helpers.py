@@ -62,8 +62,11 @@ def validate_takes(takes, available):
 
 
 def apply_pct(rate, pct):
-    """Common % rate change (positive or negative), money-rounded."""
-    return round(float(rate) * (1.0 + float(pct) / 100.0), 2)
+    """Common % rate change (positive or negative), rounded to a WHOLE rupee
+    per quintal, half-up. Done in Decimal: float 13300 * 1.005 is
+    13366.4999..., which would wrongly round down."""
+    new = Decimal(str(rate)) * (1 + Decimal(str(pct)) / 100)
+    return float(new.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def line_price(weight_kg, rate):
