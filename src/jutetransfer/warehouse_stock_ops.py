@@ -26,7 +26,8 @@ from sqlalchemy import text
 
 from .database import DatabaseConnection
 from .lot_helpers import (
-    apply_pct, line_price, production_rate, reduce_amounts, restore_amounts, round_kg,
+    apply_pct, line_price, net_rate, production_rate, reduce_amounts,
+    restore_amounts, round_kg,
 )
 from .transfer import (
     RAW_JUTE_INVOICE_TYPE,
@@ -199,7 +200,7 @@ _LI_INSERT_SQL = """
         marka, crop_year, active, updated_date_time, unit_conversion
     ) VALUES (
         :mr_id, :actual_item_id, :actual_quality, :challan_quality_id,
-        :w, :rate, 0, :price, :warehouse_id,
+        :w, :rate, :claim_rate, :price, :warehouse_id,
         :actual_qty, :w, :actual_rate,
         :marka, :crop_year, 1, NOW(), :unit_conversion
     )
@@ -208,6 +209,9 @@ _LI_INSERT_SQL = """
 # computes balances for them (bal = actual_weight - issued). actual_rate is the
 # SOURCE line's production rate (see lot_helpers.production_rate) -- never the
 # marked-up transfer rate, which belongs to `rate` (accounting) only.
+# claim_rate: split/merge lines keep the source claim (the MR's line-level
+# claim total stays whole); marked children pass 0 -- their `rate` is already
+# post-claim (lot_helpers.net_rate).
 
 
 def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
@@ -480,7 +484,8 @@ def save_marked_batch(
     delete_marked_move enforces leaf-first undo).
 
     Selected lines are grouped by source MR; each source MR gets ONE child MR
-    (transfer_mode=1) holding its selected lines at rate * (1 + pct/100).
+    (transfer_mode=1) holding its selected lines at the post-claim rate
+    (rate - claim_rate) * (1 + pct/100); the child line itself is claim-free.
     The moved amount per line is the balance-aware available kg
     (LEAST(view balance, accepted_weight)) — weight already issued to
     production stays behind. Provenance rows are written to jute_lot_src so
@@ -501,7 +506,7 @@ def save_marked_batch(
         for li_id in ids:  # ascending lock order
             row = conn.execute(text("""
                 SELECT li.jute_mr_li_id, li.accepted_weight, li.rate,
-                       li.actual_item_id, li.actual_quality, li.challan_quality_id,
+                       li.claim_rate, li.actual_item_id, li.actual_quality, li.challan_quality_id,
                        li.marka, li.crop_year, li.unit_conversion,
                        li.actual_qty, li.actual_weight, li.actual_rate,
                        li.jute_mr_id, mr.branch_id AS src_branch_id,
@@ -623,7 +628,9 @@ def save_marked_batch(
             inv_lines = []
             for r in grp:
                 moved = float(r["moved_kg"])
-                new_rate = apply_pct(float(r["rate"] or 0), pct_change)
+                # Child + invoice are claim-free, so the source claim must be
+                # netted into the rate here or the buyer pays for it.
+                new_rate = apply_pct(net_rate(r), pct_change)
                 src_item_id = r["actual_item_id"]
                 target_item_id = (
                     _ensure_item(conn, int(src_item_id), target_co_id, updated_by)
@@ -641,6 +648,7 @@ def save_marked_batch(
                         "challan_quality_id": r["challan_quality_id"],
                         "w": moved,
                         "rate": new_rate,
+                        "claim_rate": 0,
                         "actual_rate": production_rate(r),
                         "price": line_price(moved, new_rate),
                         "warehouse_id": warehouse_id,

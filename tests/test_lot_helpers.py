@@ -2,7 +2,7 @@
 import pytest
 from src.jutetransfer.lot_helpers import (
     validate_takes, apply_pct, line_price, primary_source_mr,
-    reduce_amounts, restore_amounts, combine_takes, round_kg, production_rate,
+    reduce_amounts, restore_amounts, combine_takes, round_kg, production_rate, net_rate,
 )
 
 
@@ -155,3 +155,12 @@ def test_production_rate_prefers_actual_rate_then_rate():
     assert production_rate({"rate": 13065.0, "actual_rate": 13000.0}) == 13000.0
     assert production_rate({"rate": 13065.0, "actual_rate": None}) == 13065.0
     assert production_rate({"rate": None, "actual_rate": None}) == 0.0
+
+
+def test_net_rate_deducts_claim_rate():
+    # ALMA MR 28253 line 45722: 13306/qtl with an 80/qtl claim -> stock at 13226
+    assert net_rate({"rate": 13306.0, "claim_rate": 80.0}) == 13226.0
+    assert net_rate({"rate": 13306.0, "claim_rate": None}) == 13306.0
+    assert net_rate({"rate": None, "claim_rate": None}) == 0.0
+    # the transfer % applies to the post-claim rate
+    assert apply_pct(net_rate({"rate": 13306.0, "claim_rate": 80.0}), 2) == 13490.52

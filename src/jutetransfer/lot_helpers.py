@@ -28,6 +28,15 @@ def production_rate(line) -> float:
     return float(ar or 0)
 
 
+def net_rate(line) -> float:
+    """Post-claim stock rate per quintal: rate - claim_rate. The ERP keeps
+    `rate` gross and books the claim separately (claim_amount =
+    accepted_weight/100 * claim_rate), so an approved MR's stock is really
+    worth rate - claim_rate. App-created marked lines are claim-free, so for
+    them this is just `rate`. No post-claim rate is stored anywhere."""
+    return float(line["rate"] or 0) - float(line["claim_rate"] or 0)
+
+
 def validate_takes(takes, available):
     """Validate (jute_mr_li_id, qty_kg) takes against available kg per line.
 
