@@ -26,8 +26,8 @@ from sqlalchemy import text
 
 from .database import DatabaseConnection
 from .lot_helpers import (
-    apply_pct, line_price, net_rate, production_rate, reduce_amounts,
-    restore_amounts, round_kg,
+    advised_share, apply_pct, line_price, net_rate, production_rate,
+    reduce_amounts, restore_amounts, round_kg,
 )
 from .transfer import (
     RAW_JUTE_INVOICE_TYPE,
@@ -92,8 +92,8 @@ def _parent_header(conn, jute_mr_id: int) -> dict:
     Walks src_jute_mr_id ancestry to fill NULLs: legacy app-created mode-1
     parents (pre header-copy fix) have these fields empty, but their mode-0
     origin always carries them."""
-    fields = ["challan_no", "mukam_id", "jute_supplier_id", "unit_conversion",
-              "vehicle_no", "transporter", "driver_name"]
+    fields = ["challan_no", "challan_date", "mukam_id", "jute_supplier_id",
+              "unit_conversion", "vehicle_no", "transporter", "driver_name"]
     out = dict.fromkeys(fields)
     mr_id, found = jute_mr_id, False
     for _ in range(10):  # ancestry is short; hard cap against id cycles
@@ -195,11 +195,15 @@ def _reduce_source_line(conn, r: dict, qty: float, available: float,
 _LI_INSERT_SQL = """
     INSERT INTO jute_mr_li (
         jute_mr_id, actual_item_id, actual_quality, challan_quality_id,
+        challan_item_id, challan_weight, challan_quantity,
+        allowable_moisture, actual_moisture,
         accepted_weight, rate, claim_rate, total_price, warehouse_id,
         actual_qty, actual_weight, actual_rate,
         marka, crop_year, active, updated_date_time, unit_conversion
     ) VALUES (
         :mr_id, :actual_item_id, :actual_quality, :challan_quality_id,
+        :challan_item_id, :challan_weight, :challan_quantity,
+        :allowable_moisture, :actual_moisture,
         :w, :rate, :claim_rate, :price, :warehouse_id,
         :actual_qty, :w, :actual_rate,
         :marka, :crop_year, 1, NOW(), :unit_conversion
@@ -212,6 +216,12 @@ _LI_INSERT_SQL = """
 # claim_rate: split/merge lines keep the source claim (the MR's line-level
 # claim total stays whole); marked children pass 0 -- their `rate` is already
 # post-claim (lot_helpers.net_rate).
+# challan_* = the supplier's ADVISED item/weight/bales (MR print "Advised
+# weight"). Marked children carry their moved share (advised_share); the
+# source keeps its own -- it is the gate record, and the ERP only displays
+# challan_weight (no stock/accounting sums), like the copied challan_no.
+# Split/merge lines leave advised weight on the source line (0 here) so the
+# MR's advised total stays whole.
 
 
 def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
@@ -507,6 +517,8 @@ def save_marked_batch(
             row = conn.execute(text("""
                 SELECT li.jute_mr_li_id, li.accepted_weight, li.rate,
                        li.claim_rate, li.actual_item_id, li.actual_quality, li.challan_quality_id,
+                       li.challan_item_id, li.challan_weight, li.challan_quantity,
+                       li.allowable_moisture, li.actual_moisture,
                        li.marka, li.crop_year, li.unit_conversion,
                        li.actual_qty, li.actual_weight, li.actual_rate,
                        li.jute_mr_id, mr.branch_id AS src_branch_id,
@@ -577,6 +589,13 @@ def save_marked_batch(
             # the parent so the ERP detail renders fully.
             hdr = _parent_header(conn, src_mr_id)
             moved_total = float(round_kg(sum(float(r["moved_kg"]) for r in grp)))
+            for r in grp:
+                r["adv_w"], r["adv_q"] = advised_share(
+                    r["challan_weight"], r["challan_quantity"],
+                    r["moved_kg"], r["accepted_weight"])
+            # ponytail: sources with no advised data keep the old header
+            # figure (moved kg) rather than showing 0
+            advised_total = sum(r["adv_w"] for r in grp) or moved_total
             child_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
                 INSERT INTO jute_mr (
                     jute_gate_entry_no, branch_mr_no, jute_gate_entry_date, jute_mr_date,
@@ -596,7 +615,7 @@ def save_marked_batch(
                     :branch_id, :party_id, :party_branch_id, :src_com_id, :src_jute_mr_id,
                     0, 0, 0, 0,
                     :bill_pass_no, :mr_date,
-                    :challan_no, :mr_date, :moved_kg,
+                    :challan_no, :challan_date, :challan_weight,
                     :moved_kg, 0, :moved_kg, 0,
                     :moved_kg, NOW(), :mr_date, NOW(), 1,
                     :mukam_id, :jute_supplier_id, :unit_conversion,
@@ -615,6 +634,8 @@ def save_marked_batch(
                 "src_jute_mr_id": src_mr_id,  # direct parent (mode-1 semantics)
                 "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id, mr_date),
                 "challan_no": hdr["challan_no"],
+                "challan_date": hdr["challan_date"] or mr_date,
+                "challan_weight": advised_total,
                 "moved_kg": moved_total,
                 "mukam_id": hdr["mukam_id"],
                 "jute_supplier_id": hdr["jute_supplier_id"],
@@ -636,6 +657,13 @@ def save_marked_batch(
                     _ensure_item(conn, int(src_item_id), target_co_id, updated_by)
                     if src_item_id else None
                 )
+                # Advised item remapped like actual_item_id (usually the same).
+                challan_item_id = r["challan_item_id"]
+                if challan_item_id == src_item_id:
+                    challan_item_id = target_item_id
+                elif challan_item_id:
+                    challan_item_id = _ensure_item(
+                        conn, int(challan_item_id), target_co_id, updated_by)
                 aq_delta, aw_delta = _reduce_source_line(
                     conn, r, moved, moved,
                     keep_accepted=(int(r["transfer_mode"] or 0) == 1),
@@ -646,6 +674,11 @@ def save_marked_batch(
                         "actual_item_id": target_item_id,
                         "actual_quality": r["actual_quality"],
                         "challan_quality_id": r["challan_quality_id"],
+                        "challan_item_id": challan_item_id,
+                        "challan_weight": r["adv_w"],
+                        "challan_quantity": r["adv_q"],
+                        "allowable_moisture": r["allowable_moisture"],
+                        "actual_moisture": r["actual_moisture"],
                         "w": moved,
                         "rate": new_rate,
                         "claim_rate": 0,

@@ -2,7 +2,7 @@
 import pytest
 from src.jutetransfer.lot_helpers import (
     validate_takes, apply_pct, line_price, primary_source_mr,
-    reduce_amounts, restore_amounts, combine_takes, round_kg, production_rate, net_rate,
+    reduce_amounts, restore_amounts, combine_takes, round_kg, production_rate, net_rate, advised_share,
 )
 
 
@@ -167,3 +167,14 @@ def test_net_rate_deducts_claim_rate():
     assert net_rate({"rate": None, "claim_rate": None}) == 0.0
     # the transfer % applies to the post-claim rate
     assert apply_pct(net_rate({"rate": 13306.0, "claim_rate": 80.0}), 2) == 13491.0
+
+
+def test_advised_share_whole_and_partial():
+    # ALMA MR 28253 line 45722: whole lot moves -> full advised 13188 kg / 540 bales
+    assert advised_share(13188.0, 540.0, 13188.0, 13188.0) == (13188.0, 540.0)
+    # part already issued: advised follows the moved fraction (whole kg, bales 3dp)
+    assert advised_share(13188.0, 540.0, 6594.0, 13188.0) == (6594.0, 270.0)
+    assert advised_share(10001.0, 41.0, 3333.0, 10000.0) == (3333.0, 13.665)
+    # no advised data on the source -> nothing invented
+    assert advised_share(None, None, 500.0, 1000.0) == (0.0, None)
+    assert advised_share(0.0, 0.0, 500.0, 0.0) == (0.0, 0.0)

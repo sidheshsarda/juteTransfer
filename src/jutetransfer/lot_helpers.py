@@ -37,6 +37,17 @@ def net_rate(line) -> float:
     return float(line["rate"] or 0) - float(line["claim_rate"] or 0)
 
 
+def advised_share(challan_weight, challan_qty, moved, accepted):
+    """Advised (challan) weight/bales that travel with `moved` kg of a line
+    holding `accepted` kg: the moved fraction of each, weight whole kg,
+    bales 3dp (like actual_qty). challan_qty None stays None; a zero
+    `accepted` (degenerate) carries the full advised figures."""
+    frac = float(moved) / float(accepted) if accepted else 1.0
+    adv_w = float(round_kg(float(challan_weight or 0) * frac))
+    adv_q = None if challan_qty is None else round(float(challan_qty) * frac, 3)
+    return adv_w, adv_q
+
+
 def validate_takes(takes, available):
     """Validate (jute_mr_li_id, qty_kg) takes against available kg per line.
 

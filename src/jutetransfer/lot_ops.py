@@ -29,6 +29,7 @@ _LOCK_LINE_SQL = """
            li.actual_quality, li.challan_quality_id, li.marka, li.crop_year,
            li.unit_conversion, li.warehouse_id, li.jute_mr_id,
            li.actual_qty, li.actual_weight, li.actual_rate,
+           li.challan_item_id, li.allowable_moisture, li.actual_moisture,
            mr.branch_id, mr.transfer_mode, mr.status_id, mr.src_jute_mr_id,
            mr.party_id, mr.party_branch_id, bm.co_id
     FROM jute_mr_li li
@@ -43,6 +44,20 @@ _CHAIN_CHILD_SQL = """
     WHERE src_jute_mr_id = :sid AND transfer_mode = 0 AND jute_mr_id <> :sid
     LIMIT 1
 """
+
+
+def _advised_details(r: dict) -> dict:
+    """Advised columns for an in-place split/merge line: descriptive details
+    copied from the source line; advised weight/bales stay on the source
+    line (see _LI_INSERT_SQL note) so the MR's advised total stays whole."""
+    return {
+        "challan_item_id": r["challan_item_id"],
+        "challan_weight": 0,
+        "challan_quantity": None,
+        "allowable_moisture": r["allowable_moisture"],
+        "actual_moisture": r["actual_moisture"],
+    }
+
 
 _PROV_INSERT_SQL = """
     INSERT INTO jute_lot_src
@@ -143,6 +158,7 @@ def create_lot(takes, updated_by: int, merge: bool = False) -> list:
                     "actual_item_id": r["actual_item_id"],
                     "actual_quality": r["actual_quality"],
                     "challan_quality_id": r["challan_quality_id"],
+                    **_advised_details(r),
                     "w": kg,
                     "rate": avg_rate,
                     # kg-weighted claim so the merged line nets like its sources
@@ -178,6 +194,7 @@ def create_lot(takes, updated_by: int, merge: bool = False) -> list:
                         "actual_item_id": r["actual_item_id"],
                         "actual_quality": r["actual_quality"],
                         "challan_quality_id": r["challan_quality_id"],
+                        **_advised_details(r),
                         "w": qty,
                         "rate": float(r["rate"] or 0),
                         "claim_rate": float(r["claim_rate"] or 0),
