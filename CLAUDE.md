@@ -73,9 +73,8 @@ Every chain transfer also writes ERP purchase orders (`jute_po` + `jute_po_li` +
 
 ### Type 2 core logic (as built)
 
-- Godowns tagged via `warehouse_mst.warehouse_type = 'MARKED'` (`queries.set_warehouse_marked`). That column is ERP master data ('J' jute godown, 'S' store …): tagging writes only godowns whose tag changes, untagging restores 'J', store godowns are not offered (it used to blank the type of every godown of the branch).
-- `save_marked_move`: reduces source `jute_mr_li.accepted_weight`/`total_price` (recomputes source header), INSERTs child MR at target branch/warehouse with `transfer_mode=1`, possibly different rate.
-- `save_marked_batch`: also books one seller Raw-Jute `sales_invoice` per child MR at the source branch (buyer = target company's party, auto-created if missing), stamps the child MR with invoice no/date/amount, and links via `sales_invoice_jute.mr_id` = child MR id (deletion linkage — different semantics from Type 1's hop linkage). `delete_marked_move` cascades the invoice.
+- Godowns tagged via `warehouse_mst.warehouse_type = 'MARKED'` (`queries.set_warehouse_marked`). That column is ERP master data ('J' jute godown, 'S' store …): tagging writes only godowns whose tag changes, untagging restores 'J', store godowns are not offered (it used to blank the type of every godown of the branch). Types compare case-insensitively (as MySQL does), and the godown lookups in `queries.py` return `{warehouse_id: label}` — the pages key every godown widget by id, because a branch can have two godowns of one name (sls branch 87: `LCPL_JUTE` 244 and 360).
+- `save_marked_batch` (the only move entry point; there is no single-lot `save_marked_move` any more): per source MR INSERTs one child MR (`transfer_mode=1`) at the target branch/godown with the moved kg at a possibly different rate, and books one seller Raw-Jute `sales_invoice` at the source branch (buyer = target company's party, auto-created if missing), stamps the child MR with invoice no/date/amount, and links via `sales_invoice_jute.mr_id` = child MR id (deletion linkage — different semantics from Type 1's hop linkage). **Since 2026-10-03 a move does not change the source line or its MR header**: the stock-out is the invoice line, which names the source MR line (`sales_invoice_dtl.jute_mr_li_id`), so the ERP stock view `vw_jute_stock_outstanding` nets the moved kg off that line's balance by itself. `delete_marked_move` deletes the invoice (the balance comes back) and the child; moves written by the older code (which drained the source row) are still undone by restoring the source from `jute_lot_src`'s deltas until `scripts/repair_transfer_data.py marked-stock` converts them.
 - P&L counts marked stock: `transfer_mode=1` MRs at status 3 (`get_company_wise_marked_stock`).
 - **Resale (2026-08-04):** marked stock held at a company can be resold onward — `get_available_lots(include_marked=True)` lists mode-1 lines on the Transfer tab and `save_marked_batch` accepts mode-1 sources. Each hop creates a new mode-1 child MR + seller invoice at the current holder's branch; `src_jute_mr_id` = direct parent per hop; `delete_marked_move` enforces leaf-first undo. Split/merge (lot ops) remain mode-0 only, so resale always moves a line's full remaining balance.
 
@@ -123,30 +122,31 @@ scripts/                              # backfill_transfer_pos.py, repair_transfe
 ### Critical Dependencies
 
 - **jute_mr_chain_helpers.py** — pure Python core; imports nothing from pages/DB. No circular imports allowed.
-- **transfer.py** — type 1 public API (`save_transfer_step`, `delete_transfer_step`, `delete_chain_from_step`, `revert_original_mr`). All writes inside `DatabaseConnection.get_transaction()`.
-- **warehouse_stock_ops.py** — type 2 public API (`save_marked_move`, `delete_marked_move`). Keep it independent of chain logic; the `transfer_mode` guard rails must stay.
+- **transfer.py** — type 1 public API (`save_transfer_step`, `delete_chain_from_step`, `revert_original_mr`; a single hop is only ever removed through `delete_chain_from_step`). All writes inside `DatabaseConnection.get_transaction()`; a save takes its named locks first (`database.named_locks`: `jt_chain_save:<db>` plus the ERP's `jute_po_no:<db>:<branch>` per branch that may receive a PO) and releases them after the commit.
+- **warehouse_stock_ops.py** — type 2 public API (`save_marked_batch`, `delete_marked_move`). Keep it independent of chain logic; the `transfer_mode` guard rails must stay.
 
 ## Key Implementation Patterns
 
-### 1. The % Rate Increase Widget Bug (SOLVED)
+### 1. The % Rate Increase Widget Bug (SOLVED — twice)
 
-**Root causes:** `nonlocal` doesn't cross Streamlit reruns; `value=` param resets widget state every rerun; closures capture stale loop variables.
+**Root causes (2026-03):** `nonlocal` doesn't cross Streamlit reruns; `value=` param resets widget state every rerun; closures capture stale loop variables.
 
-**Solution (in `pages/new_transfer_chain.py`):**
+**Second round (2026-10-03, review P1):** the fix had seeded the box with `value=st.session_state["pct_<root>_<step>"]` — a plain shadow key — and compared the box with that shadow. Streamlit drops a widget's key when the widget is not rendered (another lorry shown), but the shadow key lived on; after a save or delete on another lorry of the month the step dicts were rebuilt (pct 0) while the shadow still said 0.5, so the re-created box showed 0.50 and Save posted 0 % (MR, invoice and Final PO).
+
+**Solution (in `pages/new_transfer_chain.py`, `_render_step_card`):**
 ```python
-# Initialize widget state if missing
-if pct_key not in st.session_state:
-    st.session_state[pct_key] = current_pct
-
-# Let Streamlit manage widget, don't pass value= param
-new_pct = float(st.session_state[pct_key])
-
-# Trigger recalculation if changed
-if new_pct != current_pct:
-    changed = True
+# the box is a keyed widget with NO value=, seeded from the step dict only
+if pct_input_key not in st.session_state:
+    st.session_state[pct_input_key] = dict_pct
+new_pct = float(st.number_input("% Rate Increase", key=pct_input_key, ...) or 0)
+# the dict follows the box, in the same run, and the chain is recomputed
+if abs(new_pct - dict_pct) > 0.0001:
+    step["pct_rate_increase"] = new_pct
+    _recalculate_chain(all_steps, root_line_items, ...)   # no st.rerun()
 ```
+`_drop_chain_state` (after a save / delete) forgets only the saved lorry's step dicts and every `pct_input_*` key; other lorries' typed steps are kept and rebuilt by `_chain_changed` when the database shows their chain changed. The company box takes `index=` from the kept dict, so a step survives a lorry switch. Reload keeps every widget and re-applies the typed % to the fresh dicts.
 
-**Lesson:** Streamlit's session state is the source of truth; never override it with `value=` parameters when you need persistent input state.
+**Lessons:** a widget is only ever seeded from, and compared with, the model it edits (the step dict) — never a second copy of its own value; no `st.rerun()` inside a widget handler (it swallowed a Save tapped in the same run); `tests/test_pages.py` holds the headless regression.
 
 ### 2. Chain Recalculation
 
@@ -170,7 +170,9 @@ pytest tests/ -v
 streamlit run app.py
 ```
 
-Integration checklist when touching chain logic: rate cascade (10% on step 2 → step 3 updates; −5% propagates), save/reload persistence, edge cases (pending root with no transfers, single-step chain). When touching type 2: partial move reduces source and creates mode-1 child; move blocked when line is in a live chain; delete restores source weights.
+Integration checklist when touching chain logic: rate cascade (10% on step 2 → step 3 updates; −5% propagates), save/reload persistence, edge cases (pending root with no transfers, single-step chain). When touching type 2: a move creates the mode-1 child and its seller invoice and leaves the source line untouched (its view balance drops by the moved kg); move blocked when line is in a live chain; delete removes the invoice and the balance comes back.
+
+The pages have headless tests too (`tests/test_pages.py`, `streamlit.testing.v1.AppTest` on in-memory frames with every write function stubbed): the chain page's % box / Save consistency across lorries, Reload, godown-follows-company, delete confirmation, error paths.
 
 ## Development Workflow
 
@@ -183,7 +185,7 @@ Integration checklist when touching chain logic: rate cascade (10% on step 2 →
 
 ### Known housekeeping debt (don't be surprised by these)
 
-- Live `[DEBUG]` caption in `new_transfer_chain.py` (~line 470) and `debug_transfer.log` append on every save — leftover instrumentation.
+- The `[DEBUG]` captions and the `debug_transfer.log` append are gone (2026-10-03); a stale gitignored `src/debug_transfer.log` may still sit on a checkout — it corresponds to no database write and can be deleted. Errors on the pages now go through `logging` (the server log, `.logs/jt.log` on the dev VM), never onto the screen.
 - Stray `pages/company_pl_dashboard.py.tmp.*` file.
 - Demo auth means `updated_by` is always `1`.
 - `docs/invoice_data_flow_step2.md`, `docs/invoice_verification_checklist.md`, `docs/step2_invoice_example.md` and the 2026-03/04 superpowers plans reference the retired `jute_mr.py`/`jute_mr_editor.py` pages — historical only.
