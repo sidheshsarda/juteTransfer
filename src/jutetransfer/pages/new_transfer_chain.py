@@ -7,11 +7,15 @@ from datetime import datetime, date
 import pandas as pd
 import streamlit as st
 
+from .. import po_queries
+from ..po_helpers import ROLE_FORWARD, format_po_no, parse_marker
+from ..po_ops import transfer_po_enabled
 from ..queries import (
     get_companies,
     get_branches_by_company,
     get_company_branch_options,
     get_jute_mr_with_line_items,
+    get_original_po,
     get_transfer_chain,
     get_warehouses_by_branch,
     get_invoice_details_by_mr_id,
@@ -26,6 +30,121 @@ from ..jute_mr_chain_helpers import (
     is_root_eligible_for_new_chain,
 )
 from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
+
+FLASH_KEY = "chain_flash"
+
+
+def _flash(kind: str, message: str) -> None:
+    """Queue a message for the next run: st.success() followed by st.rerun()
+    is never seen, so save / delete results are shown from here instead."""
+    st.session_state[FLASH_KEY] = (kind, message)
+
+
+def _render_flash() -> None:
+    flash = st.session_state.pop(FLASH_KEY, None)
+    if not flash:
+        return
+    kind, message = flash
+    {"success": st.success, "warning": st.warning}.get(kind, st.info)(message)
+    # Also a toast: on a phone the page keeps its scroll position, so the
+    # banner at the top is out of view after a save or delete lower down.
+    st.toast(message, icon="✅" if kind == "success" else "⚠️")
+
+
+def _drop_chain_state(filter_key: str, mr_id: int, keep_selection: bool = True) -> None:
+    """Forget everything cached for this month and this chain, including the
+    '% Rate Increase' boxes: a stale box would show one % while the next
+    save posts another (MR, invoice and PO)."""
+    keys = [
+        f"raw_df_{filter_key}",
+        f"source_df_{filter_key}",
+        f"line_items_{filter_key}",
+        f"transfers_{filter_key}",
+        f"chains_map_{filter_key}",
+        f"step_line_items_{filter_key}_{mr_id}",
+        f"orig_po_{filter_key}",
+    ]
+    if not keep_selection:
+        keys.append(f"selected_row_{filter_key}")
+    prefixes = (f"pct_{mr_id}_", f"pct_input_{mr_id}_")
+    keys += [k for k in st.session_state if isinstance(k, str) and k.startswith(prefixes)]
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
+_SKIP_TEXT = {
+    "switched off": "transfer PO creation is switched off",
+    "no line with accepted weight": "the lorry has no accepted weight",
+    "already has": "it already has one",
+    "not finalized": "the chain is not finalized",
+}
+
+
+def _skip_text(reason: str) -> str:
+    """A PO skip reason in the owner's words."""
+    for needle, text in _SKIP_TEXT.items():
+        if needle in (reason or ""):
+            return text
+    return reason or "no reason given"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _company_branch_map() -> dict:
+    """{'PREFIX-Branch': (co_id, branch_id)} for the save captions, cached a
+    minute so a caption does not cost two more queries on every tap."""
+    return get_company_branch_options()[1]
+
+
+def _clear_tracker_cache() -> None:
+    """The PO Tracker caches its read for a minute; drop it after a save or
+    delete so the new PO shows there straight away."""
+    clear = getattr(po_queries, "clear_tracker_cache", None)
+    if clear:
+        clear()
+
+
+def _fmt_date(value) -> str:
+    """dd-Mon-yyyy for a date / Timestamp; '' when missing."""
+    if value is None or (isinstance(value, float) and pd.isna(value)) or value is pd.NaT:
+        return ""
+    try:
+        return pd.Timestamp(value).strftime("%d-%b-%Y")
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def _po_line(label: str, po_no: str, po_date, weight, value) -> str:
+    """'**Forwarding PO:** JTSPL/JPO/26-27/00021 · 31-Aug-2026 · 10,800 kg · ₹13,84,800'"""
+    parts = [po_no]
+    if _fmt_date(po_date):
+        parts.append(_fmt_date(po_date))
+    if weight is not None and not pd.isna(weight):
+        parts.append(f"{float(weight):,.0f} kg")
+    if value is not None and not pd.isna(value):
+        parts.append(f"₹{float(value):,.0f}")
+    return f"**{label}:** " + " · ".join(parts)
+
+
+def _step_po_info(sc: dict) -> dict:
+    """What a saved chain step's card says about its transfer PO, from the
+    chain row as stored (never from the result of the save, so it is right
+    after a rerun and for steps saved in another session)."""
+    po_id = sc.get("transfer_po_id")
+    if po_id is None or pd.isna(po_id):
+        return {"po_state": "none"}
+    po_no = format_po_no(sc.get("transfer_po_no"), sc.get("co_prefix"),
+                         sc.get("branch_prefix"),
+                         None if pd.isna(sc.get("transfer_po_date")) else sc.get("transfer_po_date"))
+    marker = parse_marker(sc.get("transfer_po_note"))
+    ours = bool(marker and marker["role"] == ROLE_FORWARD
+                and marker["mr_id"] == int(sc["jute_mr_id"]))
+    return {
+        "po_state": "transfer" if ours else "erp",
+        "po_no": po_no or f"PO #{int(po_id)}",
+        "po_date": sc.get("transfer_po_date"),
+        "po_weight": sc.get("transfer_po_weight"),
+        "po_value": sc.get("transfer_po_value"),
+    }
 
 # Known Limitations:
 # 1. pct_rate_increase is back-calculated from rounded totals (rounding errors possible)
@@ -56,7 +175,17 @@ def transfer_chain_page():
     - Step 2+ are transfer steps (material moves between companies)
     - Each step can increase the rate by a %, which cascades downward
     - Select an MR row to edit its transfer chain
+    - Every saved step also gets a purchase order: a Forwarding PO at the
+      forwarding company, and a Final PO at the mill when the chain returns
+      (PO rate rounded to the nearest ₹50) — see the PO Tracker page
     """)
+
+    # Result of the last save / delete (queued before st.rerun()).
+    _render_flash()
+    if not transfer_po_enabled():
+        st.warning(
+            "Transfer PO creation is switched off — steps saved now will have no PO."
+        )
 
     # Render filters (this also populates session state keys)
     _render_filters()
@@ -191,7 +320,22 @@ def _render_mr_table(filter_key):
     - chains_map_{filter_key} — {mr_id: chain_df}
     - selected_row_{filter_key} — selected row index
     """
-    st.subheader("Monthly MR Overview")
+    head_col, reload_col = st.columns([4, 1])
+    with head_col:
+        st.subheader("Monthly MR Overview")
+    with reload_col:
+        if st.button("Reload", key=f"reload_{filter_key}",
+                     help="Read this month again from the database"):
+            # Data caches only: the selected row and the widgets stay.
+            data = (f"raw_df_{filter_key}", f"source_df_{filter_key}",
+                    f"line_items_{filter_key}", f"transfers_{filter_key}",
+                    f"chains_map_{filter_key}", f"orig_po_{filter_key}")
+            for key in [k for k in st.session_state if isinstance(k, str)
+                        and (k in data or k.startswith(f"step_line_items_{filter_key}_")
+                             or k.startswith(("pct_", "pct_input_")))]:
+                st.session_state.pop(key, None)
+            _clear_tracker_cache()
+            st.rerun()
 
     # Load data if not cached
     raw_df_key = f"raw_df_{filter_key}"
@@ -414,6 +558,24 @@ def _render_chain_editor(filter_key):
                     step["saved_mr_id"] = sc.get("jute_mr_id")
                     step["is_final_return"] = bool(sc.get("is_final_return"))
 
+                    # The step's transfer PO, as stored: the hop's linked PO,
+                    # or (returned step) the Final PO found by its marker.
+                    if step["is_final_return"]:
+                        final_po = po_queries.get_final_transfer_po(mr_id)
+                        if final_po:
+                            step.update(
+                                po_state="transfer",
+                                po_no=(final_po.get("po_no_formatted")
+                                       or f"PO #{int(final_po['jute_po_id'])}"),
+                                po_date=final_po.get("po_date"),
+                                po_weight=final_po.get("weight"),
+                                po_value=final_po.get("jute_po_value"),
+                            )
+                        else:
+                            step["po_state"] = "none"
+                    else:
+                        step.update(_step_po_info(sc))
+
                     # Back-calculate % rate increase (TODO: use DB column after migration)
                     current_total = float(sc.get("total_amount", 0))
                     if prev_total > 0:
@@ -483,6 +645,23 @@ def _render_chain_editor(filter_key):
     st.divider()
     st.subheader(f"Transfer Chain — {row.get('Jute Gate Entry No', 'N/A')} ({row.get('Jute Supplier', 'N/A')})")
     st.write(f"**Original Total:** ₹{orig_total:,.0f}")
+    # The mill's own ERP purchase order for this lorry (one read per selected
+    # MR, kept for the session): shown once here, not on every step card.
+    orig_po_cache = st.session_state.setdefault(f"orig_po_{filter_key}", {})
+    if mr_id not in orig_po_cache:
+        try:
+            orig_po_cache[mr_id] = get_original_po(mr_id)
+        except Exception:
+            pass                    # not cached: the next run tries again
+    orig_po = orig_po_cache.get(mr_id)
+    if orig_po:
+        orig_po_no = format_po_no(orig_po.get("po_no"), orig_po.get("co_prefix"),
+                                  orig_po.get("branch_prefix"),
+                                  None if pd.isna(orig_po.get("po_date")) else orig_po.get("po_date"))
+        st.write(f"**Original PO:** {orig_po_no or '—'}"
+                 + (f" · {_fmt_date(orig_po.get('po_date'))}" if _fmt_date(orig_po.get("po_date")) else ""))
+    else:
+        st.write("**Original PO:** —")
     # DEBUG: show step_li_map keys and saved_mr_ids
     _debug_saved_ids = {i: s.get("saved_mr_id") for i, s in enumerate(steps) if s.get("saved_mr_id")}
     _debug_li_map_keys = list(step_li_map.keys())
@@ -595,8 +774,31 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
             else:
                 st.write("● **Editing**")
 
-        # Row A: Challan Date, PO No., Warehouse, Transport toggle
-        col_ch, col_po, col_wh, col_tr = st.columns(4)
+        # The step's transfer PO (the original PO is in the chain header).
+        if is_saved:
+            po_label = "Final PO" if step.get("is_final_return") else "Forwarding PO"
+            po_state = step.get("po_state", "none")
+            if po_state == "transfer":
+                st.write(_po_line(po_label, step.get("po_no", ""), step.get("po_date"),
+                                  step.get("po_weight"), step.get("po_value")))
+                if step.get("is_final_return"):
+                    st.caption(
+                        "PO rate rounded to the nearest ₹50 — invoice "
+                        f"₹{float(step.get('total_amount') or 0):,.0f}"
+                    )
+            elif po_state == "erp":
+                st.write(f"**PO:** {step.get('po_no', '')} (linked in the ERP, not a transfer PO)")
+            elif any(float(li.get("weight") or 0) > 0 for li in (line_items or [])):
+                st.write(f"**{po_label}:** not created")
+                st.caption(
+                    "Saved before transfer POs were introduced (or while they "
+                    "were switched off); covered by the one-time backfill."
+                )
+            else:
+                st.write(f"**{po_label}:** not applicable — no accepted weight on this lorry")
+
+        # Row A: Challan Date, Warehouse, Transport toggle
+        col_ch, col_wh, col_tr = st.columns(3)
 
         with col_ch:
             challan_dt = source_row.get("Challan Date") if source_row is not None else None
@@ -604,13 +806,6 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 st.write(f"**Challan Date:** {challan_dt}")
             else:
                 st.write("**Challan Date:** —")
-
-        with col_po:
-            po_no = source_row.get("PO.No.") if source_row is not None else None
-            if po_no is not None and not (isinstance(po_no, float) and pd.isna(po_no)):
-                st.write(f"**PO No.:** {po_no}")
-            else:
-                st.write("**PO No.:** —")
 
         with col_wh:
             if is_saved:
@@ -681,7 +876,7 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 with col_lc2:
                     st.write(f"**LC Date:** {lc_dt or '—'}")
                 with col_lc3:
-                    st.write(f"**PO No. (LC):** {po_lc or '—'}")
+                    st.write(f"**LC order ref:** {po_lc or '—'}")
                 with col_lc4:
                     st.write(f"**Order Date (LC):** {od_lc or '—'}")
             elif step.get("company"):
@@ -707,7 +902,7 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                     )
                 with col_lc3:
                     step["po_no_for_lc"] = st.text_input(
-                        "PO No. for LC",
+                        "LC order ref",
                         value=step.get("po_no_for_lc", ""),
                         key=f"po_lc_{mr_id}_{step_index}",
                     )
@@ -775,28 +970,35 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 if saved_mr_id:
                     with st.spinner("Deleting steps and refreshing..."):
                         try:
-                            delete_chain_from_step(
+                            summary = delete_chain_from_step(
                                 root_mr_id=mr_id,
                                 from_mr_id=saved_mr_id,
                                 updated_by=st.session_state.get("user_id", 1),
-                            )
-                            st.success(f"Deleted steps from step {step_index + 1} onward.")
-                            for key in [
-                                f"transfers_{filter_key}",
-                                f"source_df_{filter_key}",
-                                f"line_items_{filter_key}",
-                                f"selected_row_{filter_key}",
-                                f"raw_df_{filter_key}",
-                                f"chains_map_{filter_key}",
-                                f"step_line_items_{filter_key}_{mr_id}",
-                            ]:
-                                if key in st.session_state:
-                                    del st.session_state[key]
+                            ) or {}
+                            removed_pos = summary.get("deleted_pos") or []
+                            po_text = ""
+                            if removed_pos:
+                                po_text = ("; transfer PO" + ("s " if len(removed_pos) > 1 else " ")
+                                           + ", ".join(removed_pos) + " removed")
+                            if not summary.get("deleted_mr_ids") and not summary.get("reverted"):
+                                _flash("warning", "Nothing was deleted: the chain had already "
+                                       "changed (another session?). The page now shows it as it is.")
+                            elif step.get("is_final_return"):
+                                _flash("success", "Un-finalized — the mill's MR is back to "
+                                       f"Pending and the invoice is removed{po_text}.")
+                            else:
+                                msg = f"Deleted from step {step_index + 1} — MR and invoice removed"
+                                if summary.get("reverted"):
+                                    msg += ", the mill's MR is back to Pending"
+                                _flash("success", msg + po_text + ".")
+                            _clear_tracker_cache()
+                            _drop_chain_state(filter_key, mr_id, keep_selection=False)
                             st.rerun()
                         except Exception as e:
                             st.error(f"Delete failed: {e}")
                 else:
                     st.error("Could not find saved MR ID for this step.")
+            st.caption("Also deletes the transfer PO of each deleted step.")
 
         elif step.get("company"):
             # Unsaved steps with company set: save, clear, or remove
@@ -809,12 +1011,32 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
             with col_clear:
                 if st.button("Clear", key=f"clear_{mr_id}_{step_index}"):
                     all_steps[step_index] = _empty_transfer_step()
+                    st.session_state.pop(f"pct_{mr_id}_{step_index}", None)
+                    st.session_state.pop(f"pct_input_{mr_id}_{step_index}", None)
                     st.rerun()
 
             with col_delete:
                 if st.button("Delete", key=f"delete_{mr_id}_{step_index}"):
                     all_steps.pop(step_index)
+                    for k in [k for k in st.session_state if isinstance(k, str)
+                              and k.startswith((f"pct_{mr_id}_", f"pct_input_{mr_id}_"))]:
+                        st.session_state.pop(k, None)
                     st.rerun()
+
+            if transfer_po_enabled():
+                _target = _company_branch_map().get(step.get("company", ""))
+                _returns = (
+                    step_index > 0 and _target is not None
+                    and _target == (st.session_state.get("selected_company_id"),
+                                    st.session_state.get("selected_branch_id"))
+                )
+                if _returns:
+                    st.caption(
+                        f"Saving also creates the Final PO at {step['company']} "
+                        "(takes the next PO number of that branch)."
+                    )
+                else:
+                    st.caption(f"Saving also creates the Forwarding PO at {step['company']}.")
 
         st.divider()
 
@@ -1032,19 +1254,24 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
         )
 
         # Clear cache to force reload on next render
-        cache_keys_to_clear = [
-            f"raw_df_{filter_key}",
-            f"source_df_{filter_key}",
-            f"line_items_{filter_key}",
-            f"transfers_{filter_key}",
-            f"chains_map_{filter_key}",
-            f"step_line_items_{filter_key}_{mr_id}",
-        ]
-        for key in cache_keys_to_clear:
-            if key in st.session_state:
-                del st.session_state[key]
+        _drop_chain_state(filter_key, mr_id)
+        _clear_tracker_cache()
 
-        st.success(f"Step {step_index + 1} saved!")
+        # Shown on the next run (a message written just before st.rerun()
+        # would never be seen).
+        po = (result or {}).get("po") or {}
+        if is_final and step_index > 0:
+            msg = f"Step {step_index + 1} saved — returned to {company_label}"
+            po_label = "Final PO"
+        else:
+            msg = f"Step {step_index + 1} saved — MR {transfer_step.mr_no} at {company_label}"
+            po_label = "Forwarding PO"
+        if po.get("po_id"):
+            _flash("success", f"{msg}, {po_label} {po.get('po_no_formatted') or po['po_id']} created.")
+        elif po.get("skipped"):
+            _flash("warning", f"{msg}. No transfer PO was created: {_skip_text(po['skipped'])}.")
+        else:
+            _flash("success", f"{msg}.")
         st.rerun()
 
     except Exception as e:

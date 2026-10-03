@@ -10,6 +10,7 @@ from src.jutetransfer.pages import (
     transfer_chain_page,
     company_pl_dashboard_page,
     warehouse_stock_page,
+    po_tracker_page,
 )
 
 
@@ -38,6 +39,7 @@ def display_sidebar():
                 "Select Page",
                 ["Dashboard", "Analytics",
                     "Transfer Chain (Vertical)",
+                    "PO Tracker",
                     "Warehouse Stock",
                     "Company P&L", "Schema Viewer"],
                 label_visibility="collapsed"
@@ -104,6 +106,8 @@ def main():
         analytics_page()
     elif page == "Transfer Chain (Vertical)":
         transfer_chain_page()
+    elif page == "PO Tracker":
+        po_tracker_page()
     elif page == "Warehouse Stock":
         warehouse_stock_page()
     elif page == "Company P&L":

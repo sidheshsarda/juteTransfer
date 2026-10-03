@@ -12,8 +12,12 @@ from typing import Optional
 
 from sqlalchemy import text
 
-from .database import DatabaseConnection
-from .jute_mr_chain_helpers import _calculate_line_item_amount, is_root_eligible_for_new_chain
+from . import po_ops
+from .database import DatabaseConnection, delete_by_ids, select_ids
+from .jute_mr_chain_helpers import (
+    _calculate_line_item_amount, _reconstruct_chain, hop_rate,
+    is_root_eligible_for_new_chain, step_multiplier,
+)
 from .lot_helpers import production_rate
 from .queries import get_source_mr_full, _get_financial_year_bounds
 
@@ -729,15 +733,13 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
         original_rate = float(li.get("rate") or 0)
 
         if use_new_rounding:
-            # Round at kg level (2 decimals), then convert back to quintal
-            raw_quintal = original_rate * rate_multiplier
-            rate_kg = float(Decimal(str(raw_quintal / 100.0))
-                            .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-            new_rate = rate_kg * 100
+            # Round at kg level (2 decimals), then convert back to quintal --
+            # in Decimal, exactly as the screen does (hop_rate).
+            new_rate, _ = hop_rate(original_rate, rate_multiplier)
             # Use shared function for amount (rounded to 2 decimals)
             total_price = _calculate_line_item_amount(accepted_weight, new_rate)
         else:
-            new_rate = float(Decimal(str(original_rate * rate_multiplier)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+            new_rate = float((Decimal(str(original_rate)) * Decimal(str(rate_multiplier))).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
             total_price = float(
                 (Decimal(str(accepted_weight)) * Decimal(str(new_rate)) / Decimal('100'))
                 .quantize(Decimal('1'), rounding=ROUND_HALF_UP)
@@ -968,16 +970,14 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         original_rate = float(li.get("rate") or 0)
 
         if use_new_rounding:
-            # Round at kg level (2 decimals), derive quintal rate from that
-            raw_quintal = original_rate * rate_multiplier
-            rate_in_kg = float(Decimal(str(raw_quintal / 100.0))
-                               .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-            new_rate = rate_in_kg * 100
+            # Round at kg level (2 decimals), derive quintal rate from that --
+            # in Decimal, exactly as the screen does (hop_rate).
+            new_rate, rate_in_kg = hop_rate(original_rate, rate_multiplier)
             # Use shared function for amount (rounded to 2 decimals)
             amount = _calculate_line_item_amount(accepted_weight, new_rate)
             unrounded_sum += Decimal(str(amount))
         else:
-            new_rate = float(Decimal(str(original_rate * rate_multiplier)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+            new_rate = float((Decimal(str(original_rate)) * Decimal(str(rate_multiplier))).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
             rate_in_kg = float(
                 (Decimal(str(new_rate)) / Decimal('100'))
                 .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
@@ -1149,6 +1149,107 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
 # Update original MR
 # ---------------------------------------------------------------------------
 
+# The ERP's money rules for an MR header, mirrored: vowerp3be
+# src/juteProcurement/mr.py (recompute_mr_money, calculate_mr_amounts,
+# calculate_tds_amount, get_cumulative_mr_value_for_party_in_fy) and totals.py
+# (compute_jute_totals). A header the app writes is then exactly the header the
+# ERP itself would write, so its bill pass list, view and save agree. Keep in
+# step with those functions.
+ERP_TDS_THRESHOLD = 5000000.0   # 194Q: purchases from one party in a FY
+ERP_TDS_RATE = 0.001
+
+
+def _erp_tds_amount(cumulative_previous: float, current_total: float) -> float:
+    """calculate_tds_amount: 0.1 % of what crosses Rs 50 lakh of the party's
+    approved MR value in the financial year."""
+    cumulative_after = cumulative_previous + current_total
+    if cumulative_after <= ERP_TDS_THRESHOLD:
+        return 0.0
+    if cumulative_previous >= ERP_TDS_THRESHOLD:
+        applicable = current_total
+    else:
+        applicable = cumulative_after - ERP_TDS_THRESHOLD
+    return round(applicable * ERP_TDS_RATE, 2)
+
+
+def _erp_jute_totals(total_amount, claim_amount, tds_amount) -> tuple:
+    """compute_jute_totals: (roundoff, net_total); the net is a whole rupee
+    (Python round, as in the ERP)."""
+    net_pre = round(
+        float(total_amount or 0) - float(claim_amount or 0) - float(tds_amount or 0), 2
+    )
+    roundoff = round(round(net_pre) - net_pre, 2)
+    return roundoff, round(net_pre + roundoff, 2)
+
+
+def _erp_money(conn, mr_id: int, tds_amount: Optional[float] = None,
+               cumulative_previous: Optional[float] = None) -> dict:
+    """The header money the ERP would compute for an MR from its active lines
+    (calculate_mr_amounts + calculate_tds_amount + compute_jute_totals) --
+    READ ONLY. tds_amount=None derives 194Q TDS as the ERP's approve and bill
+    pass do, from the party's other approved MRs in the FY of jute_mr_date --
+    or from cumulative_previous, when the caller knows what had been approved
+    before this MR (a repair of rows approved long ago: today every later MR
+    is approved too, and would wrongly count)."""
+    sums = conn.execute(text("""
+        SELECT COALESCE(SUM((COALESCE(accepted_weight, actual_weight, 0) / 100) * COALESCE(rate, 0)), 0),
+               COALESCE(SUM((COALESCE(accepted_weight, actual_weight, 0) / 100) * COALESCE(claim_rate, 0)), 0)
+        FROM jute_mr_li WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL)
+    """), {"id": mr_id}).fetchone()
+    raw_total, raw_claim = float(sums[0] or 0), float(sums[1] or 0)
+    total_amount, claim_amount = round(raw_total, 2), round(raw_claim, 2)
+    if tds_amount is None and cumulative_previous is not None:
+        tds_amount = _erp_tds_amount(float(cumulative_previous), raw_total)
+    if tds_amount is None:
+        hdr = conn.execute(text(
+            "SELECT party_id, jute_mr_date FROM jute_mr WHERE jute_mr_id = :id"
+        ), {"id": mr_id}).fetchone()
+        cumulative = 0.0
+        if hdr and hdr[0] and hdr[1]:
+            mr_date = hdr[1].date() if isinstance(hdr[1], datetime) else hdr[1]
+            fy_start, fy_end = _get_financial_year_bounds(mr_date)
+            cumulative = float(conn.execute(text("""
+                SELECT COALESCE(SUM(COALESCE(total_amount, 0)), 0)
+                FROM jute_mr
+                WHERE party_id = :party AND status_id = 3
+                  AND jute_mr_date IS NOT NULL
+                  AND jute_mr_date BETWEEN :fy_start AND :fy_end
+                  AND jute_mr_id <> :id
+            """), {"party": str(hdr[0]), "fy_start": fy_start.strftime("%Y-%m-%d"),
+                   "fy_end": fy_end.strftime("%Y-%m-%d"), "id": mr_id}).scalar() or 0)
+        tds_amount = _erp_tds_amount(cumulative, raw_total)
+    tds_amount = round(float(tds_amount), 2)
+    roundoff, net_total = _erp_jute_totals(total_amount, claim_amount, tds_amount)
+    return {"total_amount": total_amount, "claim_amount": claim_amount,
+            "tds_amount": tds_amount, "roundoff": roundoff, "net_total": net_total}
+
+
+def _erp_recompute_money(conn, mr_id: int, tds_amount: Optional[float] = None) -> dict:
+    """recompute_mr_money on the caller's connection: active lines' total_price
+    = ROUND(accepted / 100 x rate, 2), then the header from _erp_money. Call
+    it after party / date / status are written (TDS depends on them). A
+    Pending hand-off carries tds_amount=0."""
+    line_ids = select_ids(conn, """
+        SELECT jute_mr_li_id FROM jute_mr_li
+        WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL)
+    """, {"id": mr_id})
+    if line_ids:
+        conn.execute(text(f"""
+            UPDATE jute_mr_li
+            SET total_price = ROUND((COALESCE(accepted_weight, actual_weight, 0) / 100)
+                                    * COALESCE(rate, 0), 2)
+            WHERE jute_mr_li_id IN ({','.join(str(i) for i in line_ids)})
+        """))
+    money = _erp_money(conn, mr_id, tds_amount)
+    conn.execute(text("""
+        UPDATE jute_mr
+        SET total_amount = :total_amount, claim_amount = :claim_amount,
+            tds_amount = :tds_amount, roundoff = :roundoff, net_total = :net_total
+        WHERE jute_mr_id = :id
+    """), {**money, "id": mr_id})
+    return money
+
+
 def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
                          final_party_id: int, final_party_branch_id: Optional[int],
                          source_mr: dict, branch_id: int,
@@ -1199,14 +1300,12 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
         accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
 
         if use_new_rounding:
-            # Round at kg level (2 decimals), then convert back to quintal
-            raw_quintal = base_rate * rate_multiplier
-            rate_kg = float(Decimal(str(raw_quintal / 100.0))
-                            .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-            new_rate = rate_kg * 100
+            # Round at kg level (2 decimals), then convert back to quintal --
+            # in Decimal, exactly as the screen does (hop_rate).
+            new_rate, _ = hop_rate(base_rate, rate_multiplier)
             new_total_price = _calculate_line_item_amount(accepted_weight, new_rate)
         else:
-            new_rate = float(Decimal(str(base_rate * rate_multiplier)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+            new_rate = float((Decimal(str(base_rate)) * Decimal(str(rate_multiplier))).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
             new_total_price = float(
                 (Decimal(str(accepted_weight)) * Decimal(str(new_rate)) / Decimal('100'))
                 .quantize(Decimal('1'), rounding=ROUND_HALF_UP)
@@ -1264,10 +1363,6 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
             bill_pass_no = :bill_pass_no,
             bill_pass_date = :mr_date,
             status_id = :status_id,
-            total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)),
-            roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)) -
-                       (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)),
-            net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)) - claim_amount,
             updated_by = :updated_by,
             updated_date_time = NOW()
             {optional_sql}
@@ -1283,9 +1378,85 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
         "updated_by": updated_by,
         "mr_id": jute_mr_id,
     })
+    # Money exactly as the ERP's approve would write it (line totals, claim
+    # from the lines, 194Q TDS for the new party, roundoff, net). It used to
+    # leave claim and net NULL, so the P&L read the purchase as 0.
+    _erp_recompute_money(conn, jute_mr_id)
 
 
-def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by: int) -> None:
+def _derive_original_party(conn, root_mr_id: int, step1_source_mr: dict):
+    """(party_id, party_branch_id) the root most likely had before finalize,
+    for a chain finalized without a remembering Final PO; None if unknown.
+
+    Step 1 copied the root's party into the first forwarding company BY NAME
+    (_ensure_supplier_party), so the same name in the root's own company
+    leads back to it. Same-name duplicates: the root's PO party, else the
+    one mapped to the root's jute supplier, else the lowest id."""
+    hop_party = str(step1_source_mr.get("party_id") or "").strip()
+    if not hop_party.isdigit():
+        return None
+    name_row = conn.execute(text(
+        "SELECT supp_name FROM party_mst WHERE party_id = :pid"
+    ), {"pid": int(hop_party)}).fetchone()
+    if not name_row or not name_row[0]:
+        return None
+    root = conn.execute(text("""
+        SELECT r.party_id, r.party_branch_id, r.po_id, r.jute_supplier_id, bm.co_id
+        FROM jute_mr r JOIN branch_mst bm ON bm.branch_id = r.branch_id
+        WHERE r.jute_mr_id = :id
+    """), {"id": root_mr_id}).fetchone()
+    if not root:
+        return None
+    root = root._mapping
+    candidates = [int(r[0]) for r in conn.execute(text("""
+        SELECT party_id FROM party_mst
+        WHERE co_id = :co AND LOWER(TRIM(supp_name)) = LOWER(TRIM(:name))
+        ORDER BY party_id
+    """), {"co": root["co_id"], "name": name_row[0]}).fetchall()]
+    if not candidates:
+        return None
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        po_party = conn.execute(text(
+            "SELECT party_id FROM jute_po WHERE jute_po_id = :id"
+        ), {"id": root["po_id"] or 0}).scalar()
+        mapped = [int(r[0]) for r in conn.execute(text("""
+            SELECT party_id FROM jute_supp_party_map
+            WHERE co_id = :co AND jute_supplier_id = :sid ORDER BY map_id
+        """), {"co": root["co_id"], "sid": root["jute_supplier_id"] or 0}).fetchall()
+            if r[0] is not None]
+        if po_party in candidates:
+            chosen = int(po_party)
+        else:
+            chosen = next((m for m in mapped if m in candidates), candidates[0])
+    if str(chosen) == str(root["party_id"]).strip():
+        return str(chosen), root["party_branch_id"]
+    branch = conn.execute(text("""
+        SELECT party_mst_branch_id FROM party_branch_mst
+        WHERE party_id = :pid ORDER BY party_mst_branch_id LIMIT 1
+    """), {"pid": chosen}).scalar()
+    return str(chosen), branch
+
+
+def _original_header(conn, root_mr_id: int, step1_source_mr: dict) -> dict:
+    """Header values to put back on un-finalize, by column (a column left out
+    is left as it is).
+
+    Exact when the chain's Final PO remembered them at finalize
+    (po_ops.final_po_original). Otherwise (finalized before transfer POs, or
+    with them switched off): the party derived from step 1, and jute_mr_date
+    back to NULL -- the state of a Pending (13) hand-off MR in the ERP."""
+    remembered = po_ops.final_po_original(conn, root_mr_id)
+    if remembered is not None:
+        return dict(remembered)
+    out = {"jute_mr_date": None}
+    derived = _derive_original_party(conn, root_mr_id, step1_source_mr or {})
+    if derived:
+        out["party_id"], out["party_branch_id"] = derived
+    return out
+
+
+def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by: int) -> list:
     """Revert the original MR to its pre-finalization state.
 
     Restores line item rates from Step 1 (the first transferred MR's snapshot,
@@ -1293,9 +1464,10 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
     clears invoice_no/invoice_date/invoice_amount (which finalization wrote
     from the last seller's sales_invoice), sets status_id back to Pending (13,
     decision D3 2026-09-03 — never 0, never 1: 13 is the ERP hand-off state).
-    Does NOT touch party_id/party_branch_id —
-    the original supplier party is not reliably recoverable, and leaving the
-    current party in place is safe (a re-finalize will overwrite it correctly).
+    Also puts back the header fields finalize overwrote -- party_id,
+    party_branch_id, jute_mr_date -- see _original_header. (They used to stay
+    on the last seller, and a chain restarted afterwards copied the sister
+    company as the jute supplier.)
 
     Args:
         conn: Active SQLAlchemy connection inside a transaction.
@@ -1306,7 +1478,16 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             the root MR's line items (1:1 — both were cloned from the same
             source).
         updated_by: User id for audit columns.
+
+    Returns the Final PO(s) removed with the revert (po_ops.delete_final_po).
     """
+    # What finalize overwrote on the header, read before its Final PO goes.
+    original = _original_header(conn, jute_mr_id, step1_source_mr)
+
+    # The Final PO written at finalize goes first: if it cannot be removed
+    # (an ERP user booked another MR against it) nothing else is touched.
+    deleted_final_pos = po_ops.delete_final_po(conn, jute_mr_id)
+
     # Load root MR's line items in stable order for positional matching
     root_lis = conn.execute(
         text("SELECT jute_mr_li_id, accepted_weight FROM jute_mr_li "
@@ -1323,10 +1504,10 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
         li_id = root_li[0]
         accepted_weight = round(float(root_li[1] or 0), 0)
         rate = float(step1_li.get("rate") or 0)
-        new_total = float(
-            (Decimal(str(accepted_weight)) * Decimal(str(rate)) / Decimal('100'))
-            .quantize(Decimal('1'), rounding=ROUND_HALF_UP)
-        )
+        # In paise, like finalize and the ERP's own MR save
+        # (ROUND(accepted/100 * rate, 2), vowerp3be mr.py) -- whole rupees
+        # here used to change the restored line by up to 50 paise.
+        new_total = _calculate_line_item_amount(accepted_weight, rate)
 
         conn.execute(text("""
             UPDATE jute_mr_li SET
@@ -1336,8 +1517,8 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
 
     # Restore header: clear branch_mr_no/bill_pass_*, clear invoice_no/date/amount
     # (which finalization wrote from the last hop's sales_invoice), status back
-    # to Pending, recompute totals. Do NOT touch party_id/party_branch_id or
-    # mukam_id. Also restore challan_no / challan_date from Step 1's MR: Step 1 preserved
+    # to Pending, recompute totals, put back party / party branch / MR date.
+    # mukam_id is never touched. Also restore challan_no / challan_date from Step 1's MR: Step 1 preserved
     # the original gate-entry challan because _create_mr falls back to
     # source_mr's values when no override is supplied. Finalization overwrote
     # them with the last hop's invoice challan, so we need to put the original
@@ -1353,6 +1534,10 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
     if step1_challan_date is not None:
         revert_assignments.append("challan_date = :challan_date")
         revert_params["challan_date"] = step1_challan_date
+    for col in ("party_id", "party_branch_id", "jute_mr_date"):
+        if col in original:
+            revert_assignments.append(f"{col} = :orig_{col}")
+            revert_params[f"orig_{col}"] = original[col]
 
     revert_sql = (", " + ", ".join(revert_assignments)) if revert_assignments else ""
 
@@ -1365,15 +1550,15 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
             invoice_date = NULL,
             invoice_amount = NULL,
             status_id = 13,
-            total_amount = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)),
-            roundoff = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)) -
-                       (SELECT COALESCE(SUM(total_price), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)),
-            net_total = (SELECT ROUND(COALESCE(SUM(total_price), 0), 0) FROM jute_mr_li WHERE jute_mr_id = :mr_id AND (active = 1 OR active IS NULL)) - claim_amount,
             updated_by = :updated_by,
             updated_date_time = NOW()
             {revert_sql}
         WHERE jute_mr_id = :mr_id
     """), revert_params)
+    # Money as the ERP's own Pending hand-off writes it: recomputed from the
+    # restored lines, no TDS before approval.
+    _erp_recompute_money(conn, jute_mr_id, tds_amount=0.0)
+    return deleted_final_pos
 
 
 # ---------------------------------------------------------------------------
@@ -1413,12 +1598,28 @@ def save_transfer_step(
             Used by _update_original_mr to find the correct jute_mr_li_id rows.
 
     Returns:
-        dict with keys: mr_id (int or None), invoice_id (int or None)
+        dict with keys: mr_id (int or None), invoice_id (int or None),
+        po (the transfer PO written with this step — see po_ops — or None)
     """
     mr_id = None
     invoice_id = None
+    po = None
+    # Exact Decimal multiplier (1 + pct/100) when the step carries the % the
+    # user typed; the float rate_multiplier otherwise. Posting then uses the
+    # same arithmetic as the screen (see jute_mr_chain_helpers.hop_rate).
+    rate_multiplier = step_multiplier(step.pct_rate_increase, rate_multiplier)
 
     with DatabaseConnection.get_transaction() as conn:
+        # Lock the root first: serialises every save / delete on this chain,
+        # so a stale second tab cannot fork it or finalize it twice.
+        root_row = conn.execute(
+            text("SELECT status_id, branch_mr_no FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE"),
+            {"id": root_mr_id},
+        ).fetchone()
+        if not root_row:
+            raise ValueError(f"Root MR {root_mr_id} not found")
+        root_status, root_branch_mr_no = root_row[0], root_row[1]
+
         source_mr = get_source_mr_full(source_mr_id, conn=conn)
         if not source_mr:
             raise ValueError(f"Source MR {source_mr_id} not found")
@@ -1428,14 +1629,37 @@ def save_transfer_step(
         # guard in pages/new_transfer_chain.py — the UI can be bypassed on
         # a rerun, this cannot.
         if is_first_step:
-            root_status = conn.execute(
-                text("SELECT status_id FROM jute_mr WHERE jute_mr_id = :id"),
-                {"id": root_mr_id},
-            ).scalar()
             if not is_root_eligible_for_new_chain(root_status):
                 raise ValueError(
                     f"Root MR {root_mr_id} is not Pending (13) in the ERP; "
                     f"cannot start a new transfer chain (status={root_status})"
+                )
+            if conn.execute(
+                text("SELECT 1 FROM jute_mr WHERE src_jute_mr_id = :root "
+                     "AND transfer_mode = 0 LIMIT 1"),
+                {"root": root_mr_id},
+            ).fetchone():
+                raise ValueError(
+                    f"Root MR {root_mr_id} already has a transfer chain "
+                    "(saved from another session?); refresh the page"
+                )
+        else:
+            # A later step must continue the chain as it stands NOW: a stale
+            # tab or a double save would otherwise add a hop after the
+            # finalize, or a second hop to the same seller.
+            if root_branch_mr_no is not None:
+                raise ValueError(
+                    f"Root MR {root_mr_id} is already finalized; refresh the page"
+                )
+            newest = conn.execute(
+                text("SELECT MAX(jute_mr_id) FROM jute_mr WHERE src_jute_mr_id = :root "
+                     "AND transfer_mode = 0"),
+                {"root": root_mr_id},
+            ).scalar()
+            if newest is None or int(newest) != int(source_mr_id):
+                raise ValueError(
+                    f"The transfer chain of MR {root_mr_id} has changed since this page "
+                    "was loaded (saved from another session?); refresh the page"
                 )
 
         # Assign MR number inside transaction
@@ -1456,6 +1680,8 @@ def save_transfer_step(
                 challan_date=step.challan_date,
                 use_new_rounding=use_new_rounding,
             )
+            # The forwarding company's PO on the original supplier.
+            po = po_ops.create_forward_po(conn, mr_id, updated_by)
         else:
             # Intermediate or final: create invoice from seller, then MR for buyer
             # 1. Ensure buyer exists as party in seller's company
@@ -1517,6 +1743,13 @@ def save_transfer_step(
                 )
                 if ensured_branch_id is not None:
                     last_seller_party_branch_id = ensured_branch_id
+                # What finalize is about to overwrite on the root's header; the
+                # Final PO remembers it so un-finalize can put it back.
+                original_header = {
+                    "party_id": root_mr.get("party_id"),
+                    "party_branch_id": root_mr.get("party_branch_id"),
+                    "jute_mr_date": root_mr.get("jute_mr_date"),
+                }
                 # Inherit challan_no/challan_date from the previous hop's invoice,
                 # mirroring the non-final branch below. mukam_id is preserved
                 # (not in the UPDATE inside _update_original_mr).
@@ -1531,6 +1764,11 @@ def save_transfer_step(
                     challan_date=step.challan_date or inv_challan_date,
                     seller_invoice=seller_invoice,
                 )
+                # The origin's final PO on the last forwarding company, from
+                # the root's lines as just re-priced. The root MR itself keeps
+                # its original ERP PO (owner decision 2026-10-01).
+                po = po_ops.create_final_po(conn, root_mr_id_for_update, updated_by,
+                                            original=original_header)
             else:
                 # Create MR for buyer
                 seller_party_id, seller_party_branch_id = _ensure_company_as_party(
@@ -1548,82 +1786,142 @@ def save_transfer_step(
                     seller_invoice=seller_invoice,
                     use_new_rounding=use_new_rounding,
                 )
+                # The buyer's PO on the selling company.
+                po = po_ops.create_forward_po(conn, mr_id, updated_by)
 
-    return {"mr_id": mr_id, "invoice_id": invoice_id}
+    return {"mr_id": mr_id, "invoice_id": invoice_id, "po": po}
 
 
-def delete_transfer_step(jute_mr_id: int, updated_by: int) -> None:
-    """Delete a transfer MR and its associated invoices.
+def _invoice_ids_for_mr(conn, mr_id: int) -> list:
+    """Raw-Jute invoices hanging off an MR through sales_invoice_jute.mr_id."""
+    rows = conn.execute(
+        text("SELECT invoice_id FROM sales_invoice_jute WHERE mr_id = :mr_id"),
+        {"mr_id": mr_id},
+    ).fetchall()
+    return [r[0] for r in rows]
 
-    Invoices created for this step are linked to the PREVIOUS step's MR,
-    so this deletes:
-    1. Invoices directly linked to this MR
-    2. Invoices linked to the previous MR (created as input to this step)
+
+def _delete_invoice(conn, invoice_id: int) -> None:
+    """Hard-delete one chain invoice from all four of its tables (the claim
+    breakdown in sales_invoice_jute_dtl has no FK and used to be left behind),
+    each by primary key -- see database.delete_by_ids."""
+    dtl_ids = select_ids(conn, """
+        SELECT invoice_line_item_id FROM sales_invoice_dtl WHERE invoice_id = :id
+    """, {"id": invoice_id})
+    if dtl_ids:
+        delete_by_ids(conn, "sales_invoice_jute_dtl", "sales_invoice_jute_dtl_id", select_ids(
+            conn,
+            "SELECT sales_invoice_jute_dtl_id FROM sales_invoice_jute_dtl "
+            f"WHERE invoice_line_item_id IN ({','.join(str(i) for i in dtl_ids)})",
+        ))
+    delete_by_ids(conn, "sales_invoice_jute", "sales_invoice_jute_id", select_ids(
+        conn, "SELECT sales_invoice_jute_id FROM sales_invoice_jute WHERE invoice_id = :id",
+        {"id": invoice_id}))
+    delete_by_ids(conn, "sales_invoice_dtl", "invoice_line_item_id", dtl_ids)
+    conn.execute(text("DELETE FROM sales_invoice WHERE invoice_id = :id"), {"id": invoice_id})
+
+
+def _assert_step_deletable(conn, jute_mr_id: int) -> None:
+    """Refuse when this step already has ERP issue entries drawn against it
+    (consumption started) -- deleting it would orphan the issues."""
+    issued = conn.execute(text(
+        "SELECT 1 FROM jute_issue ji JOIN jute_mr_li li ON li.jute_mr_li_id = ji.jute_mr_li_id "
+        "WHERE li.jute_mr_id = :id AND COALESCE(ji.status_id, 0) <> 4 LIMIT 1"), {"id": jute_mr_id}).fetchone()
+    if issued:
+        raise ValueError("This transfer step has ERP issue entries (consumption started); cannot delete")
+
+
+def _delete_transfer_step_in_txn(conn, jute_mr_id: int, updated_by: int) -> Optional[dict]:
+    """Delete one chain hop on the caller's connection: the invoices booked
+    for it, its transfer PO, its lines and its header.
+
+    Invoices created for a step are linked to the PREVIOUS step's MR (the
+    seller), so this deletes:
+    1. Invoices directly linked to this MR (the sale onward / the finalize
+       invoice when this is the last seller)
+    2. Invoices linked to the previous MR (the sale that created this step)
+
+    Returns the Forwarding PO removed with the step ({'po_id',
+    'po_no_formatted'}) or None.
     """
+    mr_info = conn.execute(
+        text("SELECT src_jute_mr_id, transfer_mode FROM jute_mr WHERE jute_mr_id = :id"),
+        {"id": jute_mr_id},
+    ).fetchone()
+
+    if not mr_info:
+        return None
+
+    root_mr_id, transfer_mode = mr_info
+    if root_mr_id is None or int(transfer_mode or 0) != 0:
+        # Never hard-delete a gate-entry (ERP) MR or a marked child from here.
+        raise ValueError(f"MR {jute_mr_id} is not a vertical-chain step; cannot delete")
+
+    _assert_step_deletable(conn, jute_mr_id)
+
+    # Previous MR in the chain. Hops are inserted in chain order, so it is the
+    # highest id below this one (a branch comparison picks the wrong MR when
+    # the same branch appears twice in a chain).
+    # mode-1 marked children share src_jute_mr_id; never chain rows
+    prev_mr_row = conn.execute(
+        text("""SELECT jute_mr_id FROM jute_mr
+                WHERE src_jute_mr_id = :root AND jute_mr_id < :id
+                AND transfer_mode = 0
+                ORDER BY jute_mr_id DESC LIMIT 1"""),
+        {"root": root_mr_id, "id": jute_mr_id},
+    ).fetchone()
+    prev_mr_id = prev_mr_row[0] if prev_mr_row else None
+
+    invoice_ids_to_delete = set(_invoice_ids_for_mr(conn, jute_mr_id))
+    if prev_mr_id:
+        invoice_ids_to_delete.update(_invoice_ids_for_mr(conn, prev_mr_id))
+    for inv_id in sorted(invoice_ids_to_delete):
+        _delete_invoice(conn, inv_id)
+
+    # The step's Forwarding PO goes with it (raises if an ERP user has since
+    # booked another MR against that PO).
+    deleted_po = po_ops.delete_forward_po(conn, jute_mr_id)
+
+    # Delete MR line items and MR (lines by primary key: no gap locks on the
+    # jute_mr_id index, where ERP gate entries insert new lines)
+    delete_by_ids(conn, "jute_mr_li", "jute_mr_li_id", select_ids(
+        conn, "SELECT jute_mr_li_id FROM jute_mr_li WHERE jute_mr_id = :id", {"id": jute_mr_id}))
+    conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"), {"id": jute_mr_id})
+    return deleted_po
+
+
+def delete_transfer_step(jute_mr_id: int, updated_by: int) -> Optional[dict]:
+    """Delete a transfer MR with its invoices and transfer PO, in one
+    transaction with its root locked first (like every other chain write).
+    See _delete_transfer_step_in_txn."""
     with DatabaseConnection.get_transaction() as conn:
-        # Get info about the MR being deleted
-        mr_info = conn.execute(
-            text("SELECT src_jute_mr_id, branch_id FROM jute_mr WHERE jute_mr_id = :id"),
+        root = conn.execute(
+            text("SELECT src_jute_mr_id FROM jute_mr WHERE jute_mr_id = :id"),
             {"id": jute_mr_id},
-        ).fetchone()
-
-        if not mr_info:
-            return
-
-        # Refuse when this step already has ERP issue entries drawn against
-        # it (consumption started) — deleting it would orphan the issues.
-        issued = conn.execute(text(
-            "SELECT 1 FROM jute_issue ji JOIN jute_mr_li li ON li.jute_mr_li_id = ji.jute_mr_li_id "
-            "WHERE li.jute_mr_id = :id AND COALESCE(ji.status_id, 0) <> 4 LIMIT 1"), {"id": jute_mr_id}).fetchone()
-        if issued:
-            raise ValueError("This transfer step has ERP issue entries (consumption started); cannot delete")
-
-        root_mr_id, current_branch_id = mr_info
-
-        # Find the previous MR in the chain (same root, different branch, most recent)
-        # mode-1 marked children share src_jute_mr_id; never chain rows
-        prev_mr_result = conn.execute(
-            text("""SELECT jute_mr_id FROM jute_mr
-                    WHERE src_jute_mr_id = :root AND branch_id != :bid
-                    AND transfer_mode = 0
-                    ORDER BY jute_mr_id DESC LIMIT 1"""),
-            {"root": root_mr_id, "bid": current_branch_id},
-        )
-        prev_mr_row = prev_mr_result.fetchone()
-        prev_mr_id = prev_mr_row[0] if prev_mr_row else None
-
-        # Collect all invoices to delete
-        invoice_ids_to_delete = set()
-
-        # Find invoices linked to the current MR
-        inv_rows = conn.execute(
-            text("SELECT invoice_id FROM sales_invoice_jute WHERE mr_id = :mr_id"),
-            {"mr_id": jute_mr_id},
-        ).fetchall()
-        for inv_row in inv_rows:
-            invoice_ids_to_delete.add(inv_row[0])
-
-        # Find invoices linked to the previous MR (sale invoices created as input to this step)
-        if prev_mr_id:
-            prev_inv_rows = conn.execute(
-                text("SELECT invoice_id FROM sales_invoice_jute WHERE mr_id = :mr_id"),
-                {"mr_id": prev_mr_id},
-            ).fetchall()
-            for inv_row in prev_inv_rows:
-                invoice_ids_to_delete.add(inv_row[0])
-
-        # Delete all invoices
-        for inv_id in invoice_ids_to_delete:
-            conn.execute(text("DELETE FROM sales_invoice_jute WHERE invoice_id = :id"), {"id": inv_id})
-            conn.execute(text("DELETE FROM sales_invoice_dtl WHERE invoice_id = :id"), {"id": inv_id})
-            conn.execute(text("DELETE FROM sales_invoice WHERE invoice_id = :id"), {"id": inv_id})
-
-        # Delete MR line items and MR
-        conn.execute(text("DELETE FROM jute_mr_li WHERE jute_mr_id = :id"), {"id": jute_mr_id})
-        conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"), {"id": jute_mr_id})
+        ).scalar()
+        if root is not None:
+            conn.execute(
+                text("SELECT jute_mr_id FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE"),
+                {"id": int(root)},
+            )
+        return _delete_transfer_step_in_txn(conn, jute_mr_id, updated_by)
 
 
-def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) -> None:
+def _chain_rows(conn, root_mr_id: int) -> list:
+    """Chain hop MRs of a root, on the caller's connection (the columns
+    _reconstruct_chain needs; same filter as queries.get_transfer_chain)."""
+    rows = conn.execute(text("""
+        SELECT mr.jute_mr_id, mr.src_com_id, mr.branch_id, bm.co_id AS owner_co_id
+        FROM jute_mr mr
+        JOIN branch_mst bm ON mr.branch_id = bm.branch_id
+        WHERE mr.src_jute_mr_id = :root_id
+        AND mr.transfer_mode = 0
+        ORDER BY mr.jute_mr_id ASC
+    """), {"root_id": root_mr_id}).fetchall()
+    return [dict(r._mapping) for r in rows]
+
+
+def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) -> dict:
     """Delete chain steps from a given point onward, OR revert finalization.
 
     Special case: if from_mr_id == root_mr_id, the caller is "unfinalizing"
@@ -1634,22 +1932,34 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
     Otherwise: cascade-delete transfer rows from from_mr_id onward (in
     reverse chain order), and if the chain was finalized, additionally
     revert the root MR.
+
+    Everything -- reads, guards, deletes, the root update -- runs in ONE
+    transaction with the root row locked, so a failure on any step leaves
+    the chain exactly as it was.
+
+    Returns what was removed: {'deleted_mr_ids': [...], 'deleted_pos':
+    [printed PO numbers], 'reverted': bool} (all empty/False on a no-op).
     """
-    from .queries import get_transfer_chain
-    from .jute_mr_chain_helpers import _reconstruct_chain
-
-    root_mr = get_source_mr_full(root_mr_id)
-    if not root_mr:
-        return
-
-    chain_df = get_transfer_chain(root_mr_id)
-    if chain_df is None or chain_df.empty:
-        return
-
-    chain_mrs = chain_df.to_dict("records")
-
-    # Derive root co_id
+    summary = {"deleted_mr_ids": [], "deleted_pos": [], "reverted": False}
     with DatabaseConnection.get_transaction() as conn:
+        # Lock the root first: serialises this against any concurrent save
+        # or delete on the same chain.
+        locked = conn.execute(
+            text("SELECT jute_mr_id FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE"),
+            {"id": root_mr_id},
+        ).fetchone()
+        if not locked:
+            return summary
+
+        root_mr = get_source_mr_full(root_mr_id, conn=conn)
+        if not root_mr:
+            return summary
+
+        chain_mrs = _chain_rows(conn, root_mr_id)
+        if not chain_mrs:
+            return summary
+
+        # Derive root co_id
         root_branch = int(root_mr.get("branch_id") or 0)
         root_co_row = conn.execute(
             text("SELECT co_id FROM branch_mst WHERE branch_id = :bid"),
@@ -1657,68 +1967,63 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
         ).fetchone()
         root_co_id = root_co_row[0] if root_co_row else 0
 
-    ordered = _reconstruct_chain(chain_mrs, root_co_id)
+        ordered = _reconstruct_chain(chain_mrs, root_co_id)
 
-    was_complete = root_mr.get("branch_mr_no") is not None
+        was_complete = root_mr.get("branch_mr_no") is not None
 
-    # Snapshot Step 1 BEFORE any deletes (Step 1 = first transferred MR).
-    step1_source_mr = None
-    if ordered:
-        step1_id = ordered[0]["jute_mr_id"]
-        step1_source_mr = get_source_mr_full(step1_id)
+        # Snapshot Step 1 BEFORE any deletes (Step 1 = first transferred MR).
+        step1_source_mr = None
+        if ordered:
+            step1_id = ordered[0]["jute_mr_id"]
+            step1_source_mr = get_source_mr_full(step1_id, conn=conn)
 
-    # Branch A: root-return revert only (unfinalize the synthetic final step)
-    if from_mr_id == root_mr_id:
-        if not was_complete:
-            return
-        if step1_source_mr is None:
-            return
-        # The finalization invoice was created with sales_invoice_jute.mr_id =
-        # the last seller's MR (last entry of the reconstructed chain). Delete
-        # those invoice rows in the same transaction as the root-MR revert so
-        # nothing orphans if either step fails.
-        last_seller_mr_id = ordered[-1]["jute_mr_id"] if ordered else None
-        with DatabaseConnection.get_transaction() as conn:
-            if last_seller_mr_id is not None:
-                inv_rows = conn.execute(
-                    text("SELECT invoice_id FROM sales_invoice_jute "
-                         "WHERE mr_id = :mr_id"),
-                    {"mr_id": last_seller_mr_id},
-                ).fetchall()
-                for (inv_id,) in inv_rows:
-                    conn.execute(text(
-                        "DELETE FROM sales_invoice_jute WHERE invoice_id = :id"
-                    ), {"id": inv_id})
-                    conn.execute(text(
-                        "DELETE FROM sales_invoice_dtl WHERE invoice_id = :id"
-                    ), {"id": inv_id})
-                    conn.execute(text(
-                        "DELETE FROM sales_invoice WHERE invoice_id = :id"
-                    ), {"id": inv_id})
-            revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
-        return
+        # Branch A: root-return revert only (unfinalize the synthetic final step)
+        if from_mr_id == root_mr_id:
+            if not was_complete:
+                return summary
+            if step1_source_mr is None:
+                return summary
+            # The finalization invoice was created with sales_invoice_jute.mr_id =
+            # the last seller's MR (last entry of the reconstructed chain).
+            last_seller_mr_id = ordered[-1]["jute_mr_id"]
+            for inv_id in _invoice_ids_for_mr(conn, last_seller_mr_id):
+                _delete_invoice(conn, inv_id)
+            finals = revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
+            summary["deleted_pos"] = [p["po_no_formatted"] for p in finals]
+            summary["reverted"] = True
+            return summary
 
-    # Branch B: middle-step cascade delete
-    from_idx = next((i for i, m in enumerate(ordered) if m["jute_mr_id"] == from_mr_id), None)
-    if from_idx is None:
-        return
+        # Branch B: middle-step cascade delete
+        from_idx = next((i for i, m in enumerate(ordered) if m["jute_mr_id"] == from_mr_id), None)
+        if from_idx is None:
+            return summary
 
-    to_delete = ordered[from_idx:]
-    for mr in reversed(to_delete):
-        delete_transfer_step(mr["jute_mr_id"], updated_by)
+        to_delete = ordered[from_idx:]
+        # Every guard for every step before the first DELETE.
+        for mr in to_delete:
+            _assert_step_deletable(conn, mr["jute_mr_id"])
+        for mr in reversed(to_delete):
+            deleted_po = _delete_transfer_step_in_txn(conn, mr["jute_mr_id"], updated_by)
+            summary["deleted_mr_ids"].append(mr["jute_mr_id"])
+            if deleted_po:
+                summary["deleted_pos"].append(deleted_po["po_no_formatted"])
 
-    if from_idx == 0:
-        # Whole chain rolled back from Step 1: root returns to Pending (13) —
-        # the ERP hand-off state, never Open (decision D3 2026-09-03).
-        with DatabaseConnection.get_transaction() as conn:
+        if was_complete and step1_source_mr is not None:
+            # The chain was finalized: whichever step the delete started from,
+            # the root must leave its finalized state (rates, MR / bill-pass
+            # numbers, invoice fields, final PO) and return to Pending (13).
+            finals = revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
+            summary["deleted_pos"].extend(p["po_no_formatted"] for p in finals)
+            summary["reverted"] = True
+        elif from_idx == 0:
+            # Whole chain rolled back from Step 1: root returns to Pending (13) —
+            # the ERP hand-off state, never Open (decision D3 2026-09-03).
             conn.execute(
                 text("UPDATE jute_mr SET status_id = 13, updated_by = :uid, "
                      "updated_date_time = NOW() WHERE jute_mr_id = :id"),
                 {"uid": updated_by, "id": root_mr_id},
             )
-    elif was_complete and step1_source_mr is not None:
-        with DatabaseConnection.get_transaction() as conn:
-            revert_original_mr(conn, root_mr_id, step1_source_mr, updated_by)
+    return summary
 
 
 # ---------------------------------------------------------------------------

@@ -501,7 +501,10 @@ def get_transfer_chain(root_mr_id: int) -> pd.DataFrame:
 
     Returns DataFrame with columns: jute_mr_id, src_com_id, branch_id,
     jute_mr_date, challan_date, branch_mr_no, total_amount, claim_amount, net_total,
-    owner_co_id, branch_name, co_name, co_prefix.
+    owner_co_id, branch_name, co_name, co_prefix, branch_prefix, and the PO
+    the step's MR is linked to (transfer_po_id / _no / _date / _weight /
+    _value / _note; all NULL on chains saved before transfer POs existed --
+    _note is jute_po.internal_note, which carries the transfer PO marker).
     Ordered by jute_mr_id ASC for chain reconstruction.
     """
     return DatabaseConnection.execute_query(
@@ -509,16 +512,42 @@ def get_transfer_chain(root_mr_id: int) -> pd.DataFrame:
         SELECT mr.jute_mr_id, mr.src_com_id, mr.branch_id, mr.jute_mr_date,
                mr.challan_date, mr.branch_mr_no, mr.total_amount, mr.claim_amount, mr.net_total,
                bm.co_id AS owner_co_id, bm.branch_name,
-               cm.co_name, cm.co_prefix
+               cm.co_name, cm.co_prefix, bm.branch_prefix,
+               mr.po_id AS transfer_po_id, po.po_no AS transfer_po_no,
+               po.po_date AS transfer_po_date, po.weight AS transfer_po_weight,
+               po.jute_po_value AS transfer_po_value,
+               po.internal_note AS transfer_po_note
         FROM jute_mr mr
         JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         JOIN co_mst cm ON bm.co_id = cm.co_id
+        LEFT JOIN jute_po po ON po.jute_po_id = mr.po_id
         WHERE mr.src_jute_mr_id = :root_id
         AND mr.transfer_mode = 0
         ORDER BY mr.jute_mr_id ASC
         """,
         {"root_id": root_mr_id},
     )
+
+
+def get_original_po(root_mr_id: int) -> Optional[dict]:
+    """The ERP purchase order a chain root was received on (jute_mr.po_id),
+    with the prefixes needed to print its number. None when the MR has no PO.
+
+    Keys: jute_po_id, po_no, po_date, co_prefix, branch_prefix."""
+    df = DatabaseConnection.execute_query(
+        """
+        SELECT p.jute_po_id, p.po_no, p.po_date, cm.co_prefix, bm.branch_prefix
+        FROM jute_mr mr
+        JOIN jute_po p ON p.jute_po_id = mr.po_id
+        JOIN branch_mst bm ON bm.branch_id = p.branch_id
+        JOIN co_mst cm ON cm.co_id = bm.co_id
+        WHERE mr.jute_mr_id = :id
+        """,
+        {"id": int(root_mr_id)},
+    )
+    if df is None or df.empty:
+        return None
+    return df.iloc[0].to_dict()
 
 
 def get_transfer_chains_batch(mr_ids: list) -> dict:
@@ -568,11 +597,48 @@ def get_marked_warehouses_by_branch(branch_id: int) -> dict:
     return dict(zip(filtered['warehouse_name'], filtered['warehouse_id']))
 
 
-def set_warehouse_marked(warehouse_id: int, marked: bool) -> None:
-    """Tag/untag a godown as marked (warehouse_type = 'MARKED' or NULL)."""
-    DatabaseConnection.execute_non_query(
-        "UPDATE warehouse_mst SET warehouse_type = :t WHERE warehouse_id = :id",
-        {"t": "MARKED" if marked else None, "id": int(warehouse_id)},
+# warehouse_mst.warehouse_type is ERP master data ('J' jute godown, 'S' store,
+# ...). The app borrows it for its own 'MARKED' tag, so it may only ever flip
+# a godown between its jute type and MARKED -- never blank it, never touch a
+# godown whose tag is not changing.
+JUTE_GODOWN_TYPE = "J"
+MARKED_GODOWN_TYPE = "MARKED"
+STORE_GODOWN_TYPE = "S"
+
+
+def get_markable_warehouses_by_branch(branch_id: int) -> dict:
+    """{warehouse_name: warehouse_id} of the godowns that may be tagged as
+    marked: jute godowns ('J'), those already marked, and untyped ones
+    (blank / NULL -- the godowns an old tag save blanked were all 'J').
+    Store godowns ('S') and any other type are left out, because untagging
+    gives a godown the jute type 'J' back."""
+    df = load_warehouses()
+    if df is None or df.empty:
+        return {}
+    kind = df['warehouse_type'].fillna('').astype(str).str.strip()
+    filtered = df[(df['branch_id'] == int(branch_id))
+                  & kind.isin(['', JUTE_GODOWN_TYPE, MARKED_GODOWN_TYPE])]
+    return dict(zip(filtered['warehouse_name'], filtered['warehouse_id']))
+
+
+def set_warehouse_marked(warehouse_id: int, marked: bool) -> int:
+    """Tag a godown as marked, or give a marked godown back its jute type.
+
+    Only a godown whose tag actually changes is written: tagging leaves an
+    already-marked godown alone, untagging touches only a MARKED godown and
+    restores 'J' (it used to write NULL -- and the page called this for every
+    godown of the branch, blanking the ERP type of all of them).
+    Returns the number of rows changed (0 or 1)."""
+    if marked:
+        return DatabaseConnection.execute_non_query(
+            "UPDATE warehouse_mst SET warehouse_type = :t "
+            "WHERE warehouse_id = :id AND NOT (warehouse_type <=> :t)",
+            {"t": MARKED_GODOWN_TYPE, "id": int(warehouse_id)},
+        )
+    return DatabaseConnection.execute_non_query(
+        "UPDATE warehouse_mst SET warehouse_type = :j "
+        "WHERE warehouse_id = :id AND warehouse_type = :m",
+        {"j": JUTE_GODOWN_TYPE, "m": MARKED_GODOWN_TYPE, "id": int(warehouse_id)},
     )
 
 

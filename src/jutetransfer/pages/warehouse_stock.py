@@ -24,11 +24,28 @@ from ..queries import (
     get_lot_line_provenance,
     get_warehouses_by_branch,
     get_marked_warehouses_by_branch,
+    get_markable_warehouses_by_branch,
     set_warehouse_marked,
 )
 from ..lot_ops import create_lot, delete_lot_line
 from ..lot_helpers import apply_pct, line_price, combine_takes
 from ..warehouse_stock_ops import save_marked_batch, delete_marked_move
+
+
+WAREHOUSE_FLASH_KEY = "warehouse_flash"
+
+
+def _flash(message: str) -> None:
+    """Queue a success message for the next run: st.success() followed by
+    st.rerun() is never seen."""
+    st.session_state[WAREHOUSE_FLASH_KEY] = message
+
+
+def _render_flash() -> None:
+    message = st.session_state.pop(WAREHOUSE_FLASH_KEY, None)
+    if message:
+        st.success(message)
+        st.toast(message, icon="✅")   # the banner may be out of view on a phone
 
 
 def _lot_grid(df: pd.DataFrame, key: str) -> pd.DataFrame:
@@ -118,7 +135,7 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
                 new_ids = create_lot(takes, user_id)
                 for li_id, _ in takes:
                     st.session_state.pop(f"take_{li_id}", None)
-                st.success(f"{len(new_ids)} lot line(s) created.")
+                _flash(f"{len(new_ids)} lot line(s) created.")
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
@@ -147,7 +164,7 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
                     new_ids = create_lot(merges, user_id, merge=True)
                     for li_id, _ in merges:
                         st.session_state.pop(f"take_{li_id}", None)
-                    st.success(f"Merged into line {new_ids[0]}.")
+                    _flash(f"Merged into line {new_ids[0]}.")
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
@@ -174,7 +191,7 @@ def _render_lots_tab(co_id: int, branch_id: int, year: int, month: int,
                 if st.button("Delete", key=f"del_lot_{li_id}"):
                     try:
                         delete_lot_line(li_id, user_id)
-                        st.success("Lot line deleted; sources restored.")
+                        _flash("Lot line deleted; sources restored.")
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
@@ -248,7 +265,7 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
                 li_ids, float(pct), int(tgt_co), int(tgt_br), int(wh_id),
                 move_date, user_id,
             )
-            st.success(
+            _flash(
                 "Transferred. " + "; ".join(
                     f"MR {c['child_mr_id']} — invoice {c['invoice_no']} "
                     f"({c['invoice_amount']:,.0f})"
@@ -263,7 +280,7 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
 def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
                        user_id: int) -> None:
     with st.expander("Tag godowns as marked"):
-        all_wh = get_warehouses_by_branch(branch_id)
+        all_wh = get_markable_warehouses_by_branch(branch_id)
         marked_wh = get_marked_warehouses_by_branch(branch_id)
         if not all_wh:
             st.write("No godowns for this branch.")
@@ -271,13 +288,19 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
             chosen = st.multiselect(
                 "Marked godowns (this branch)",
                 options=list(all_wh.keys()),
-                default=list(marked_wh.keys()),
+                default=[n for n in marked_wh if n in all_wh],
             )
+            st.caption("Store godowns are not listed. Untagging gives a godown "
+                       "back the jute godown type.")
             if st.button("Save godown tags"):
                 chosen_ids = {int(all_wh[n]) for n in chosen}
-                for _name, wid in all_wh.items():
-                    set_warehouse_marked(int(wid), int(wid) in chosen_ids)
-                st.success("Godown tags updated.")
+                marked_ids = {int(w) for w in marked_wh.values()}
+                # Only the godowns whose tag changes are written.
+                for wid in sorted(chosen_ids - marked_ids):
+                    set_warehouse_marked(wid, True)
+                for wid in sorted(marked_ids - chosen_ids):
+                    set_warehouse_marked(wid, False)
+                _flash("Godown tags updated.")
                 st.rerun()
 
     mk = get_marked_stock_with_balance(co_id, branch_id, year, month)
@@ -329,7 +352,7 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
             if st.button("Delete", key=f"del_mk_{mr_id}", disabled=not can_delete):
                 try:
                     delete_marked_move(mr_id, user_id)
-                    st.success("Deleted; source restored.")
+                    _flash("Deleted; source restored.")
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
@@ -337,6 +360,7 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
 
 def warehouse_stock_page() -> None:
     st.title("Warehouse-Marked Stock")
+    _render_flash()
     st.caption(
         "Restructure lots, batch-move them into marked godowns at other "
         "companies, and track marked stock until the ERP sells it."

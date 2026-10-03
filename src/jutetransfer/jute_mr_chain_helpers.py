@@ -55,6 +55,43 @@ def _cascade_rate(original_rate: float, steps: list, up_to_index: int) -> float:
     return float(rate_quintal)
 
 
+def step_multiplier(pct_rate_increase, rate_multiplier=None) -> Decimal:
+    """Exact Decimal multiplier of one step: 1 + pct/100, built from the %
+    the user typed -- the same expression _cascade_rate uses for the screen.
+
+    A caller that only has the float multiplier (1.0 + pct / 100.0) passes it
+    as rate_multiplier: it is used when no pct is given or when the two
+    disagree (the pct then does not describe this multiplier)."""
+    pct = None
+    try:
+        if pct_rate_increase is not None and pct_rate_increase == pct_rate_increase:
+            pct = Decimal(str(float(pct_rate_increase)))
+    except (TypeError, ValueError):
+        pct = None
+    from_pct = None if pct is None else 1 + pct / 100
+    if rate_multiplier is None:
+        return from_pct if from_pct is not None else Decimal(1)
+    given = Decimal(str(rate_multiplier))
+    if from_pct is not None and abs(from_pct - given) < Decimal("0.000000001"):
+        return from_pct
+    return given
+
+
+def hop_rate(rate_per_quintal, multiplier) -> tuple:
+    """(quintal rate, kg rate) after one hop's mark-up, as floats.
+
+    The multiplication is done in Decimal and the KG rate is rounded to 2
+    decimals half-up -- exactly what _cascade_rate does for the screen, so
+    the rate posted on MR / invoice lines is the rate the user saw. In float,
+    13100 x 1.005 is 13165.499999999998, which lands on 131.65 per kg
+    instead of 131.66 and left the invoice lines short of the invoice total."""
+    if rate_per_quintal is None or rate_per_quintal != rate_per_quintal:
+        return 0.0, 0.0
+    quintal = Decimal(str(rate_per_quintal)) * Decimal(str(multiplier))
+    rate_kg = (quintal / 100).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    return float(rate_kg * 100), float(rate_kg)
+
+
 def _calculate_line_item_amount(weight: float, rate_per_quintal: float) -> float:
     """Amount = weight * rate / 100, rounded to 2 decimals (ROUND_HALF_UP).
 

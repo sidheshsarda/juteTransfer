@@ -163,6 +163,29 @@ def get_mysql_connector() -> Optional[Union[mysql.connector.MySQLConnection, Poo
         return None
 
 
+def select_ids(conn, sql: str, params: Optional[dict] = None) -> list:
+    """Integer ids from a plain (non-locking) read on the caller's connection."""
+    return [int(r[0]) for r in conn.execute(text(sql), params or {}).fetchall()]
+
+
+def delete_by_ids(conn, table: str, pk: str, ids) -> int:
+    """DELETE rows by primary key on the caller's connection.
+
+    A DELETE filtered on a column without an index (e.g.
+    jute_po_li.jute_po_id, sales_invoice_jute_dtl.invoice_line_item_id)
+    scans the table and, under REPEATABLE READ, locks every row of it until
+    commit -- ERP saves on that table in every company would wait. Read the
+    ids first (select_ids) and delete by key: only those rows are locked.
+    `table` / `pk` are code constants, never user input."""
+    ids = sorted({int(i) for i in ids})
+    if not ids:
+        return 0
+    result = conn.execute(text(
+        f"DELETE FROM {table} WHERE {pk} IN ({','.join(str(i) for i in ids)})"
+    ))
+    return result.rowcount
+
+
 @st.cache_resource
 def get_cached_database_connection():
     """Cached database connection for Streamlit (use with caution)."""

@@ -57,11 +57,23 @@ Mutual exclusion is enforced in code: a line feeding a live chain can't be mark-
 - Rates cascade multiplicatively hop-to-hop (`_cascade_rate`: round at kg level each hop, ×100 back to quintal).
 - **Claims never cascade** — every step's `claim_amount` is the flat sum of the original per-line claims. (Older phrasing "claim breaks" in this file was misleading; no such flag exists.)
 - Finalization = buyer's company+branch equals root's → `_update_original_mr` UPDATEs the root row in place (no new row). `revert_original_mr` undoes it.
-- Deletion from a middle step cascades downstream (MR + line items + both linked invoices per hop).
+- Deletion from a middle step cascades downstream (MR + line items + both linked invoices per hop). The whole cascade (and un-finalize) runs in ONE transaction with the root row locked; a finalized chain is always reverted, also when deleting from step 1. Un-finalize puts back the root's party / party branch / MR date (exactly from the Final PO's marker, else derived by name from step 1).
+- `save_transfer_step` locks the root row first and refuses a second step 1, any step after finalize, and a step that does not continue the chain's newest hop (stale tab / double save). Posted hop rates use exact Decimal (`jute_mr_chain_helpers.hop_rate`) = the screen's `_cascade_rate`. Finalize / un-finalize write the root's money exactly as the ERP does (`transfer._erp_recompute_money` mirrors vowerp3be `recompute_mr_money`, incl. 194Q TDS; TDS 0 on un-finalize). Deletes go by primary key after a plain read (`database.select_ids` / `delete_by_ids`) — never a DELETE filtered on an unindexed column (whole-table locks).
+
+### Transfer POs (2026-10-01 — spec `docs/superpowers/specs/2026-10-01-transfer-po-design.md`)
+
+Every chain transfer also writes ERP purchase orders (`jute_po` + `jute_po_li` + one `jute_po_status_log` row), in the same transaction as the step:
+- **Forwarding PO** with every hop MR (hop's branch and party; linked via `jute_mr.po_id` / `jute_mr_li.jute_po_li_id`), and a **Final PO** at the mill when the chain is finalized (root's party after finalize; NOT linked from the root, which keeps its original ERP PO).
+- One PO per lorry, from the MR's own active lines: rate rounded to the nearest ₹50 (PO only), ERP "quantity mode" (whole bales of 150 kg / loose units of 48 kg, `percentage` NULL), `vehicle_quantity` 1, no lorry type, credit terms only on the first hop's PO.
+- Inserted CLOSED (`status_id = 5`, `close_type = 'TRANSFER'`) so the ERP never offers them at QC or lists them as outstanding; `close_remark` explains the PO in words.
+- Identified by a marker in `jute_po.internal_note`: `JT|FORWARD|root=…|mr=…|srcpo=…|` / `JT|FINAL|root=…|mr=…|srcpo=…|orig=<party>/<branch>/<mr date>|` (`po_helpers.build_marker` / `parse_marker`). Only a PO whose marker names the MR is ever deleted, and never while another MR is linked to it.
+- Code: `po_helpers.py` (pure math + marker), `po_ops.py` (`plan_*` read-only / `create_*` / `delete_*`, caller's transaction), `po_queries.py` (reads), `pages/po_tracker.py` + `po_tracker_helpers.py` (read-only PO Tracker page). Kill switch: env `JT_TRANSFER_PO=0` (default in `po_ops._ENABLED_DEFAULT`).
+- Existing chains: `scripts/backfill_transfer_pos.py` (dry-run by default; writes need `--apply` + ONE scope `--all` / `--root N` / `--limit N` + `--expect N`; stops at the first failed PO or duplicate number; exit 0 only when all planned POs exist and the after-run check is clean; `--undo <log>`). Damaged rows from the fixed bugs: `scripts/repair_transfer_data.py` (dry-run by default; writes need `--apply --only <repair> --expect N`; the plan is printed and logged before the first write). Its `finalized-net` repair counts 194Q TDS in MR-date order (`_erp_money(cumulative_previous=…)`): a recompute today would count every later MR too. Both write production — owner's OK first. Dry-runs plan in a `START TRANSACTION READ ONLY` transaction — never `SET SESSION ... READ ONLY` (it sticks to the pooled connection).
+- **Where this code runs:** the staff's daily copy of the app is on another server (`srv1836306.hstgr.cloud`) and runs what is merged to `main`; this VM only serves the owner's preview (port 8501). Code that is not deployed there does not exist for the staff, and the old code there never deletes a transfer PO — so: deploy first (PO creation OFF), then backfill, then switch ON, then repairs (spec, "Rollout order").
 
 ### Type 2 core logic (as built)
 
-- Godowns tagged via `warehouse_mst.warehouse_type = 'MARKED'` (`queries.set_warehouse_marked`).
+- Godowns tagged via `warehouse_mst.warehouse_type = 'MARKED'` (`queries.set_warehouse_marked`). That column is ERP master data ('J' jute godown, 'S' store …): tagging writes only godowns whose tag changes, untagging restores 'J', store godowns are not offered (it used to blank the type of every godown of the branch).
 - `save_marked_move`: reduces source `jute_mr_li.accepted_weight`/`total_price` (recomputes source header), INSERTs child MR at target branch/warehouse with `transfer_mode=1`, possibly different rate.
 - `save_marked_batch`: also books one seller Raw-Jute `sales_invoice` per child MR at the source branch (buyer = target company's party, auto-created if missing), stamps the child MR with invoice no/date/amount, and links via `sales_invoice_jute.mr_id` = child MR id (deletion linkage — different semantics from Type 1's hop linkage). `delete_marked_move` cascades the invoice.
 - P&L counts marked stock: `transfer_mode=1` MRs at status 3 (`get_company_wise_marked_stock`).
@@ -80,12 +92,17 @@ src/jutetransfer/
 ├── pages/
 │   ├── new_transfer_chain.py         # Type 1: vertical chain page (sole chain-editing UI)
 │   ├── warehouse_stock.py            # Type 2: marked-godown stock page
+│   ├── po_tracker.py                 # PO Tracker: Original / Forwarding / Final PO per lorry (read-only)
 │   ├── company_pl_dashboard.py       # Company P&L dashboard
 │   ├── schema_viewer.py              # Schema browser (dev tool)
 │   └── __init__.py
 ├── jute_mr_chain_helpers.py          # Pure Python chain math (no Streamlit/DB imports)
 ├── lot_helpers.py                    # Pure lot math (no Streamlit/DB imports)
 ├── transfer.py                       # Type 1 DB writes: save/delete/finalize/revert
+├── po_helpers.py                     # Pure transfer-PO math + provenance marker (no Streamlit/DB imports)
+├── po_ops.py                         # Transfer PO writes (plan/create/delete), caller's transaction
+├── po_queries.py                     # Transfer PO reads (step cards, PO Tracker)
+├── po_tracker_helpers.py             # Pure PO Tracker shaping (status model, reconciliation, CSV)
 ├── warehouse_stock_ops.py            # Type 2 DB writes: save/delete marked moves
 ├── lot_ops.py                        # In-place lot split/merge on jute_mr_li (provenance + per-line undo)
 ├── queries.py                        # All read queries + P&L aggregations
@@ -98,7 +115,9 @@ src/jutetransfer/
 └── __init__.py
 
 app.py                                # Streamlit entry point
-tests/                                # pytest: chain reconstruction, grouping, recalculation
+tests/                                # pytest (no DB): chain math, PO math, tracker helpers, and
+                                      # end-to-end flows on an in-memory SQLite stand-in (fake_mysql.py)
+scripts/                              # backfill_transfer_pos.py, repair_transfer_data.py (dry-run by default)
 ```
 
 ### Critical Dependencies
@@ -177,5 +196,5 @@ Integration checklist when touching chain logic: rate cascade (10% on step 2 →
 
 ---
 
-**Last Updated:** 2026-08-04
+**Last Updated:** 2026-10-02
 **Key Constraints:** sls tenant only; `transfer_mode` keeps the two transfer types disjoint; the vertical chain page is the sole chain-editing UI; gate-entry root MRs come from VoWERP, never from this app — lot split/merge edits `jute_mr_li` in place (no new mode-0 MRs), always traceable via `jute_lot_src`
