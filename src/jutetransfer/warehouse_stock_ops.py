@@ -1,20 +1,35 @@
-"""Warehouse-marked stock moves (partial-quantity, no circular chain).
+"""Warehouse-marked stock moves (whole lots, no circular chain).
 
-A "mark move" takes part of a purchased stock line at company A and moves it
-into a marked godown at company B: it reduces the source line's accepted_weight
-(the balance stays at A) and inserts a child jute_mr (transfer_mode=1) at B
-carrying only the moved quantity at a possibly-new rate. The batch transfer is
-an inter-company SALE (owner amendment 2026-08-03): one seller-side Raw-Jute
-sales_invoice (invoice_type=5) is created at the source branch per child MR,
-and missing masters (party, item/quality) are auto-created on both ends.
+A "mark move" sells whole lots of purchased stock held at company A to a
+marked godown at company B -- the batch transfer IS the inter-company sale
+(owner amendment 2026-08-03). Per source MR it inserts one child jute_mr
+(transfer_mode=1) at B carrying the moved kg at a possibly-new rate, and books
+one seller-side Raw-Jute sales_invoice (invoice_type=5) at A's branch.
+Missing masters (party, item/quality) are auto-created on both ends.
+
+The stock leaves A exactly ONCE, the way the ERP books its own raw-jute
+sales: each invoice line names the source MR line it was sold from
+(sales_invoice_dtl.jute_mr_li_id), and the ERP stock ledger
+vw_jute_stock_outstanding subtracts the sold weight from that line's balance
+(bal_weight = actual_weight - issued - sold). The source jute_mr_li / jute_mr
+rows -- a real supplier delivery: bill pass, PO position, 194Q TDS and the
+purchase register read them -- are never changed by a move or its undo.
+
+Until 2026-10-03 the move ALSO drained the source line (accepted / actual
+weight, bales, price) and re-wrote the purchase header, so the ERP saw the
+jute leave the seller twice (as receipt and as sale; stock report negative by
+the moved weight, purchase MR at total 0 / net -claim: sls MR 28253).
+Children written that way carry actual_*_delta on their jute_lot_src rows and
+an invoice line that names no MR line; delete_marked_move still restores
+their sources, and scripts/repair_transfer_data.py `marked-stock` converts
+them to the linked model.
 
 Kept deliberately separate from the vertical transfer chain (transfer.py):
 no rate cascade, no finalization / return-to-origin, no chain of invoices.
 The two worlds are disjoint by jute_mr.transfer_mode (0 = chain, 1 = marked
-stock). The legacy single-line save_marked_move still creates no invoice
-(dead code kept for compatibility; the page only calls save_marked_batch).
+stock); the guard rails that keep a line out of both must stay.
 
-Run `python -m src.jutetransfer.warehouse_stock_ops` for the split_weights
+Run `python -m src.jutetransfer.warehouse_stock_ops` for the pure-math
 self-check (no DB required).
 """
 
@@ -24,15 +39,19 @@ from typing import Tuple
 
 from sqlalchemy import text
 
-from .database import DatabaseConnection
+from .database import DatabaseConnection, delete_by_ids, named_locks, select_ids
 from .lot_helpers import (
     advised_share, apply_pct, line_price, net_rate, production_rate,
-    reduce_amounts, restore_amounts, round_kg,
+    restore_amounts, round_kg, sold_share,
 )
 from .transfer import (
+    CHAIN_SAVE_LOCK,
+    CHAIN_SAVE_LOCK_TIMEOUT,
     RAW_JUTE_INVOICE_TYPE,
+    _delete_invoice,
     _ensure_company_as_party,
     _ensure_item,
+    _erp_money,
     _format_document_no,
     _get_next_challan_no,
     _get_next_gate_entry_no,
@@ -40,6 +59,7 @@ from .transfer import (
     _get_next_mr_number_in_txn,
     _get_next_bill_pass_no_in_txn,
     _get_seller_prefixes,
+    _invoice_ids_for_mr,
 )
 
 
@@ -58,31 +78,36 @@ def split_weights(source: float, moved: float) -> Tuple[float, float]:
     return float(round_kg(source - moved)), moved
 
 
-def _round2(x: float) -> float:
-    return float(round(x, 2))
+def _recompute_mr_header(conn, jute_mr_id: int, updated_by: int) -> dict:
+    """Write the header the ERP itself would write for this MR's lines.
 
-
-def _recompute_mr_header(conn, jute_mr_id: int, updated_by: int) -> None:
-    """Recompute total_amount/roundoff/net_total/mr_weight from the MR's lines.
-
-    Mirrors transfer._update_original_mr's SUM(total_price) pattern; claim_amount
-    is left as stored (matches chain behaviour). net_total = ROUND(SUM,0) - claim.
-    mr_weight = ROUND(SUM(accepted_weight)), the same rule (and integer
-    format) the ERP's MR-edit endpoint applies — keeps the MR-screen weight
-    truthful after app-side reductions/additions.
-    """
+    Money as mr.recompute_mr_money: ACTIVE lines only, total = sum of
+    accepted / 100 x rate and claim = sum of accepted / 100 x claim_rate (both
+    2 dp), the stored 194Q TDS kept, net a whole rupee with roundoff the
+    difference (transfer._erp_money). MR weight as totals.sync_mr_weight_
+    from_lines: the active lines' accepted kg. A soft-deleted line (active =
+    0, ERP QC edit -- the weights stay on the row) counts for nothing, as in
+    the ERP. Used for app-created MRs (marked children) and for MRs whose
+    lines a lot split / merge or an undo has just changed; never for the
+    source of a marked move, which a move does not touch."""
+    row = conn.execute(text(
+        "SELECT tds_amount FROM jute_mr WHERE jute_mr_id = :id"
+    ), {"id": jute_mr_id}).fetchone()
+    if not row:
+        raise ValueError(f"MR {jute_mr_id} not found")
+    money = _erp_money(conn, jute_mr_id, tds_amount=float(row[0] or 0))
     conn.execute(text("""
         UPDATE jute_mr SET
-            total_amount = (SELECT ROUND(COALESCE(SUM(total_price),0),0) FROM jute_mr_li WHERE jute_mr_id = :id),
-            roundoff = (SELECT ROUND(COALESCE(SUM(total_price),0),0) FROM jute_mr_li WHERE jute_mr_id = :id) -
-                       (SELECT COALESCE(SUM(total_price),0) FROM jute_mr_li WHERE jute_mr_id = :id),
-            net_total = (SELECT ROUND(COALESCE(SUM(total_price),0),0) FROM jute_mr_li WHERE jute_mr_id = :id)
-                        - COALESCE(claim_amount,0),
-            mr_weight = (SELECT ROUND(COALESCE(SUM(accepted_weight),0)) FROM jute_mr_li WHERE jute_mr_id = :id),
+            total_amount = :total_amount, claim_amount = :claim_amount,
+            tds_amount = :tds_amount, roundoff = :roundoff, net_total = :net_total,
+            mr_weight = (SELECT ROUND(COALESCE(SUM(COALESCE(accepted_weight, actual_weight, 0)), 0))
+                         FROM jute_mr_li
+                         WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL)),
             updated_by = :updated_by,
             updated_date_time = NOW()
         WHERE jute_mr_id = :id
-    """), {"id": jute_mr_id, "updated_by": updated_by})
+    """), {**money, "id": jute_mr_id, "updated_by": updated_by})
+    return money
 
 
 def _parent_header(conn, jute_mr_id: int) -> dict:
@@ -128,68 +153,41 @@ _CHAIN_CHILD_SQL = """
 
 
 def _available_kg(conn, li_id: int, accepted: float) -> float:
-    """Balance-aware available kg: LEAST(view balance, accepted_weight).
+    """Balance-aware available kg: LEAST(ERP stock-view balance, accepted_weight),
+    whole kg, FLOORED (a legacy 4811.65 kg balance offers 4811, never 4812,
+    so a full take can't over-draw the view by the rounding fraction).
 
-    The view row can be missing (e.g. freshly created line inside this
-    transaction) — fall back to accepted_weight.
+    The view's balance already nets ERP issues and every approved raw-jute
+    sale that names the line -- including this app's own marked moves. A line
+    the view does not list is NOT stock (soft-deleted line, removed line
+    status, MR cancelled / rejected / returned): 0, never accepted_weight. A
+    consistent read sees this transaction's own inserts, so a line created a
+    moment ago is listed too.
 
     # ponytail: reads vw_jute_stock_outstanding without a lock, so a
-    # concurrent ERP issue between this read and the caller's UPDATE can
-    # shrink the true balance in between (TOCTOU). Accepted risk: queries
-    # clamp with GREATEST(0), so the worst case is a stale-high available
-    # figure for one save, not a negative/corrupt balance. Upgrade path if
-    # this ever bites: SELECT ... FOR UPDATE on the view's underlying rows,
-    # or move the check inside the same locked transaction as the UPDATE.
+    # concurrent ERP issue between this read and the caller's INSERTs can
+    # shrink the true balance in between (TOCTOU) and the line ends
+    # over-sold by that issue. Accepted risk, same window as the ERP's own
+    # issue screen; the invoice link means it can at worst overdraw this one
+    # line, never mint or double-book stock.
     """
     row = conn.execute(text(_BALANCE_SQL), {"id": li_id}).fetchone()
-    bal = row._mapping["bal_weight"] if row else None
-    # Whole kg, FLOORED: a legacy 4811.65 kg balance offers 4811, never 4812,
-    # so a full take can't over-draw the ERP view by the rounding fraction.
-    avail = min(float(bal), accepted) if bal is not None else accepted
+    if row is None or row._mapping["bal_weight"] is None:
+        return 0.0
+    avail = min(float(row._mapping["bal_weight"]), float(accepted or 0))
     return float(math.floor(avail + 1e-9))
 
 
-def _reduce_source_line(conn, r: dict, qty: float, available: float,
-                        keep_accepted: bool = False) -> tuple:
-    """Reduce a locked source line by qty kg across accepted AND actual fields.
-
-    keep_accepted=True (mode-1 resale) drains only the actual fields — the
-    stock-view balance moves to the buyer while accepted_weight/total_price
-    (and thus the holder's purchase net_total in the P&L) stay intact, exactly
-    as an ERP sale of the stock would have left them.
-
-    Returns (actual_qty_delta, actual_weight_delta) for provenance storage.
-    Raises ValueError (via reduce_amounts) if actual_weight is missing or
-    less than qty — moving more than the line's actual on-hand weight would
-    mint balance the ERP stock view doesn't have."""
-    new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta = reduce_amounts(
-        r["accepted_weight"], r["actual_weight"], r["actual_qty"], qty, available
-    )
-    if keep_accepted:
-        conn.execute(text("""
-            UPDATE jute_mr_li
-            SET actual_weight = :aw, actual_qty = :aq, updated_date_time = NOW()
-            WHERE jute_mr_li_id = :id
-        """), {
-            "aw": new_actual_w,
-            "aq": new_actual_q,
-            "id": int(r["jute_mr_li_id"]),
-        })
-        return aq_delta, aw_delta
-    conn.execute(text("""
-        UPDATE jute_mr_li
-        SET accepted_weight = :w, total_price = :p,
-            actual_weight = :aw, actual_qty = :aq,
-            updated_date_time = NOW()
-        WHERE jute_mr_li_id = :id
-    """), {
-        "w": new_accepted,
-        "p": line_price(new_accepted, float(r["rate"] or 0)),
-        "aw": new_actual_w,
-        "aq": new_actual_q,
-        "id": int(r["jute_mr_li_id"]),
-    })
-    return aq_delta, aw_delta
+def _assert_stock_line(r: dict) -> None:
+    """A soft-deleted (active = 0) or removed (status 4 / 6) jute_mr_li row
+    still carries its weights -- the ERP QC edit only flips the flag -- but is
+    not stock. Moving or re-lotting it would mint stock that was never
+    received (audit-02 V3)."""
+    li_id = int(r["jute_mr_li_id"])
+    if r.get("active") is not None and int(r["active"]) != 1:
+        raise ValueError(f"Line {li_id} is soft-deleted in the ERP (active = 0); not stock")
+    if str(r.get("status") or "") in ("4", "6"):
+        raise ValueError(f"Line {li_id} is removed in the ERP (status {r['status']}); not stock")
 
 
 _LI_INSERT_SQL = """
@@ -210,12 +208,15 @@ _LI_INSERT_SQL = """
     )
 """
 # actual_weight = accepted kg on app-created lines, so the ERP stock view
-# computes balances for them (bal = actual_weight - issued). actual_rate is the
-# SOURCE line's production rate (see lot_helpers.production_rate) -- never the
-# marked-up transfer rate, which belongs to `rate` (accounting) only.
+# computes balances for them (bal = actual_weight - issued - sold). actual_rate
+# is the SOURCE line's production rate (see lot_helpers.production_rate) --
+# never the marked-up transfer rate, which belongs to `rate` (accounting) only.
 # claim_rate: split/merge lines keep the source claim (the MR's line-level
 # claim total stays whole); marked children pass 0 -- their `rate` is already
 # post-claim (lot_helpers.net_rate).
+# actual_qty on a marked child = the bales the stock view books as sold on
+# the source line for the moved kg (lot_helpers.sold_share), so source balance
+# and child add up to the source's bales.
 # challan_* = the supplier's ADVISED item/weight/bales (MR print "Advised
 # weight"). Marked children carry their moved share (advised_share); the
 # source keeps its own -- it is the gate record, and the ERP only displays
@@ -234,11 +235,18 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
     branch bills the target company at the child's (marked-up) rates. One
     invoice per child MR; claim-free by design.
 
-    sales_invoice_jute.mr_id stores the CHILD MR id — the deletion linkage
+    Every invoice line names the source MR line it sells
+    (sales_invoice_dtl.jute_mr_li_id = inv_lines[i]["src_li_id"]): that link
+    is the stock-out. vw_jute_stock_outstanding subtracts the line's
+    sales_weight from the source line's balance, exactly as for a raw-jute
+    sale entered in the ERP, and the ERP stock report nets the sale against
+    the receipt that stays on the purchase MR.
+
+    sales_invoice_jute.mr_id stores the CHILD MR id -- the deletion linkage
     for delete_marked_move. NOTE: Type 1 stores the seller MR id there; the
     differing semantics are safe because mode-1 MRs never enter a chain.
-    Line data (kg/rate/price/item id) is passed in by the caller
-    (save_marked_batch) — item ids are the ORIGINAL source-company ids the
+    Line data (kg/rate/price/item id/source line) is passed in by the caller
+    (save_marked_batch) -- item ids are the ORIGINAL source-company ids the
     caller already had in scope, not re-derived here.
     """
     lines = inv_lines
@@ -299,10 +307,12 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
         dtl_id = DatabaseConnection.execute_insert_returning_id(conn, """
             INSERT INTO sales_invoice_dtl (
                 invoice_id, item_id, hsn_code, quantity, sales_weight,
-                uom_id, rate, amount_without_tax, total_amount, remarks
+                uom_id, rate, amount_without_tax, total_amount, remarks,
+                jute_mr_li_id
             ) VALUES (
                 :invoice_id, :item_id, NULL, :kg, :kg,
-                163, :rate, :amount, :amount, :remarks
+                163, :rate, :amount, :amount, :remarks,
+                :src_li_id
             )
         """, {
             "invoice_id": invoice_id,
@@ -311,6 +321,7 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
             "rate": rate_kg,
             "amount": float(l["price"] or 0),
             "remarks": f"Raw Jute - {qty} {unit}".strip(),
+            "src_li_id": int(l["src_li_id"]),
         })
         try:
             qty_unit_conv = int(float(l["actual_qty"] or 0))
@@ -344,139 +355,6 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
     }
 
 
-def save_marked_move(
-    source_mr_li_id: int,
-    moved_qty: float,
-    rate: float,
-    target_co_id: int,
-    target_branch_id: int,
-    warehouse_id: int,
-    mr_date: date,
-    updated_by: int,
-) -> int:
-    """Move ``moved_qty`` from a source stock line into a marked godown at the
-    target company. Reduces the source line (balance stays) and inserts a child
-    jute_mr (transfer_mode=1). Returns the child jute_mr_id.
-
-    Raises ValueError on over-transfer, a non-normal source, or a source that is
-    a live vertical-chain lot (shrinking it would corrupt the chain).
-    """
-    with DatabaseConnection.get_transaction() as conn:
-        # Lock + read the source line (FOR UPDATE serialises concurrent marks).
-        row = conn.execute(text("""
-            SELECT li.accepted_weight, li.rate, li.actual_item_id, li.actual_quality,
-                   li.challan_quality_id, li.marka, li.crop_year, li.unit_conversion,
-                   li.jute_mr_id, mr.branch_id AS src_branch_id, mr.transfer_mode,
-                   bm.co_id AS src_co_id
-            FROM jute_mr_li li
-            JOIN jute_mr mr ON mr.jute_mr_id = li.jute_mr_id
-            JOIN branch_mst bm ON bm.branch_id = mr.branch_id
-            WHERE li.jute_mr_li_id = :id
-            FOR UPDATE
-        """), {"id": source_mr_li_id}).fetchone()
-        if not row:
-            raise ValueError(f"Source line {source_mr_li_id} not found")
-        r = row._mapping
-
-        available = float(r["accepted_weight"] or 0)
-        source_rate = float(r["rate"] or 0)
-        source_mr_id = int(r["jute_mr_id"])
-        source_co_id = int(r["src_co_id"])
-        source_branch_id = int(r["src_branch_id"])
-
-        # Guards
-        if int(r["transfer_mode"] or 0) != 0:
-            raise ValueError("Can only mark-move from normal (transfer_mode=0) stock")
-        new_source_weight, moved = split_weights(available, float(moved_qty))
-        chain_child = conn.execute(
-            text(_CHAIN_CHILD_SQL), {"sid": source_mr_id}
-        ).fetchone()
-        if chain_child:
-            raise ValueError(
-                "This MR is part of a vertical transfer chain; "
-                "mark-move is disabled to avoid corrupting it"
-            )
-
-        # 1. Reduce the source line + recompute its header (balance stays at A).
-        new_source_price = _round2(new_source_weight * source_rate / 100.0)
-        conn.execute(text("""
-            UPDATE jute_mr_li
-            SET accepted_weight = :w, total_price = :p, updated_date_time = NOW()
-            WHERE jute_mr_li_id = :id
-        """), {"w": new_source_weight, "p": new_source_price, "id": source_mr_li_id})
-        _recompute_mr_header(conn, source_mr_id, updated_by)
-
-        # 2. Party = source company represented in the target company's party_mst.
-        party_id, party_branch_id = _ensure_company_as_party(
-            conn, source_co_id, source_branch_id, target_co_id, updated_by
-        )
-
-        # 3. Insert the child jute_mr (transfer_mode=1, active stock at B).
-        child_price = _round2(moved * float(rate) / 100.0)
-        child_total = float(round(child_price, 0))
-        child_mr_id = DatabaseConnection.execute_insert_returning_id(conn, """
-            INSERT INTO jute_mr (
-                jute_gate_entry_no, branch_mr_no, jute_gate_entry_date, jute_mr_date,
-                status_id, transfer_mode, updated_by, updated_date_time,
-                branch_id, party_id, party_branch_id, src_com_id, src_jute_mr_id,
-                total_amount, claim_amount, roundoff, net_total,
-                bill_pass_no, bill_pass_date
-            ) VALUES (
-                :gate_no, :mr_no, :mr_date, :mr_date,
-                3, 1, :updated_by, NOW(),
-                :branch_id, :party_id, :party_branch_id, :src_com_id, :src_jute_mr_id,
-                :total, 0, 0, :total,
-                :bill_pass_no, :mr_date
-            )
-        """, {
-            "gate_no": _get_next_gate_entry_no(conn, target_branch_id, mr_date),
-            "mr_no": _get_next_mr_number_in_txn(conn, target_branch_id, mr_date),
-            "mr_date": mr_date,
-            "updated_by": updated_by,
-            "branch_id": target_branch_id,
-            "party_id": party_id,
-            "party_branch_id": party_branch_id,
-            "src_com_id": source_co_id,
-            "src_jute_mr_id": source_mr_id,  # direct parent (origin, not a chain root)
-            "total": child_total,
-            "bill_pass_no": _get_next_bill_pass_no_in_txn(conn, target_branch_id, mr_date),
-        })
-
-        # 4. Insert the child line item: moved qty at the new rate, claim-free
-        #    (value of marked stock = qty * rate). Item id is remapped to the
-        #    target company; quality (jute_qlty_id) is copied unchanged.
-        src_item_id = r["actual_item_id"]
-        target_item_id = (
-            _ensure_item(conn, int(src_item_id), target_co_id, updated_by)
-            if src_item_id else None
-        )
-        conn.execute(text("""
-            INSERT INTO jute_mr_li (
-                jute_mr_id, actual_item_id, actual_quality, challan_quality_id,
-                accepted_weight, rate, claim_rate, total_price, warehouse_id,
-                marka, crop_year, active, updated_date_time, unit_conversion
-            ) VALUES (
-                :mr_id, :actual_item_id, :actual_quality, :challan_quality_id,
-                :w, :rate, 0, :price, :warehouse_id,
-                :marka, :crop_year, 1, NOW(), :unit_conversion
-            )
-        """), {
-            "mr_id": child_mr_id,
-            "actual_item_id": target_item_id,
-            "actual_quality": r["actual_quality"],
-            "challan_quality_id": r["challan_quality_id"],
-            "w": moved,
-            "rate": float(rate),
-            "price": child_price,
-            "warehouse_id": warehouse_id,
-            "marka": r["marka"],
-            "crop_year": r["crop_year"],
-            "unit_conversion": r["unit_conversion"],
-        })
-
-        return child_mr_id
-
-
 def save_marked_batch(
     lot_li_ids: list,
     pct_change: float,
@@ -497,21 +375,28 @@ def save_marked_batch(
     (transfer_mode=1) holding its selected lines at the post-claim rate
     (rate - claim_rate) * (1 + pct/100); the child line itself is claim-free.
     The moved amount per line is the balance-aware available kg
-    (LEAST(view balance, accepted_weight)) — weight already issued to
-    production stays behind. Provenance rows are written to jute_lot_src so
-    deletion restores sources exactly.
+    (LEAST(view balance, accepted_weight)) -- weight already issued to
+    production or sold stays behind.
 
-    Also creates one seller-side Raw-Jute sales invoice per child MR at the
-    source branch (buyer = target company, auto-created in the source's
-    party_mst if missing) and stamps the child MR with the formatted invoice
-    no/date/amount. Returns a list of dicts:
+    The source lines and their MR header are NOT changed. The stock-out is
+    the seller invoice: one Raw-Jute sales invoice per child MR at the source
+    branch (buyer = target company, auto-created in the source's party_mst if
+    missing) whose lines name the source MR lines, so the ERP stock ledger
+    moves the balance to the child by itself. The child MR is stamped with
+    the formatted invoice no/date/amount. One jute_lot_src row per line
+    (qty_kg = moved kg, actual_*_delta NULL: nothing was taken off the
+    source row) keeps the provenance. Returns a list of dicts:
     {"child_mr_id": int, "invoice_no": str, "invoice_amount": float}.
     """
     if not lot_li_ids:
         raise ValueError("no lots selected")
     ids = sorted({int(x) for x in lot_li_ids})
 
-    with DatabaseConnection.get_transaction() as conn:
+    # The app's own saves one at a time (see transfer.CHAIN_SAVE_LOCK): the
+    # child MR / gate-entry / invoice numbers below are MAX+1 reads, and the
+    # lock is taken BEFORE the transaction so those reads are fresh.
+    with named_locks({CHAIN_SAVE_LOCK: CHAIN_SAVE_LOCK_TIMEOUT}), \
+            DatabaseConnection.get_transaction() as conn:
         rows = []
         for li_id in ids:  # ascending lock order
             row = conn.execute(text("""
@@ -521,6 +406,7 @@ def save_marked_batch(
                        li.allowable_moisture, li.actual_moisture,
                        li.marka, li.crop_year, li.unit_conversion,
                        li.actual_qty, li.actual_weight, li.actual_rate,
+                       li.active, li.status,
                        li.jute_mr_id, mr.branch_id AS src_branch_id,
                        mr.transfer_mode, mr.status_id, mr.src_jute_mr_id,
                        bm.co_id AS src_co_id
@@ -540,7 +426,7 @@ def save_marked_batch(
                 )
             if int(r["status_id"] or 0) != 3:
                 raise ValueError("Can only mark-move Approved (status 3) MRs")
-            # Mode-0 rows with src_jute_mr_id set are chain hops — blocked.
+            # Mode-0 rows with src_jute_mr_id set are chain hops -- blocked.
             # Mode-1 rows legitimately carry their direct parent there and may
             # be resold onward (each hop books its own seller invoice).
             if mode == 0 and r["src_jute_mr_id"] is not None:
@@ -548,6 +434,7 @@ def save_marked_batch(
                     f"MR {int(r['jute_mr_id'])} is a chain-hop MR "
                     "(src_jute_mr_id set); re-lot disabled"
                 )
+            _assert_stock_line(r)
             r["moved_kg"] = _available_kg(
                 conn, li_id, float(r["accepted_weight"] or 0)
             )
@@ -664,10 +551,10 @@ def save_marked_batch(
                 elif challan_item_id:
                     challan_item_id = _ensure_item(
                         conn, int(challan_item_id), target_co_id, updated_by)
-                aq_delta, aw_delta = _reduce_source_line(
-                    conn, r, moved, moved,
-                    keep_accepted=(int(r["transfer_mode"] or 0) == 1),
-                )
+                # The bales that travel with the moved kg: the stock view's
+                # own pro-rata of a sale against the line (sold_qty), so the
+                # seller's bal_qty and this child line add up to the source's.
+                moved_bales = sold_share(r["actual_qty"], r["actual_weight"], moved)
                 child_li_id = DatabaseConnection.execute_insert_returning_id(
                     conn, _LI_INSERT_SQL, {
                         "mr_id": child_mr_id,
@@ -685,38 +572,41 @@ def save_marked_batch(
                         "actual_rate": production_rate(r),
                         "price": line_price(moved, new_rate),
                         "warehouse_id": warehouse_id,
-                        "actual_qty": aq_delta,
+                        "actual_qty": moved_bales,
                         "marka": r["marka"],
                         "crop_year": r["crop_year"],
                         "unit_conversion": r["unit_conversion"],
                     })
+                # Provenance. NULL deltas: nothing was taken off the source
+                # row -- the stock-out is the invoice line below. (Rows with
+                # deltas are pre-2026-10-03 moves that drained the source.)
                 conn.execute(text("""
                     INSERT INTO jute_lot_src
                         (new_jute_mr_li_id, src_jute_mr_li_id, qty_kg,
                          actual_qty_delta, actual_weight_delta,
                          created_by, created_date_time)
-                    VALUES (:new_li, :src_li, :qty, :aq, :aw, :by, NOW())
+                    VALUES (:new_li, :src_li, :qty, NULL, NULL, :by, NOW())
                 """), {"new_li": child_li_id,
                        "src_li": int(r["jute_mr_li_id"]),
-                       "qty": moved, "aq": aq_delta, "aw": aw_delta,
-                       "by": updated_by})
+                       "qty": moved, "by": updated_by})
                 # Original source-company item id, taken BEFORE the
-                # target-company remap above — used as-is on the invoice
+                # target-company remap above -- used as-is on the invoice
                 # line so the invoice never round-trips through _ensure_item.
                 inv_lines.append({
                     "kg": moved,
                     "rate": new_rate,
                     "price": line_price(moved, new_rate),
                     "item_id": (int(src_item_id) if src_item_id else None),
-                    "actual_qty": aq_delta,
+                    "actual_qty": moved_bales,
                     "unit_conversion": r["unit_conversion"],
+                    "src_li_id": int(r["jute_mr_li_id"]),
                 })
 
-            _recompute_mr_header(conn, src_mr_id, updated_by)
             _recompute_mr_header(conn, child_mr_id, updated_by)
 
             # Seller-side inter-company sale (owner amendment 2026-08-03):
-            # the source branch bills the target company for this child MR.
+            # the source branch bills the target company for this child MR;
+            # each invoice line names its source MR line (the stock-out).
             buyer_party_id, buyer_party_branch_id = _ensure_company_as_party(
                 conn, target_co_id, target_branch_id, src_co_id, updated_by
             )
@@ -743,12 +633,85 @@ def save_marked_batch(
         return child_ids
 
 
-def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
-    """Reverse a marked move: delete the linked seller invoice, return the
-    child's weight to the matching source line(s), recompute the source
-    header(s), and delete the child MR + line items.
+def _restore_drained_sources(conn, prov: list, updated_by: int) -> None:
+    """Undo of a move written before 2026-10-03, which took the moved kg off
+    the source row: put accepted / actual weight, bales and price back from
+    the provenance deltas (a mode-1 source -- a resale -- had only its actual
+    fields drained) and rewrite the source headers by the ERP's rule.
 
-    Blocks if the child is itself the source of another marked move (leaf-first).
+    Locks and chain-guards every source line / MR BEFORE the first UPDATE
+    (fail-fast; the transaction would roll back anyway)."""
+    ordered = sorted(prov, key=lambda m: int(m["src_jute_mr_li_id"]))
+    srcs = {}
+    for m in ordered:
+        src_li_id = int(m["src_jute_mr_li_id"])
+        src = conn.execute(text("""
+            SELECT li.jute_mr_li_id, li.jute_mr_id, li.accepted_weight,
+                   li.rate, li.actual_qty, li.actual_weight,
+                   mr.transfer_mode
+            FROM jute_mr_li li
+            JOIN jute_mr mr ON mr.jute_mr_id = li.jute_mr_id
+            WHERE li.jute_mr_li_id = :id FOR UPDATE
+        """), {"id": src_li_id}).fetchone()
+        if not src:
+            raise ValueError(f"Source line {src_li_id} vanished; cannot restore")
+        srcs[src_li_id] = dict(src._mapping)
+
+    for mr_id in sorted({int(s["jute_mr_id"]) for s in srcs.values()}):
+        if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": mr_id}).fetchone():
+            raise ValueError(
+                f"Source MR {mr_id} now feeds a vertical chain; "
+                "cannot restore weights onto it"
+            )
+
+    touched = set()
+    for m in ordered:
+        s = srcs[int(m["src_jute_mr_li_id"])]
+        qty = float(m["qty_kg"] or 0)
+        new_w, new_aw, new_aq = restore_amounts(
+            s["accepted_weight"], s["actual_weight"], s["actual_qty"],
+            qty, m["actual_qty_delta"], m["actual_weight_delta"],
+        )
+        if int(s["transfer_mode"] or 0) == 1:
+            # Resale undo: accepted/total_price were never reduced
+            # (keep_accepted) -- restore only the actual fields.
+            conn.execute(text("""
+                UPDATE jute_mr_li
+                SET actual_weight = :aw, actual_qty = :aq,
+                    updated_date_time = NOW()
+                WHERE jute_mr_li_id = :id
+            """), {"aw": new_aw, "aq": new_aq, "id": int(s["jute_mr_li_id"])})
+        else:
+            conn.execute(text("""
+                UPDATE jute_mr_li
+                SET accepted_weight = :w, total_price = :p,
+                    actual_weight = :aw, actual_qty = :aq,
+                    updated_date_time = NOW()
+                WHERE jute_mr_li_id = :id
+            """), {"w": new_w,
+                   "p": line_price(new_w, float(s["rate"] or 0)),
+                   "aw": new_aw,
+                   "aq": new_aq,
+                   "id": int(s["jute_mr_li_id"])})
+        touched.add(int(s["jute_mr_id"]))
+    for mr_id in sorted(touched):
+        _recompute_mr_header(conn, mr_id, updated_by)
+
+
+def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
+    """Undo one marked move: delete the seller invoice booked with it -- the
+    stock-out, so the source line's balance comes back by itself -- and the
+    child MR with its lines and provenance. The source MR is not written.
+
+    A child written before 2026-10-03 (its jute_lot_src rows carry
+    actual_*_delta and its invoice line names no MR line: the move drained
+    the source row) gets its source lines restored from the provenance and
+    the source headers rewritten by the ERP's rule -- until
+    scripts/repair_transfer_data.py `marked-stock` has converted it.
+
+    Blocks, leaving nothing orphaned: a later marked move out of this child
+    (leaf-first), ERP issue entries on its lines, an ERP sales invoice line
+    drawn on its lines, a child without provenance.
     """
     with DatabaseConnection.get_transaction() as conn:
         child = conn.execute(text("""
@@ -780,164 +743,63 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
                 "This marked MR has ERP issue entries (consumption started); "
                 "cannot delete"
             )
+        # A raw-jute sale entered in the ERP against this child's stock names
+        # its lines (sales_invoice_dtl.jute_mr_li_id); deleting the lines
+        # would orphan that sale. (This move's own invoice names the SOURCE
+        # lines, a resale's the child's -- the leaf-first guard above covers
+        # the resale.)
+        sold = conn.execute(text("""
+            SELECT 1 FROM sales_invoice_dtl sid
+            JOIN jute_mr_li li ON li.jute_mr_li_id = sid.jute_mr_li_id
+            WHERE li.jute_mr_id = :id
+            LIMIT 1
+        """), {"id": child_mr_id}).fetchone()
+        if sold:
+            raise ValueError(
+                "This marked MR's stock has been sold in the ERP (a sales "
+                "invoice line names it); cannot delete"
+            )
 
-        # Cascade-delete the seller invoice created at transfer time
-        # (sales_invoice_jute.mr_id = child MR id; absent on pre-amendment
-        # rows, so this is a no-op for legacy marked MRs).
-        inv_rows = conn.execute(text(
-            "SELECT invoice_id FROM sales_invoice_jute WHERE mr_id = :id"
-        ), {"id": child_mr_id}).fetchall()
-        for (inv_id,) in inv_rows:
-            conn.execute(text("""
-                DELETE sijd FROM sales_invoice_jute_dtl sijd
-                JOIN sales_invoice_dtl sid
-                  ON sid.invoice_line_item_id = sijd.invoice_line_item_id
-                WHERE sid.invoice_id = :id
-            """), {"id": inv_id})
-            conn.execute(text(
-                "DELETE FROM sales_invoice_jute WHERE invoice_id = :id"
-            ), {"id": inv_id})
-            conn.execute(text(
-                "DELETE FROM sales_invoice_dtl WHERE invoice_id = :id"
-            ), {"id": inv_id})
-            conn.execute(text(
-                "DELETE FROM sales_invoice WHERE invoice_id = :id"
-            ), {"id": inv_id})
+        # This move's own seller invoice(s): sales_invoice_jute.mr_id = child
+        # MR id (absent on pre-amendment rows: then nothing to delete).
+        own_invoices = _invoice_ids_for_mr(conn, child_mr_id)
+        linked_src = set()
+        for inv_id in own_invoices:
+            linked_src.update(select_ids(conn, """
+                SELECT jute_mr_li_id FROM sales_invoice_dtl
+                WHERE invoice_id = :id AND jute_mr_li_id IS NOT NULL
+            """, {"id": inv_id}))
 
-        source_mr_id = c["src_jute_mr_id"]
-
-        prov = conn.execute(text("""
-            SELECT ls.src_jute_mr_li_id, ls.qty_kg,
-                   ls.actual_qty_delta, ls.actual_weight_delta,
-                   ls.new_jute_mr_li_id
+        prov = [dict(p._mapping) for p in conn.execute(text("""
+            SELECT ls.lot_src_id, ls.src_jute_mr_li_id, ls.qty_kg,
+                   ls.actual_qty_delta, ls.actual_weight_delta
             FROM jute_lot_src ls
             JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
             WHERE li.jute_mr_id = :id
             FOR UPDATE
-        """), {"id": child_mr_id}).fetchall()
-        if prov:
-            ordered_prov = sorted(
-                prov, key=lambda p: int(p._mapping["src_jute_mr_li_id"])
+        """), {"id": child_mr_id}).fetchall()]
+        if not prov:
+            raise ValueError(
+                f"Marked MR {child_mr_id} has no line provenance (jute_lot_src); "
+                "it predates provenance and cannot be undone by the app"
             )
+        # Only a pre-2026-10-03 move took anything off the source row:
+        # deltas on the provenance AND an invoice that does not name the
+        # source line. Everything else is undone by deleting the invoice.
+        drained = [m for m in prov
+                   if m["actual_weight_delta"] is not None
+                   and int(m["src_jute_mr_li_id"]) not in linked_src]
+        if drained:
+            _restore_drained_sources(conn, drained, updated_by)
 
-            # Lock + fetch all source lines first, and chain-guard every source
-            # MR BEFORE any UPDATE runs (fail-fast; the transaction would roll
-            # back anyway, but this avoids partial mutation attempts).
-            srcs = {}
-            for p in ordered_prov:
-                m = p._mapping
-                src_li_id = int(m["src_jute_mr_li_id"])
-                src = conn.execute(text("""
-                    SELECT li.jute_mr_li_id, li.jute_mr_id, li.accepted_weight,
-                           li.rate, li.actual_qty, li.actual_weight,
-                           mr.transfer_mode
-                    FROM jute_mr_li li
-                    JOIN jute_mr mr ON mr.jute_mr_id = li.jute_mr_id
-                    WHERE li.jute_mr_li_id = :id FOR UPDATE
-                """), {"id": src_li_id}).fetchone()
-                if not src:
-                    raise ValueError(
-                        f"Source line {src_li_id} vanished; cannot restore"
-                    )
-                srcs[src_li_id] = src._mapping
-
-            checked_mrs = set()
-            for s in srcs.values():
-                mr_id = int(s["jute_mr_id"])
-                if mr_id in checked_mrs:
-                    continue
-                if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": mr_id}).fetchone():
-                    raise ValueError(
-                        f"Source MR {mr_id} now feeds a vertical chain; "
-                        "cannot restore weights onto it"
-                    )
-                checked_mrs.add(mr_id)
-
-            src_mr_ids = set()
-            for p in ordered_prov:
-                m = p._mapping
-                s = srcs[int(m["src_jute_mr_li_id"])]
-                qty = float(m["qty_kg"] or 0)
-                new_w, new_aw, new_aq = restore_amounts(
-                    s["accepted_weight"], s["actual_weight"], s["actual_qty"],
-                    qty, m["actual_qty_delta"], m["actual_weight_delta"],
-                )
-                if int(s["transfer_mode"] or 0) == 1:
-                    # Resale undo: accepted/total_price were never reduced
-                    # (keep_accepted) — restore only the actual fields.
-                    conn.execute(text("""
-                        UPDATE jute_mr_li
-                        SET actual_weight = :aw, actual_qty = :aq,
-                            updated_date_time = NOW()
-                        WHERE jute_mr_li_id = :id
-                    """), {"aw": new_aw, "aq": new_aq,
-                           "id": int(s["jute_mr_li_id"])})
-                else:
-                    conn.execute(text("""
-                        UPDATE jute_mr_li
-                        SET accepted_weight = :w, total_price = :p,
-                            actual_weight = :aw, actual_qty = :aq,
-                            updated_date_time = NOW()
-                        WHERE jute_mr_li_id = :id
-                    """), {"w": new_w,
-                           "p": _round2(new_w * float(s["rate"] or 0) / 100.0),
-                           "aw": new_aw,
-                           "aq": new_aq,
-                           "id": int(s["jute_mr_li_id"])})
-                src_mr_ids.add(int(s["jute_mr_id"]))
-            for mr_id in sorted(src_mr_ids):
-                _recompute_mr_header(conn, mr_id, updated_by)
-            conn.execute(text("""
-                DELETE ls FROM jute_lot_src ls
-                JOIN jute_mr_li li ON li.jute_mr_li_id = ls.new_jute_mr_li_id
-                WHERE li.jute_mr_id = :id
-            """), {"id": child_mr_id})
-            conn.execute(text("DELETE FROM jute_mr_li WHERE jute_mr_id = :id"),
-                         {"id": child_mr_id})
-            conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"),
-                         {"id": child_mr_id})
-            return
-
-        child_li = conn.execute(text("""
-            SELECT COALESCE(SUM(accepted_weight),0) AS w, MIN(actual_quality) AS q
-            FROM jute_mr_li WHERE jute_mr_id = :id
-        """), {"id": child_mr_id}).fetchone()
-        moved = float(child_li._mapping["w"] or 0)
-        child_quality = child_li._mapping["q"]
-
-        if source_mr_id and moved:
-            if conn.execute(text(_CHAIN_CHILD_SQL), {"sid": int(source_mr_id)}).fetchone():
-                raise ValueError(
-                    f"Source MR {source_mr_id} now feeds a vertical chain; "
-                    "cannot restore weights onto it"
-                )
-            # Match the source line by quality (jute_qlty_id copied unchanged);
-            # fall back to the first line if quality is null.
-            src_line = conn.execute(text("""
-                SELECT jute_mr_li_id, accepted_weight, rate
-                FROM jute_mr_li
-                WHERE jute_mr_id = :id AND (actual_quality <=> :q)
-                ORDER BY jute_mr_li_id LIMIT 1 FOR UPDATE
-            """), {"id": int(source_mr_id), "q": child_quality}).fetchone()
-            if src_line is None:
-                src_line = conn.execute(text("""
-                    SELECT jute_mr_li_id, accepted_weight, rate
-                    FROM jute_mr_li WHERE jute_mr_id = :id
-                    ORDER BY jute_mr_li_id LIMIT 1 FOR UPDATE
-                """), {"id": int(source_mr_id)}).fetchone()
-            if src_line is not None:
-                s = src_line._mapping
-                new_w = float(s["accepted_weight"] or 0) + moved
-                new_p = _round2(new_w * float(s["rate"] or 0) / 100.0)
-                conn.execute(text("""
-                    UPDATE jute_mr_li
-                    SET accepted_weight = :w, total_price = :p, updated_date_time = NOW()
-                    WHERE jute_mr_li_id = :id
-                """), {"w": new_w, "p": new_p, "id": int(s["jute_mr_li_id"])})
-                _recompute_mr_header(conn, int(source_mr_id), updated_by)
-
-        conn.execute(text("DELETE FROM jute_mr_li WHERE jute_mr_id = :id"), {"id": child_mr_id})
-        conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"), {"id": child_mr_id})
+        for inv_id in own_invoices:
+            _delete_invoice(conn, inv_id)
+        delete_by_ids(conn, "jute_lot_src", "lot_src_id", [m["lot_src_id"] for m in prov])
+        delete_by_ids(conn, "jute_mr_li", "jute_mr_li_id", select_ids(
+            conn, "SELECT jute_mr_li_id FROM jute_mr_li WHERE jute_mr_id = :id",
+            {"id": child_mr_id}))
+        conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"),
+                     {"id": child_mr_id})
 
 
 if __name__ == "__main__":
@@ -953,4 +815,8 @@ if __name__ == "__main__":
             pass
         else:
             raise AssertionError(f"expected ValueError for moved={bad}")
+    # bales travel with the moved kg the way the stock view books a sale
+    assert sold_share(66, 9700, 9700) == 66.0
+    assert sold_share(66, 9700, 9312) == 63.36
+    assert sold_share(0, 0, 100) == 0.0
     print("warehouse_stock_ops self-check OK")

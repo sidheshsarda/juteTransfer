@@ -1649,6 +1649,30 @@ def summary_line(t: dict) -> str:
     ])
 
 
+def fy_po_note(shown: dict, in_fy: dict, period_code, fy_start_year: int,
+               searching: bool = False) -> str:
+    """The caption under the summary line when the shown month has fewer
+    transfer POs than the financial year it belongs to: '' otherwise.
+
+    During the pilot the default screen (newest month) said '0 forwarding
+    POs · 0 final POs' while the pilot's two POs sat in August, which read
+    as 'the POs are missing'. `shown` / `in_fy` are lorry_totals() of the
+    rows on screen and of every lorry of the year in the same mill /
+    forwarder filter. A search already spans the year, so nothing is said."""
+    if searching or not isinstance(period_code, str) or not period_code.startswith("M:"):
+        return ""
+    elsewhere = (max(in_fy["fwd_count"] - shown["fwd_count"], 0)
+                 + max(in_fy["final_count"] - shown["final_count"], 0))
+    if elsewhere <= 0:
+        return ""
+    year = fy_text(fy_start_year)
+    return (f"Transfer POs so far in FY {year}: "
+            f"{_plural(in_fy['fwd_count'], 'forwarding PO')}, "
+            f"{_plural(in_fy['final_count'], 'final PO')} — "
+            f"{elsewhere} {'is' if elsewhere == 1 else 'are'} in other months; "
+            f"pick 'FY {year} – all' under Period to see them.")
+
+
 def totals_line(t: dict) -> str:
     """The line under the Lorries table (never a table row: a total row
     could be selected and would break the row-to-lorry mapping)."""

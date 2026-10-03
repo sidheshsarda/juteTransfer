@@ -192,7 +192,16 @@ def get_jute_mr_with_line_items(
             (COALESCE(li.accepted_weight, 0) * COALESCE(li.claim_rate, 0) / 100 + COALESCE(li.water_damage_amount, 0) - COALESCE(li.premium_amount, 0)) AS `Claim Amount`,
             ((COALESCE(li.accepted_weight, 0) * COALESCE(li.rate, 0) / 100) - (COALESCE(li.accepted_weight, 0) * COALESCE(li.claim_rate, 0) / 100 + COALESCE(li.water_damage_amount, 0) - COALESCE(li.premium_amount, 0))) AS `Net Total`,
             mr.challan_date AS `Challan Date`,
-            wh.warehouse_name AS `Warehouse`
+            wh.warehouse_name AS `Warehouse`,
+            -- the MR header's own money (what the ERP shows and the P&L
+            -- sums): after a finalize the net carries 194Q TDS and the
+            -- roundoff, which the line-derived `Net Total` above does not
+            mr.total_amount AS mr_total_amount,
+            mr.claim_amount AS mr_claim_amount,
+            mr.tds_amount AS mr_tds_amount,
+            mr.roundoff AS mr_roundoff,
+            mr.net_total AS mr_net_total,
+            mr.invoice_amount AS mr_invoice_amount
         FROM jute_mr mr
         INNER JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         INNER JOIN jute_mr_li li ON mr.jute_mr_id = li.jute_mr_id
@@ -222,6 +231,12 @@ def get_jute_mr_with_line_items(
     return DatabaseConnection.execute_query(query, params)
 
 
+# A jute_mr_li row that is stock in the ERP's eyes (vw_jute_stock_outstanding,
+# warehouse_stock_ops._assert_stock_line): active, and not removed at QC.
+STOCK_LINE_SQL = ("(li.active = 1 OR li.active IS NULL) "
+                  "AND (li.status IS NULL OR li.status NOT IN ('4', '6'))")
+
+
 def get_available_lots(co_id: int, branch_id: int, year: int, month: int,
                        include_marked: bool = False) -> pd.DataFrame:
     """Transferable lots: Approved (status 3), available kg > 0, not feeding a
@@ -232,7 +247,12 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int,
 
     Mode-0 lines only by default (src_jute_mr_id NULL keeps chain hops out);
     include_marked=True also lists mode-1 marked stock held here so it can be
-    resold onward (its src_jute_mr_id is legitimately the direct parent)."""
+    resold onward (its src_jute_mr_id is legitimately the direct parent).
+
+    A soft-deleted line (active = 0, the ERP QC edit leaves its weights on
+    the row) or a removed one (status 4 / 6) is not stock: the ERP stock view
+    does not list it and save_marked_batch / create_lot refuse it, so it is
+    not offered here either (it used to be, through the COALESCE fallback)."""
     # actual_weight > 0 keeps out legacy mode-1 lines (created before actual
     # fields were written) — reduce_amounts would reject them and poison the
     # whole batch save.
@@ -275,6 +295,7 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int,
         WHERE mr.status_id = 3
           AND ((mr.transfer_mode = 0 AND mr.src_jute_mr_id IS NULL)
                {marked_clause})
+          AND {STOCK_LINE_SQL}
           AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
                     COALESCE(li.accepted_weight, 0)) > 0
           AND bm.co_id = :co_id
@@ -296,8 +317,8 @@ def get_available_lots(co_id: int, branch_id: int, year: int, month: int,
 
 def get_quality_availability_summary(co_id: int, branch_id: int, year: int, month: int) -> pd.DataFrame:
     """Quality-wise availability: lot count, total kg, weighted-avg
-    post-claim rate (rate - claim_rate)."""
-    query = """
+    post-claim rate (rate - claim_rate). Same lines as get_available_lots."""
+    query = f"""
         SELECT
             im.item_name AS quality,
             COUNT(*) AS lots,
@@ -316,6 +337,7 @@ def get_quality_availability_summary(co_id: int, branch_id: int, year: int, mont
         WHERE mr.transfer_mode = 0
           AND mr.status_id = 3
           AND mr.src_jute_mr_id IS NULL
+          AND {STOCK_LINE_SQL}
           AND LEAST(COALESCE(v.bal_weight, li.accepted_weight),
                     COALESCE(li.accepted_weight, 0)) > 0
           AND bm.co_id = :co_id
@@ -471,7 +493,7 @@ def get_source_mr_full(jute_mr_id: int, conn=None) -> Optional[dict]:
         mr_dict = dict(mr_row._mapping)
 
         li_rows = conn.execute(
-            sa_text("SELECT * FROM jute_mr_li WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL)"),
+            sa_text("SELECT * FROM jute_mr_li WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL) ORDER BY jute_mr_li_id"),
             {"id": jute_mr_id},
         ).fetchall()
         mr_dict["line_items"] = [dict(r._mapping) for r in li_rows]
@@ -487,7 +509,7 @@ def get_source_mr_full(jute_mr_id: int, conn=None) -> Optional[dict]:
     mr_dict = mr_df.iloc[0].to_dict()
 
     li_df = DatabaseConnection.execute_query(
-        "SELECT * FROM jute_mr_li WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL)",
+        "SELECT * FROM jute_mr_li WHERE jute_mr_id = :id AND (active = 1 OR active IS NULL) ORDER BY jute_mr_li_id",
         {"id": jute_mr_id},
     )
     mr_dict["line_items"] = (
@@ -500,7 +522,8 @@ def get_transfer_chain(root_mr_id: int) -> pd.DataFrame:
     """Fetch all transferred MRs for a given root MR, with company info.
 
     Returns DataFrame with columns: jute_mr_id, src_com_id, branch_id,
-    jute_mr_date, challan_date, branch_mr_no, total_amount, claim_amount, net_total,
+    jute_mr_date, challan_date, branch_mr_no, total_amount, claim_amount,
+    tds_amount, roundoff, net_total (the header money as stored),
     owner_co_id, branch_name, co_name, co_prefix, branch_prefix, and the PO
     the step's MR is linked to (transfer_po_id / _no / _date / _weight /
     _value / _note; all NULL on chains saved before transfer POs existed --
@@ -510,7 +533,8 @@ def get_transfer_chain(root_mr_id: int) -> pd.DataFrame:
     return DatabaseConnection.execute_query(
         """
         SELECT mr.jute_mr_id, mr.src_com_id, mr.branch_id, mr.jute_mr_date,
-               mr.challan_date, mr.branch_mr_no, mr.total_amount, mr.claim_amount, mr.net_total,
+               mr.challan_date, mr.branch_mr_no, mr.total_amount, mr.claim_amount,
+               mr.tds_amount, mr.roundoff, mr.net_total,
                bm.co_id AS owner_co_id, bm.branch_name,
                cm.co_name, cm.co_prefix, bm.branch_prefix,
                mr.po_id AS transfer_po_id, po.po_no AS transfer_po_no,
@@ -577,26 +601,6 @@ def get_transfer_chains_batch(mr_ids: list) -> dict:
     return {int(mid): group for mid, group in df.groupby("src_jute_mr_id")}
 
 
-def get_warehouses_by_branch(branch_id: int) -> dict:
-    """Return {warehouse_name: warehouse_id} for a branch from cached data."""
-    df = load_warehouses()
-    if df is None or df.empty:
-        return {}
-    # Explicit int cast to avoid numpy/pandas dtype mismatch from iterrows()
-    filtered = df[df['branch_id'] == int(branch_id)]
-    return dict(zip(filtered['warehouse_name'], filtered['warehouse_id']))
-
-
-def get_marked_warehouses_by_branch(branch_id: int) -> dict:
-    """Return {warehouse_name: warehouse_id} for a branch, only godowns tagged
-    as marked (warehouse_type == 'MARKED')."""
-    df = load_warehouses()
-    if df is None or df.empty:
-        return {}
-    filtered = df[(df['branch_id'] == int(branch_id)) & (df['warehouse_type'] == 'MARKED')]
-    return dict(zip(filtered['warehouse_name'], filtered['warehouse_id']))
-
-
 # warehouse_mst.warehouse_type is ERP master data ('J' jute godown, 'S' store,
 # ...). The app borrows it for its own 'MARKED' tag, so it may only ever flip
 # a godown between its jute type and MARKED -- never blank it, never touch a
@@ -606,19 +610,55 @@ MARKED_GODOWN_TYPE = "MARKED"
 STORE_GODOWN_TYPE = "S"
 
 
-def get_markable_warehouses_by_branch(branch_id: int) -> dict:
-    """{warehouse_name: warehouse_id} of the godowns that may be tagged as
-    marked: jute godowns ('J'), those already marked, and untyped ones
-    (blank / NULL -- the godowns an old tag save blanked were all 'J').
-    Store godowns ('S') and any other type are left out, because untagging
-    gives a godown the jute type 'J' back."""
+def _godown_kind(df: pd.DataFrame) -> pd.Series:
+    """warehouse_type as MySQL compares it: trimmed, case-insensitive ('j' is
+    a jute godown too -- sls branch 87 has two typed that way), NULL -> ''."""
+    return df['warehouse_type'].fillna('').astype(str).str.strip().str.upper()
+
+
+def _branch_godowns(branch_id: int, kinds=None) -> dict:
+    """{warehouse_id: label} of a branch's godowns, in the master's order,
+    limited to the given warehouse types (all when None).
+
+    The pages key their godown widgets by id, never by name: branch 87 has
+    two godowns called LCPL_JUTE (244, 360), and a name-keyed map kept only
+    one of them. A name two godowns of the branch share is shown with the id
+    after it -- decided over the whole branch, so a godown keeps one label
+    in every list it appears in."""
     df = load_warehouses()
     if df is None or df.empty:
         return {}
-    kind = df['warehouse_type'].fillna('').astype(str).str.strip()
-    filtered = df[(df['branch_id'] == int(branch_id))
-                  & kind.isin(['', JUTE_GODOWN_TYPE, MARKED_GODOWN_TYPE])]
-    return dict(zip(filtered['warehouse_name'], filtered['warehouse_id']))
+    # Explicit int cast to avoid numpy/pandas dtype mismatch from iterrows()
+    branch = df[df['branch_id'] == int(branch_id)]
+    names = branch['warehouse_name'].fillna('').astype(str).tolist()
+    ids = [int(w) for w in branch['warehouse_id']]
+    shared = {n for n in names if names.count(n) > 1}
+    labels = {wid: (f"{name} (#{wid})" if name in shared else name)
+              for wid, name in zip(ids, names)}
+    if kinds is None:
+        return labels
+    keep = _godown_kind(branch).isin(list(kinds)).tolist()
+    return {wid: labels[wid] for wid, ok in zip(ids, keep) if ok}
+
+
+def get_warehouses_by_branch(branch_id: int) -> dict:
+    """{warehouse_id: label} of every godown of a branch."""
+    return _branch_godowns(branch_id)
+
+
+def get_marked_warehouses_by_branch(branch_id: int) -> dict:
+    """{warehouse_id: label} of the branch's godowns tagged as marked
+    (warehouse_type 'MARKED', compared case-insensitively like MySQL)."""
+    return _branch_godowns(branch_id, [MARKED_GODOWN_TYPE])
+
+
+def get_markable_warehouses_by_branch(branch_id: int) -> dict:
+    """{warehouse_id: label} of the godowns that may be tagged as marked:
+    jute godowns ('J' / 'j'), those already marked, and untyped ones (blank /
+    NULL -- the godowns an old tag save blanked were all 'J'). Store godowns
+    ('S') and any other type are left out, because untagging gives a godown
+    the jute type 'J' back."""
+    return _branch_godowns(branch_id, ['', JUTE_GODOWN_TYPE, MARKED_GODOWN_TYPE])
 
 
 def set_warehouse_marked(warehouse_id: int, marked: bool) -> int:
@@ -740,17 +780,29 @@ def get_company_wise_unsold_stock(fy_start, fy_end) -> pd.DataFrame:
       - Not referenced by an active raw-jute sales_invoice_jute row
         (i.e., the seller has not yet invoiced this MR forward).
 
+    Valuation: the MR's net_total -- except for an MR some of whose lines were
+    sold through a marked move (a mode-1 child names it as src_jute_mr_id).
+    Since 2026-10-03 a move no longer drains the source line: the stock-out is
+    the seller invoice line that names the source MR line, which the ERP
+    stock view nets off that line's balance (and the invoice itself is linked
+    to the CHILD MR, so the sales_invoice_jute test above does not see it).
+    Such an MR is valued like the marked-stock arm (get_company_wise_marked_
+    stock): remaining balance per active line, LEAST(view balance, accepted)
+    and never below 0, at the post-claim rate (rate - claim_rate) -- so what
+    was moved counts once, as marked stock at the holder, not twice.
+
     Columns: co_id, co_name, stock_value (float).
     """
-    return DatabaseConnection.execute_query(
-        """
-        SELECT
-            cm.co_id   AS co_id,
-            cm.co_name AS co_name,
-            COALESCE(SUM(mr.net_total), 0) AS stock_value
+    common = """
         FROM jute_mr mr
         JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         JOIN co_mst    cm ON bm.co_id = cm.co_id
+        {mk_join} (
+            SELECT DISTINCT c.src_jute_mr_id AS src_id
+            FROM jute_mr c
+            WHERE c.transfer_mode = 1 AND c.src_jute_mr_id IS NOT NULL
+        ) mk ON mk.src_id = mr.jute_mr_id
+        {line_joins}
         WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
           AND mr.status_id = 3
           AND mr.transfer_mode = 0
@@ -768,7 +820,30 @@ def get_company_wise_unsold_stock(fy_start, fy_end) -> pd.DataFrame:
                 AND si.active = 1
                 AND si.invoice_type = 5
           )
-        GROUP BY cm.co_id, cm.co_name
+    """
+    untouched = common.format(mk_join="LEFT JOIN", line_joins="") + " AND mk.src_id IS NULL"
+    moved_from = common.format(
+        mk_join="JOIN",
+        line_joins=f"""
+        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id AND {STOCK_LINE_SQL}
+        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
+        """,
+    )
+    return DatabaseConnection.execute_query(
+        f"""
+        SELECT s.co_id, s.co_name, COALESCE(SUM(s.stock_value), 0) AS stock_value
+        FROM (
+            SELECT cm.co_id AS co_id, cm.co_name AS co_name,
+                   COALESCE(mr.net_total, 0) AS stock_value
+            {untouched}
+            UNION ALL
+            SELECT cm.co_id AS co_id, cm.co_name AS co_name,
+                   LEAST(GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0),
+                         COALESCE(li.accepted_weight, 0))
+                   * (COALESCE(li.rate, 0) - COALESCE(li.claim_rate, 0)) / 100 AS stock_value
+            {moved_from}
+        ) s
+        GROUP BY s.co_id, s.co_name
         """,
         {
             "fy_start": fy_start.strftime("%Y-%m-%d"),

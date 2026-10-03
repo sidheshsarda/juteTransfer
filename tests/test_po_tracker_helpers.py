@@ -802,6 +802,27 @@ def test_summary_counts_only_check_and_other_as_attention():
                                  "1 without PO yet · 2 need attention (1 to check, 1 other)")
 
 
+def test_fy_note_says_where_the_pos_are_when_the_month_shows_none():
+    """The pilot's two POs are in August; the default screen is September:
+    '0 forwarding POs · 0 final POs' needs the line that says where they are."""
+    pilot = one(scenario(root=101, hop=201, fwd_po=301, fwd_no=1, ge_no=1,
+                         ge_date=date(2026, 8, 5), returned=True))
+    waiting = one(scenario(root=102, hop=202, ge_no=2, fwd=False))
+    september, year = H.lorry_totals([waiting]), H.lorry_totals([pilot, waiting])
+    assert H.fy_po_note(september, year, "M:2026-09", 2026) == (
+        "Transfer POs so far in FY 26-27: 1 forwarding PO, 1 final PO — 2 are in other "
+        "months; pick 'FY 26-27 – all' under Period to see them.")
+    one_more = H.lorry_totals([one(scenario(root=103, hop=203, ge_no=3, fwd_po=303, fwd_no=3)),
+                               waiting])
+    assert H.fy_po_note(september, one_more, "M:2026-09", 2026).startswith(
+        "Transfer POs so far in FY 26-27: 1 forwarding PO, 0 final POs — 1 is in other months")
+    # nothing to add when the month holds every PO, for the whole year, or during a search
+    assert H.fy_po_note(year, year, "M:2026-08", 2026) == ""
+    assert H.fy_po_note(september, year, "FY:2026", 2026) == ""
+    assert H.fy_po_note(september, year, "M:2026-09", 2026, searching=True) == ""
+    assert H.fy_po_note(september, year, None, 2026) == ""
+
+
 def test_one_info_banner_for_lorries_without_po():
     lorries = [one(scenario(fwd=False)), one(scenario(returned=True, fwd=False, final=False))]
     assert H.backfill_banners(lorries) == [(
@@ -1015,6 +1036,15 @@ def test_page_renders_every_chip_view_and_search(monkeypatch):
             "1 without PO yet · 0 need attention") in markdown
     assert [t for t in info if t.startswith("1 lorry has no transfer PO yet")]
     assert names[-2:] == ["po_tracker_all_2026-09.csv", "po_tracker_all_2026-09_lines.csv"]
+    # the pilot's POs are in August: the screen says so instead of '0 final POs' alone
+    assert ("Transfer POs so far in FY 26-27: 2 forwarding POs, 1 final PO — 2 are in other "
+            "months; pick 'FY 26-27 – all' under Period to see them.") in [
+                str(c.value) for c in at.caption]
+    # the four pinned / fixed columns fit a 390 px phone beside the selection box
+    widths = {c: cfg.get("width") for c, cfg in
+              page._lorry_column_config().items() if c in ("Lorry", "Orig PO", "Fwd PO", "Final PO")}
+    assert widths == {"Lorry": 100, "Orig PO": 70, "Fwd PO": 78, "Final PO": 78}
+    assert sum(widths.values()) + 32 <= 358
 
     for chip in H.SHOW_OPTIONS:
         at.session_state["pot_show"] = chip

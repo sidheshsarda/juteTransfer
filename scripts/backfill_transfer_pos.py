@@ -22,12 +22,14 @@ the numbers still rise with the dates; a --root / --limit run that would
 jump older lorries says so.
 
 Numbers are taken in date order per branch (PO date, gate-entry no, MR id),
-Forwarding POs first, then Final POs, one transaction per PO; re-running
-skips what already exists. The run STOPS at the first failed PO and at the
-first PO whose number turns out to be used twice (the ERP and this app both
-number MAX+1 without a lock): nothing after it has taken a number, so a
-re-run continues in date order. Exit code 0 only when every planned PO was
-created and the after-run check is clean.
+Forwarding POs first, then Final POs, one transaction per PO under the
+branch's PO numbering lock (the ERP's protocol, po_ops.po_no_lock: an ERP PO
+save at that branch waits, or this run does); re-running skips what already
+exists. The run STOPS at the first failed PO and at the first PO whose number
+turns out to be used twice (a writer that skipped the lock, or an older
+duplicate): nothing after it has taken a number, so a re-run continues in
+date order. Exit code 0 only when every planned PO was created and the
+after-run check is clean.
 
 Every --apply run writes a JSON log (the plan first, then each PO as it is
 committed); --undo deletes exactly the PO ids in it, and only while each
@@ -51,7 +53,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from src.jutetransfer import po_ops
-from src.jutetransfer.database import DatabaseConnection
+from src.jutetransfer.database import DatabaseConnection, named_locks
 from src.jutetransfer.po_helpers import (
     ROLE_FINAL, ROLE_FORWARD, format_po_no, fy_label, parse_marker,
 )
@@ -377,8 +379,10 @@ def same_number_pos(conn, po_id: int) -> list:
 
 
 def apply(planned, log_path: Path, scope: str = ""):
-    """Create the planned POs: one transaction per PO, root row locked first
-    (as the page does), each planned again under that lock.
+    """Create the planned POs: one transaction per PO, the branch's PO
+    numbering lock (po_ops.po_no_lock, the ERP's protocol) held from before
+    the transaction opens until after it ends and the root row locked first
+    inside it (as the page does), each PO planned again under those locks.
 
     Stops at the first FAILED PO and at the first duplicate number, so that
     no later lorry takes a number before an earlier one. A PO the fresh plan
@@ -400,7 +404,8 @@ def apply(planned, log_path: Path, scope: str = ""):
         p = e["plan"]
         role, mr_id, root_id = p["role"], int(p["mr_id"]), int(p["root_mr_id"])
         try:
-            with DatabaseConnection.get_transaction() as conn:
+            lock = {po_ops.po_no_lock(p["branch_id"]): po_ops.PO_NO_LOCK_TIMEOUT}
+            with named_locks(lock), DatabaseConnection.get_transaction() as conn:
                 conn.execute(text(
                     "SELECT jute_mr_id FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE"
                 ), {"id": root_id})

@@ -3,6 +3,7 @@ New Vertical Transfer Chain Editor Page
 Displays transfer chains in a 3-level hierarchy (filters → MR table → step cards with line items).
 """
 
+import logging
 from datetime import datetime, date
 import pandas as pd
 import streamlit as st
@@ -27,11 +28,20 @@ from ..jute_mr_chain_helpers import (
     _empty_transfer_step,
     _cascade_rate,
     _calculate_line_item_amount,
+    _stored_amount,
     is_root_eligible_for_new_chain,
 )
 from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
 
 FLASH_KEY = "chain_flash"
+# Every '% Rate Increase' box is a widget keyed 'pct_input_<root mr>_<step>'.
+# (The plain 'pct_<root>_<step>' shadow keys the box used to be seeded from
+# are gone: a shadow that outlived its step dict made the box show one %
+# while the save posted another. A box is now only ever seeded from, and
+# compared with, its step dict.)
+PCT_PREFIXES = ("pct_input_", "pct_")
+
+_log = logging.getLogger("jutetransfer.pages.transfer_chain")
 
 
 def _flash(kind: str, message: str) -> None:
@@ -48,28 +58,151 @@ def _render_flash() -> None:
     {"success": st.success, "warning": st.warning}.get(kind, st.info)(message)
     # Also a toast: on a phone the page keeps its scroll position, so the
     # banner at the top is out of view after a save or delete lower down.
-    st.toast(message, icon="✅" if kind == "success" else "⚠️")
+    # 'long', because the month reloads for 10-20 s right after a save.
+    st.toast(message, icon="✅" if kind == "success" else "⚠️", duration="long")
 
 
 def _drop_chain_state(filter_key: str, mr_id: int, keep_selection: bool = True) -> None:
-    """Forget everything cached for this month and this chain, including the
-    '% Rate Increase' boxes: a stale box would show one % while the next
-    save posts another (MR, invoice and PO)."""
+    """Forget what is cached for this month (the rows and every chain are read
+    again) and this lorry's editing state after a save or delete.
+
+    The other lorries' typed steps are kept: a save here does not change
+    them, and the editor rebuilds a kept chain by itself when the database
+    shows it changed (_chain_changed). Every '% Rate Increase' box is
+    forgotten: a box is re-seeded from its step dict, never the other way
+    round, so it can never show one % while the next save posts another."""
     keys = [
         f"raw_df_{filter_key}",
         f"source_df_{filter_key}",
         f"line_items_{filter_key}",
-        f"transfers_{filter_key}",
         f"chains_map_{filter_key}",
         f"step_line_items_{filter_key}_{mr_id}",
         f"orig_po_{filter_key}",
     ]
     if not keep_selection:
         keys.append(f"selected_row_{filter_key}")
-    prefixes = (f"pct_{mr_id}_", f"pct_input_{mr_id}_")
-    keys += [k for k in st.session_state if isinstance(k, str) and k.startswith(prefixes)]
+    keys += [k for k in st.session_state if isinstance(k, str) and k.startswith(PCT_PREFIXES)]
+    # This lorry's own step widgets go too: its cards are rebuilt from the
+    # database, and what was typed on the saved step is in the database now.
+    keys += _lorry_widget_keys(mr_id)
     for key in keys:
         st.session_state.pop(key, None)
+    transfers = st.session_state.get(f"transfers_{filter_key}")
+    if isinstance(transfers, dict):
+        transfers.pop(mr_id, None)
+
+
+def _saved_ids(steps) -> set:
+    """The MR ids of the saved steps of an in-memory chain (the root's own id
+    stands for the finalized return step)."""
+    return {int(s["saved_mr_id"]) for s in steps or [] if s.get("saved_mr_id")}
+
+
+def _chain_changed(steps, chain_data, is_finalized: bool, mr_id: int) -> bool:
+    """True when the chain kept in session state no longer matches the chain
+    the database holds (a step saved or deleted elsewhere, a finalize or an
+    un-finalize): the kept steps -- and anything typed on them -- are then
+    stale and must be rebuilt from the database."""
+    in_db = set()
+    if chain_data is not None and not chain_data.empty:
+        in_db = {int(x) for x in chain_data["jute_mr_id"]}
+    if is_finalized:
+        in_db.add(int(mr_id))
+    return _saved_ids(steps) != in_db
+
+
+STEP_WIDGETS = ("company", "date", "transport", "lc_ref", "lc_date", "po_lc", "od_lc",
+                "pct_input", "pct", "confirm_delete")
+
+
+def _step_widget_keys(mr_id: int, step_index: int) -> list:
+    """The session-state keys of every widget on one step card."""
+    exact = [f"{name}_{mr_id}_{step_index}" for name in STEP_WIDGETS]
+    prefix = f"wh_{mr_id}_{step_index}_"            # keyed by branch as well
+    return [k for k in st.session_state if isinstance(k, str)
+            and (k in exact or k.startswith(prefix))]
+
+
+def _lorry_widget_keys(mr_id: int) -> list:
+    """The session-state keys of the step widgets of every card of one lorry."""
+    prefixes = tuple(f"{name}_{mr_id}_" for name in STEP_WIDGETS + ("wh",))
+    return [k for k in st.session_state if isinstance(k, str) and k.startswith(prefixes)]
+
+
+def _source_mr_date(source_row):
+    """The selected MR's date (the default date of a new step); today when
+    the row has none."""
+    raw = None
+    if source_row is not None and "MR DATE" in getattr(source_row, "index", []):
+        raw = source_row.get("MR DATE")
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return date.today()
+    return raw
+
+
+def _mr_label(step: dict) -> str:
+    """'MR 50 (EJM-FACTORY)' for a saved step; the company alone when the
+    number is not known."""
+    mr_no = step.get("mr_no")
+    company = step.get("company") or "?"
+    if mr_no is None or (isinstance(mr_no, float) and pd.isna(mr_no)) or mr_no == "":
+        return company
+    try:
+        mr_no = int(mr_no)
+    except (TypeError, ValueError):
+        pass
+    return f"MR {mr_no} ({company})"
+
+
+def _delete_confirm_label(step_index: int, step: dict, all_steps: list) -> str:
+    """The tick-box text beside 'Delete from Step N onward': it names every
+    MR the tap will delete and what else goes with it, so the owner confirms
+    a thing, not a button."""
+    if step.get("is_final_return"):
+        return (f"Yes, un-finalize: remove the mill's {_mr_label(step)}, its invoice and "
+                "the Final PO — the mill's MR goes back to Pending")
+    doomed = [s for s in all_steps[step_index:] if s.get("saved_mr_id")]
+    hops = [s for s in doomed if not s.get("is_final_return")]
+    names = ", ".join(_mr_label(s) for s in hops)
+    steps_text = (f"step {step_index + 1}" if len(doomed) == 1
+                  else f"steps {step_index + 1}–{step_index + len(doomed)}")
+    text = f"Yes, delete {steps_text}: {names}"
+    if step_index == 0 and len(hops) == 1:
+        text += " and its transfer PO"
+    else:
+        text += (", with the invoices and transfer POs" if len(hops) > 1
+                 else ", with its invoice and transfer PO")
+    if any(s.get("is_final_return") for s in doomed):
+        text += "; the mill's MR goes back to Pending (invoice and Final PO removed)"
+    return text
+
+
+def _delete_result_message(summary: dict, step_index: int, step: dict) -> tuple:
+    """(kind, text) of the flash after delete_chain_from_step, from what it
+    reports as deleted -- never from what the page meant to delete."""
+    removed_pos = summary.get("deleted_pos") or []
+    po_text = ""
+    if removed_pos:
+        po_text = ("; transfer PO" + ("s " if len(removed_pos) > 1 else " ")
+                   + ", ".join(removed_pos) + " removed")
+    deleted = summary.get("deleted_mr_ids") or []
+    if not deleted and not summary.get("reverted"):
+        return ("warning", "Nothing was deleted: the chain had already changed "
+                           "(another session?). The page now shows it as it is.")
+    if step.get("is_final_return"):
+        return ("success", "Un-finalized — the mill's MR is back to Pending and the "
+                           f"invoice is removed{po_text}.")
+    n = len(deleted)
+    if step_index == 0:
+        # The first hop carries no invoice: the mill sells nothing, it hands
+        # the lorry over (the invoices start with the second hop).
+        what = "MR removed" if n == 1 else f"{n} MRs removed with the invoices of the later steps"
+    else:
+        what = "MR and invoice removed" if n == 1 else f"{n} MRs and their invoices removed"
+    msg = f"Deleted from step {step_index + 1} — {what}"
+    if summary.get("reverted"):
+        msg += ", the mill's MR is back to Pending"
+    return ("success", msg + po_text + ".")
 
 
 _SKIP_TEXT = {
@@ -101,6 +234,29 @@ def _clear_tracker_cache() -> None:
     clear = getattr(po_queries, "clear_tracker_cache", None)
     if clear:
         clear()
+
+
+def _stored_or_zero(value) -> float:
+    """A stored money figure as a float; 0.0 for None / NaN."""
+    amount = _stored_amount(value)
+    return 0.0 if amount is None else amount
+
+
+def _header_amount(row, key: str, fallback_key: str = None):
+    """A money column of the selected MR row as a float: the header column
+    `key` when the row has it, else `fallback_key` (the line-derived figure),
+    else None."""
+    for name in (key, fallback_key):
+        if name is None or name not in row.index:
+            continue
+        value = row.get(name)
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _fmt_date(value) -> str:
@@ -237,12 +393,16 @@ def _render_filters():
         st.error(f"Failed to load companies: {str(e)}")
         company_options = {}
 
+    # persist_state: the four filters survive a visit to another page (the
+    # PO Tracker, say) instead of falling back to the first company and the
+    # current month -- each fallback cost a 10-20 s reload of the month.
     with col1:
         selected_company_name = st.selectbox(
             "Select Company",
             options=list(company_options.keys()),
             index=0 if company_options else None,
             key="company_select",
+            persist_state="session",
         )
         selected_company_id = (
             company_options.get(selected_company_name)
@@ -270,6 +430,7 @@ def _render_filters():
             options=list(branch_options.keys()),
             index=0 if branch_options else None,
             key="branch_select",
+            persist_state="session",
         )
         selected_branch_id = (
             branch_options.get(selected_branch_name)
@@ -289,6 +450,7 @@ def _render_filters():
             options=list(range(current_year, current_year - 10, -1)),
             index=0,
             key="year_select",
+            persist_state="session",
         )
 
     # Store in session state
@@ -301,6 +463,7 @@ def _render_filters():
             format_func=lambda x: month_names[x - 1],
             index=current_month - 1,
             key="month_select",
+            persist_state="session",
         )
 
     # Store in session state
@@ -326,13 +489,15 @@ def _render_mr_table(filter_key):
     with reload_col:
         if st.button("Reload", key=f"reload_{filter_key}",
                      help="Read this month again from the database"):
-            # Data caches only: the selected row and the widgets stay.
+            # Data caches only: the selected row and every widget stay --
+            # company, date, LC fields AND the typed % (the box re-seeds its
+            # fresh step dict on the next run), so the card the owner was
+            # filling in looks the same after the reload as before it.
             data = (f"raw_df_{filter_key}", f"source_df_{filter_key}",
                     f"line_items_{filter_key}", f"transfers_{filter_key}",
                     f"chains_map_{filter_key}", f"orig_po_{filter_key}")
             for key in [k for k in st.session_state if isinstance(k, str)
-                        and (k in data or k.startswith(f"step_line_items_{filter_key}_")
-                             or k.startswith(("pct_", "pct_input_")))]:
+                        and (k in data or k.startswith(f"step_line_items_{filter_key}_"))]:
                 st.session_state.pop(key, None)
             _clear_tracker_cache()
             st.rerun()
@@ -340,6 +505,9 @@ def _render_mr_table(filter_key):
     # Load data if not cached
     raw_df_key = f"raw_df_{filter_key}"
     if raw_df_key not in st.session_state:
+        # Whatever the read below leaves behind, the editor must not find a
+        # half-loaded month: the grouped rows are the last thing written.
+        st.session_state.pop(f"source_df_{filter_key}", None)
         try:
             raw_df = get_jute_mr_with_line_items(
                 year=st.session_state["selected_year"],
@@ -355,11 +523,6 @@ def _render_mr_table(filter_key):
             # Group by MR header
             grouped_df, line_items_map = _group_by_mr(raw_df)
 
-            # Cache all data
-            st.session_state[raw_df_key] = raw_df
-            st.session_state[f"source_df_{filter_key}"] = grouped_df
-            st.session_state[f"line_items_{filter_key}"] = line_items_map
-
             # Batch-load all chains
             all_mr_ids = grouped_df["jute_mr_id"].astype(int).tolist()
             chains_dict = {}
@@ -367,10 +530,17 @@ def _render_mr_table(filter_key):
                 chain_data = get_transfer_chain(mr_id)
                 if chain_data is not None:
                     chains_dict[mr_id] = chain_data
+
+            # Cache all data -- only once every read succeeded, so a failure
+            # half-way never leaves rows without their chains.
+            st.session_state[raw_df_key] = raw_df
+            st.session_state[f"line_items_{filter_key}"] = line_items_map
             st.session_state[f"chains_map_{filter_key}"] = chains_dict
+            st.session_state[f"source_df_{filter_key}"] = grouped_df
 
         except Exception as e:
-            st.error(f"Error loading MRs: {str(e)}")
+            _log.exception("Loading the month failed (%s)", filter_key)
+            st.error(f"Error loading MRs: {str(e)} — tap Reload to try again.")
             return
 
     # Get cached data
@@ -441,6 +611,8 @@ def _render_chain_editor(filter_key):
     selected_row_key = f"selected_row_{filter_key}"
     if selected_row_key not in st.session_state:
         return  # No row selected
+    if f"source_df_{filter_key}" not in st.session_state:
+        return  # the month did not load (error shown above); nothing to edit
 
     row_idx = st.session_state[selected_row_key]
     grouped_df = st.session_state[f"source_df_{filter_key}"]
@@ -484,16 +656,25 @@ def _render_chain_editor(filter_key):
     _raw_ejm = row.get("EJM MR No.")
     is_finalized = pd.notna(_raw_ejm) and bool(_raw_ejm)
 
+    # The saved chain as the database holds it (the month was just read).
+    chain_data = chains_map.get(mr_id)
+    step_line_items_key = f"step_line_items_{filter_key}_{mr_id}"
+
+    # A chain kept from an earlier run (typed steps included) is only reused
+    # while the database still shows the same saved steps; otherwise it is
+    # rebuilt -- another session's save, or a delete, must never be edited
+    # over.
+    if mr_id in transfers and _chain_changed(transfers[mr_id], chain_data, is_finalized, mr_id):
+        transfers.pop(mr_id, None)
+        st.session_state.pop(step_line_items_key, None)
+
     # First time loading this MR: initialize from DB chain
     if mr_id not in transfers:
-        transfers[mr_id] = []
-
-        # Load saved chain if exists
-        chain_data = chains_map.get(mr_id)
-
         # Decision D1 (2026-09-03): a NEW chain may only start from an
         # ERP root at status 13 (Pending). Existing chains (root already
-        # has children) keep working regardless of root status.
+        # has children) keep working regardless of root status. (Checked
+        # before anything is kept for the MR, so the warning shows on every
+        # run, not only the first.)
         is_new_chain = chain_data is None or chain_data.empty
         if is_new_chain and not is_finalized:
             root_status = row.get("status_id_raw")
@@ -504,6 +685,8 @@ def _render_chain_editor(filter_key):
                     "for reference."
                 )
                 return
+
+        transfers[mr_id] = []
 
         if chain_data is not None and not chain_data.empty:
             try:
@@ -527,6 +710,10 @@ def _render_chain_editor(filter_key):
                         _src_co_prefix, _src_branch_name = src_label.split("-", 1)
                     else:
                         _src_co_prefix, _src_branch_name = src_label, ""
+                    # Money as the ERP stores it on the root (finalize writes
+                    # total / claim / 194Q TDS / roundoff / net the ERP way);
+                    # the row's line-derived figures only when the header
+                    # has none.
                     saved_chain.append({
                         "jute_mr_id": mr_id,
                         "co_prefix": _src_co_prefix,
@@ -534,9 +721,12 @@ def _render_chain_editor(filter_key):
                         "branch_mr_no": row.get("EJM MR No."),
                         "jute_mr_date": row.get("MR DATE"),
                         "challan_date": row.get("Challan Date"),
-                        "total_amount": float(row.get("Total Amount") or 0),
-                        "claim_amount": float(row.get("Claim Amount") or 0),
-                        "net_total": float(row.get("Net Total") or 0),
+                        "total_amount": _header_amount(row, "mr_total_amount", "Total Amount"),
+                        "claim_amount": _header_amount(row, "mr_claim_amount", "Claim Amount"),
+                        "tds_amount": _header_amount(row, "mr_tds_amount"),
+                        "roundoff": _header_amount(row, "mr_roundoff"),
+                        "net_total": _header_amount(row, "mr_net_total", "Net Total"),
+                        "invoice_amount": _header_amount(row, "mr_invoice_amount"),
                         "is_final_return": True,
                     })
 
@@ -552,9 +742,13 @@ def _render_chain_editor(filter_key):
                     step["company"] = f"{sc.get('co_prefix', 'N/A')}-{sc.get('branch_name', 'N/A')}"
                     step["mr_no"] = sc.get("branch_mr_no", "")
                     step["mr_date"] = sc.get("jute_mr_date", date.today())
-                    step["total_amount"] = float(sc.get("total_amount", 0))
-                    step["claim_amount"] = float(sc.get("claim_amount", 0))
-                    step["net_amount"] = float(sc.get("net_total", 0))
+                    # Stored header money; NaN / None are left to
+                    # _recalculate_chain, which then computes the figure.
+                    step["total_amount"] = float(sc.get("total_amount") or 0)
+                    step["claim_amount"] = sc.get("claim_amount")
+                    step["net_amount"] = sc.get("net_total")
+                    step["tds_amount"] = _stored_or_zero(sc.get("tds_amount"))
+                    step["invoice_amount"] = sc.get("invoice_amount")
                     step["saved_mr_id"] = sc.get("jute_mr_id")
                     step["is_final_return"] = bool(sc.get("is_final_return"))
 
@@ -577,7 +771,7 @@ def _render_chain_editor(filter_key):
                         step.update(_step_po_info(sc))
 
                     # Back-calculate % rate increase (TODO: use DB column after migration)
-                    current_total = float(sc.get("total_amount", 0))
+                    current_total = float(sc.get("total_amount") or 0)
                     if prev_total > 0:
                         step["pct_rate_increase"] = ((current_total - prev_total) / prev_total) * 100
                     else:
@@ -599,7 +793,6 @@ def _render_chain_editor(filter_key):
                 st.error(f"Error reconstructing chain: {str(e)}")
 
         # Fetch line items for each saved step's MR (with item names)
-        step_line_items_key = f"step_line_items_{filter_key}_{mr_id}"
         if step_line_items_key not in st.session_state:
             step_li_map = {}
             for idx, s in enumerate(transfers[mr_id]):
@@ -648,11 +841,13 @@ def _render_chain_editor(filter_key):
     # The mill's own ERP purchase order for this lorry (one read per selected
     # MR, kept for the session): shown once here, not on every step card.
     orig_po_cache = st.session_state.setdefault(f"orig_po_{filter_key}", {})
+    orig_po_failed = False
     if mr_id not in orig_po_cache:
         try:
             orig_po_cache[mr_id] = get_original_po(mr_id)
         except Exception:
-            pass                    # not cached: the next run tries again
+            orig_po_failed = True       # not cached: the next run tries again
+            _log.exception("Reading the original PO of MR %s failed", mr_id)
     orig_po = orig_po_cache.get(mr_id)
     if orig_po:
         orig_po_no = format_po_no(orig_po.get("po_no"), orig_po.get("co_prefix"),
@@ -660,12 +855,10 @@ def _render_chain_editor(filter_key):
                                   None if pd.isna(orig_po.get("po_date")) else orig_po.get("po_date"))
         st.write(f"**Original PO:** {orig_po_no or '—'}"
                  + (f" · {_fmt_date(orig_po.get('po_date'))}" if _fmt_date(orig_po.get("po_date")) else ""))
+    elif orig_po_failed:
+        st.write("**Original PO:** could not be read just now — it is read again on the next tap")
     else:
-        st.write("**Original PO:** —")
-    # DEBUG: show step_li_map keys and saved_mr_ids
-    _debug_saved_ids = {i: s.get("saved_mr_id") for i, s in enumerate(steps) if s.get("saved_mr_id")}
-    _debug_li_map_keys = list(step_li_map.keys())
-    st.caption(f"[DEBUG] saved_mr_ids: {_debug_saved_ids} | step_li_map keys: {_debug_li_map_keys}")
+        st.write("**Original PO:** none in the ERP")
 
     # Render all steps
     for i, step in enumerate(steps):
@@ -673,19 +866,16 @@ def _render_chain_editor(filter_key):
             # Saved step: use its own line items (rates are authoritative)
             step_line_items = step_li_map[i]
             base_step_index = 0  # not used for saved steps
-            _li_source_debug = f"own MR #{step['saved_mr_id']} (in step_li_map)"
         else:
             # Unsaved step: use the nearest preceding saved step's line items
             # so that displayed rates reflect the previous step's actual rates,
             # not the original source MR rates.
             step_line_items = li_data
             base_step_index = 0
-            _li_source_debug = f"root MR #{mr_id} (fallback to li_data)"
             for j in range(i - 1, -1, -1):
                 if steps[j].get("saved_mr_id") and j in step_li_map:
                     step_line_items = step_li_map[j]
                     base_step_index = j
-                    _li_source_debug = f"step {j+1} MR #{steps[j]['saved_mr_id']} (prev saved)"
                     break
         _render_step_card(
             step_index=i,
@@ -697,12 +887,13 @@ def _render_chain_editor(filter_key):
             filter_key=filter_key,
             source_row=row,
             base_step_index=base_step_index,
-            li_source_debug=_li_source_debug,
+            root_line_items=li_data,
         )
 
 
 # TODO: Extract to jute_mr_page_helpers.py (shared with jute_mr.py)
-def _render_step_card(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key, source_row=None, base_step_index=0, li_source_debug=""):
+def _render_step_card(step_index, step, all_steps, line_items, original_total_amount, mr_id,
+                      filter_key, source_row=None, base_step_index=0, root_line_items=None):
     """
     Render individual step card with company/date/% inputs, metrics, line items, and action buttons.
 
@@ -717,17 +908,21 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
     - source_row: source MR row (for challan_date, PO no. display)
     - base_step_index: index of the step whose line items are being used as base
                        (for unsaved steps following a saved step)
-    - li_source_debug: debug string showing which MR's line items are used
+    - root_line_items: the root MR's line items -- what _recalculate_chain
+                       cascades the whole chain from (the card's own
+                       line_items may already carry a saved step's mark-up)
     """
     is_saved = "saved_mr_id" in step and step.get("saved_mr_id") is not None
     is_empty = not step.get("company")
+    if root_line_items is None:
+        root_line_items = line_items
+
+    def _recalculate():
+        _recalculate_chain(all_steps, root_line_items, original_total_amount, use_new_rounding=True)
 
     # Card styling
     with st.container(border=True):
         st.markdown(f"### Step {step_index + 1}")
-        # DEBUG: show which MR's line items are being used for rate display
-        if li_source_debug:
-            st.caption(f"[DEBUG] Line items from: {li_source_debug}")
 
         col1, col2, col3 = st.columns([2, 1, 1])
 
@@ -737,12 +932,22 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 st.write(f"**Company:** {step['company']}")
             else:
                 co_options, _ = get_company_branch_options()
+                # index= is read only when the box is created: a step kept in
+                # session state while another lorry was shown gets its
+                # company back (the widget itself was dropped meanwhile).
+                kept = step.get("company", "")
+                company_before = kept
                 step["company"] = st.selectbox(
                     "Company",
                     options=co_options,
+                    index=co_options.index(kept) if kept in co_options else 0,
                     key=f"company_{mr_id}_{step_index}",
                     disabled=is_saved
                 )
+                if step["company"] != company_before:
+                    # The totals were computed before the pick: redo them
+                    # now, so this card does not print 'Total: ₹0' once.
+                    _recalculate()
 
         # Date input
         with col2:
@@ -782,17 +987,24 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 st.write(_po_line(po_label, step.get("po_no", ""), step.get("po_date"),
                                   step.get("po_weight"), step.get("po_value")))
                 if step.get("is_final_return"):
-                    st.caption(
-                        "PO rate rounded to the nearest ₹50 — invoice "
-                        f"₹{float(step.get('total_amount') or 0):,.0f}"
-                    )
+                    # The invoice the Final PO is compared with is the hop's
+                    # invoice as stored on the root (jute_mr.invoice_amount);
+                    # it can differ from the MR lines' total by a few rupees.
+                    invoice_amount = _stored_amount(step.get("invoice_amount"))
+                    if invoice_amount is not None:
+                        st.caption("PO rate rounded to the nearest ₹50 — invoice "
+                                   f"₹{invoice_amount:,.0f}")
+                    else:
+                        st.caption("PO rate rounded to the nearest ₹50 — MR total "
+                                   f"₹{float(step.get('total_amount') or 0):,.0f}")
             elif po_state == "erp":
                 st.write(f"**PO:** {step.get('po_no', '')} (linked in the ERP, not a transfer PO)")
             elif any(float(li.get("weight") or 0) > 0 for li in (line_items or [])):
                 st.write(f"**{po_label}:** not created")
                 st.caption(
                     "Saved before transfer POs were introduced (or while they "
-                    "were switched off); covered by the one-time backfill."
+                    "were switched off). The one-time backfill creates it when "
+                    "it is run; nothing to do here."
                 )
             else:
                 st.write(f"**{po_label}:** not applicable — no accepted weight on this lorry")
@@ -818,37 +1030,40 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                     if company_label in co_branch_mapping:
                         _, step_branch_id = co_branch_mapping[company_label]
                         warehouses = get_warehouses_by_branch(step_branch_id)
-                        wh_name = next((n for n, wid in warehouses.items() if wid == wh_id), str(wh_id))
-                        st.write(f"**Warehouse:** {wh_name}")
+                        st.write(f"**Warehouse:** {warehouses.get(int(wh_id), str(wh_id))}")
                     else:
                         st.write(f"**Warehouse:** ID {wh_id}")
                 else:
                     st.write("**Warehouse:** —")
             else:
-                # Editable warehouse selectbox
+                # Editable warehouse selectbox: the godowns of the step's
+                # company, by id (two godowns of a branch can share a name).
                 company_label = step.get("company", "")
                 _, co_branch_mapping = get_company_branch_options()
                 if company_label and company_label in co_branch_mapping:
                     _, step_branch_id = co_branch_mapping[company_label]
-                    warehouses = get_warehouses_by_branch(step_branch_id)
-                    wh_names = [""] + list(warehouses.keys()) if warehouses else [""]
-                    current_wh_id = step.get("warehouse_id")
-                    current_wh_name = ""
-                    if warehouses:
-                        for wn, wid in warehouses.items():
-                            if wid == current_wh_id:
-                                current_wh_name = wn
-                                break
-                    wh_index = wh_names.index(current_wh_name) if current_wh_name in wh_names else 0
+                    warehouses = get_warehouses_by_branch(step_branch_id)   # {id: label}
+                    # A godown belongs to one branch: a pick made under the
+                    # previous company is dropped with the company (the box
+                    # is keyed by branch, so it starts blank again).
+                    if step.get("warehouse_branch_id") != step_branch_id:
+                        step["warehouse_id"] = None
+                        step["warehouse_branch_id"] = step_branch_id
+                    wh_ids = [None] + list(warehouses)
+                    current = step.get("warehouse_id")
                     new_wh = st.selectbox(
                         "Warehouse",
-                        options=wh_names,
-                        index=wh_index,
-                        key=f"wh_{mr_id}_{step_index}",
+                        options=wh_ids,
+                        index=wh_ids.index(current) if current in wh_ids else 0,
+                        format_func=lambda wid: "" if wid is None else warehouses.get(wid, str(wid)),
+                        key=f"wh_{mr_id}_{step_index}_{step_branch_id}",
                     )
-                    if new_wh and warehouses and new_wh in warehouses:
-                        step["warehouse_id"] = warehouses[new_wh]
+                    # Always written: a blank box means no godown, never the
+                    # last one picked.
+                    step["warehouse_id"] = int(new_wh) if new_wh is not None else None
                 else:
+                    step["warehouse_id"] = None
+                    step["warehouse_branch_id"] = None
                     st.write("**Warehouse:** —")
 
         with col_tr:
@@ -919,54 +1134,67 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                         key=f"od_lc_{mr_id}_{step_index}",
                     )
 
-        # % Rate Increase input (for step 2+, unsaved only)
+        # % Rate Increase input (for step 2+, unsaved only). The box is a
+        # widget with a key and NO value=: it is seeded from the step dict
+        # when it does not exist yet, and whenever it differs from the dict
+        # the dict follows the box (the owner typed) and the chain is
+        # recomputed in this same run -- so the % on screen, the Total under
+        # it and the % a Save posts are always one figure, whatever happened
+        # to other lorries or on a Reload in between.
         if step_index > 0 and not is_saved and step.get("company"):
-            pct_key = f"pct_{mr_id}_{step_index}"
-            if pct_key not in st.session_state:
-                st.session_state[pct_key] = float(step.get("pct_rate_increase", 0) or 0)
+            pct_input_key = f"pct_input_{mr_id}_{step_index}"
+            dict_pct = float(step.get("pct_rate_increase", 0) or 0)
+            if pct_input_key not in st.session_state:
+                st.session_state[pct_input_key] = dict_pct
 
             col_pct, col_space = st.columns([1, 3])
             with col_pct:
-                new_pct = st.number_input(
+                new_pct = float(st.number_input(
                     "% Rate Increase",
-                    value=st.session_state[pct_key],
                     step=0.01,
                     min_value=-100.0,
                     max_value=100.0,
-                    key=f"pct_input_{mr_id}_{step_index}"
-                )
-
-                # On change: trigger recalculation
-                if abs(new_pct - st.session_state[pct_key]) > 0.0001:
-                    all_steps[step_index]["pct_rate_increase"] = new_pct
-                    st.session_state[pct_key] = new_pct
-
-                    # Recalculate chain downstream
-                    _recalculate_chain(all_steps, line_items, original_total_amount, use_new_rounding=True)
-                    st.rerun()
+                    key=pct_input_key,
+                ) or 0)
+                if abs(new_pct - dict_pct) > 0.0001:
+                    step["pct_rate_increase"] = new_pct
+                    _recalculate()      # this card and the steps below it
 
         # Summary metrics — use step dict values (from _recalculate_chain for unsaved,
         # from DB header for saved). Recomputing from per-item rates diverges due to
         # intermediate rounding at each step.
-        total = step.get("total_amount", 0)
-        claim = step.get("claim_amount", 0)
-        net = step.get("net_amount", 0)
+        total = float(step.get("total_amount") or 0)
+        claim = float(step.get("claim_amount") or 0)
+        net = float(step.get("net_amount") or 0)
+        tds = float(step.get("tds_amount") or 0) if is_saved else 0.0
 
-        st.markdown(f"""
-        **Total:** ₹{total:,.0f} | **Claim:** ₹{claim:,.0f} | **Net:** ₹{net:,.0f}
-        """)
+        metrics = f"**Total:** ₹{total:,.0f} | **Claim:** ₹{claim:,.0f}"
+        if abs(tds) >= 0.5:
+            # The ERP's 194Q TDS on a finalized root: part of the stored net.
+            metrics += f" | **TDS:** ₹{tds:,.0f}"
+        st.markdown(metrics + f" | **Net:** ₹{net:,.0f}")
 
         # Line items table — saved steps with own line items use rates directly
         _render_step_line_items(step_index, line_items, all_steps, is_saved=is_saved, base_step_index=base_step_index)
 
         # Action buttons
         if is_saved:
-            # Saved steps: offer "Delete from here" (deletes this step and all subsequent)
+            # Saved steps: "Delete from here" deletes this step and every
+            # later one -- MRs, invoices and transfer POs, on production, so
+            # it takes a confirming tick first (one mis-tap on a phone must
+            # not be enough). The tick is a plain widget: unticked on the
+            # next visit to the card.
+            saved_mr_id = step.get("saved_mr_id")
+            confirm_key = f"confirm_delete_{mr_id}_{step_index}"
+            confirmed = st.checkbox(
+                _delete_confirm_label(step_index, step, all_steps),
+                key=confirm_key,
+            )
             if st.button(
                 f"Delete from Step {step_index + 1} onward",
                 key=f"delete_saved_{mr_id}_{step_index}",
+                disabled=not confirmed,
             ):
-                saved_mr_id = step.get("saved_mr_id")
                 if saved_mr_id:
                     with st.spinner("Deleting steps and refreshing..."):
                         try:
@@ -975,52 +1203,51 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                                 from_mr_id=saved_mr_id,
                                 updated_by=st.session_state.get("user_id", 1),
                             ) or {}
-                            removed_pos = summary.get("deleted_pos") or []
-                            po_text = ""
-                            if removed_pos:
-                                po_text = ("; transfer PO" + ("s " if len(removed_pos) > 1 else " ")
-                                           + ", ".join(removed_pos) + " removed")
-                            if not summary.get("deleted_mr_ids") and not summary.get("reverted"):
-                                _flash("warning", "Nothing was deleted: the chain had already "
-                                       "changed (another session?). The page now shows it as it is.")
-                            elif step.get("is_final_return"):
-                                _flash("success", "Un-finalized — the mill's MR is back to "
-                                       f"Pending and the invoice is removed{po_text}.")
-                            else:
-                                msg = f"Deleted from step {step_index + 1} — MR and invoice removed"
-                                if summary.get("reverted"):
-                                    msg += ", the mill's MR is back to Pending"
-                                _flash("success", msg + po_text + ".")
+                            _flash(*_delete_result_message(summary, step_index, step))
                             _clear_tracker_cache()
                             _drop_chain_state(filter_key, mr_id, keep_selection=False)
                             st.rerun()
                         except Exception as e:
-                            st.error(f"Delete failed: {e}")
+                            _log.exception("Delete from step %s of root %s failed",
+                                           step_index + 1, mr_id)
+                            st.error(f"Delete failed: {e}. Nothing was deleted.")
                 else:
                     st.error("Could not find saved MR ID for this step.")
-            st.caption("Also deletes the transfer PO of each deleted step.")
+            st.caption("Tick the box, then tap Delete. Also deletes the transfer PO "
+                       "of each deleted step.")
 
         elif step.get("company"):
             # Unsaved steps with company set: save, clear, or remove
             col_save, col_clear, col_delete = st.columns(3)
 
             with col_save:
-                if st.button("Save Step", key=f"save_{mr_id}_{step_index}"):
+                if st.button("Save Step", key=f"save_{mr_id}_{step_index}", type="primary"):
                     _save_step(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key)
 
             with col_clear:
-                if st.button("Clear", key=f"clear_{mr_id}_{step_index}"):
+                if st.button("Clear", key=f"clear_{mr_id}_{step_index}",
+                             help="Empty this step: company, date, godown, LC fields and %"):
                     all_steps[step_index] = _empty_transfer_step()
-                    st.session_state.pop(f"pct_{mr_id}_{step_index}", None)
-                    st.session_state.pop(f"pct_input_{mr_id}_{step_index}", None)
+                    all_steps[step_index]["mr_date"] = _source_mr_date(source_row)
+                    for k in _step_widget_keys(mr_id, step_index):
+                        st.session_state.pop(k, None)
                     st.rerun()
 
             with col_delete:
-                if st.button("Delete", key=f"delete_{mr_id}_{step_index}"):
+                if st.button("Delete", key=f"delete_{mr_id}_{step_index}",
+                             help="Remove this unsaved step from the chain"):
+                    last_index = len(all_steps)
                     all_steps.pop(step_index)
-                    for k in [k for k in st.session_state if isinstance(k, str)
-                              and k.startswith((f"pct_{mr_id}_", f"pct_input_{mr_id}_"))]:
-                        st.session_state.pop(k, None)
+                    # The steps below move up one place: their widgets are
+                    # dropped too and come back from their step dicts.
+                    for i in range(step_index, last_index + 1):
+                        for k in _step_widget_keys(mr_id, i):
+                            st.session_state.pop(k, None)
+                    if not any(not s.get("saved_mr_id") for s in all_steps):
+                        # Never leave the chain without a step to type into.
+                        blank = _empty_transfer_step()
+                        blank["mr_date"] = _source_mr_date(source_row)
+                        all_steps.append(blank)
                     st.rerun()
 
             if transfer_po_enabled():
@@ -1126,12 +1353,13 @@ def _render_step_line_items(step_index, line_items, all_steps, is_saved=False, b
     ]
     total_weight = sum(valid_weights) if valid_weights else 0
 
+    # (plain text: st.dataframe does not render markdown, so no ** here)
     rows.append({
-        "Quality": "**TOTAL**",
+        "Quality": "TOTAL",
         "Weight (KG)": total_weight if valid_weights else "—",
         "Warehouse": "—",
         "Rate (per quintal)": "—",
-        "Amount": f"**₹{total_amount:,.2f}**" if total_amount > 0 else "—",
+        "Amount": f"₹{total_amount:,.2f}" if total_amount > 0 else "—",
     })
 
     # Display table
@@ -1166,6 +1394,17 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             st.error(f"Unknown company selection: {company_label}")
             return
         step_co_id, step_branch_id = co_branch_mapping[company_label]
+
+        # The godown goes on every hop line (the ERP's stock view is per
+        # godown): it must be one of the chosen company's own.
+        warehouse_id = step.get("warehouse_id")
+        if warehouse_id is not None:
+            if int(warehouse_id) not in get_warehouses_by_branch(step_branch_id):
+                st.error(f"The godown picked is not at {company_label}. Pick the "
+                         "godown again (the box was reset when the company changed).")
+                step["warehouse_id"] = None
+                return
+            warehouse_id = int(warehouse_id)
 
         # Determine previous step's co_id and branch_id
         if step_index > 0 and step_index - 1 < len(all_steps):
@@ -1215,7 +1454,7 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             total_amount=total_amt,
             claim_amount=claim_amt,
             net_amount=net_amt,
-            warehouse_id=step.get("warehouse_id"),
+            warehouse_id=warehouse_id,
             mr_no=0,  # Assigned inside save_transfer_step transaction
             lc_reference_no=step.get("lc_reference_no", ""),
             lc_date=step.get("lc_date"),
@@ -1226,15 +1465,6 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
 
         # Determine if this is the final step (returns to source company)
         is_final = (step_co_id == source_co_id and step_branch_id == source_branch_id)
-
-        # Debug log to file (Streamlit swallows stdout)
-        import os
-        _log_path = os.path.join(os.path.dirname(__file__), "..", "..", "debug_transfer.log")
-        with open(_log_path, "a") as _f:
-            _f.write(f"[{datetime.now().isoformat()}] _save_step: step_index={step_index}, "
-                     f"step_co_id={step_co_id}, step_branch_id={step_branch_id}, "
-                     f"source_co_id={source_co_id}, source_branch_id={source_branch_id}, "
-                     f"is_final={is_final}, is_first_step={step_index == 0}\n")
 
         # Call save_transfer_step from transfer.py
         result = save_transfer_step(
@@ -1275,6 +1505,8 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
         st.rerun()
 
     except Exception as e:
-        st.error(f"Error saving step: {str(e)}")
-        import traceback
-        st.write(traceback.format_exc())
+        # The whole step is one transaction: a failure writes nothing. The
+        # traceback goes to the server log (.logs/jt.log), not to the phone.
+        _log.exception("Saving step %s of root MR %s failed", step_index + 1, mr_id)
+        st.error(f"Step {step_index + 1} was not saved: {e}. Nothing was written. "
+                 "Tap Reload above to read the chain again, then save once more.")

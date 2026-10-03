@@ -2,9 +2,15 @@
 
 Lots: quality-wise availability + split/merge of jute_mr_li lines IN PLACE —
 no new MRs, jute_lot_src provenance. Transfer: multi-lot whole-lot batch move into a
-marked godown with a common % rate change. Marked Stock: mode-1 stock with
-balance-based consumption tracking (ERP stock view vw_jute_stock_outstanding;
-consumed when remaining balance <= 0).
+marked godown with a common % rate change; the source lines are never
+changed -- the seller invoice booked with the move is the stock-out, and the
+ERP stock view takes the moved kg off the source line's balance (undo deletes
+the invoice and the balance comes back by itself). Marked Stock: mode-1 stock
+with balance-based consumption tracking (ERP stock view
+vw_jute_stock_outstanding; consumed when remaining balance <= 0).
+
+Godown pickers are keyed by warehouse id (a branch can have two godowns of
+one name); the lookups in queries return {id: label}.
 """
 
 from datetime import date, datetime
@@ -45,7 +51,9 @@ def _render_flash() -> None:
     message = st.session_state.pop(WAREHOUSE_FLASH_KEY, None)
     if message:
         st.success(message)
-        st.toast(message, icon="✅")   # the banner may be out of view on a phone
+        # the banner may be out of view on a phone; 'long' because the page
+        # re-reads its grids for several seconds right after a save
+        st.toast(message, icon="✅", duration="long")
 
 
 def _lot_grid(df: pd.DataFrame, key: str) -> pd.DataFrame:
@@ -220,11 +228,16 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
     with t2:
         if tgt:
             tgt_co, tgt_br = tgt
-            mwh = get_marked_warehouses_by_branch(tgt_br)
-            wh_name = st.selectbox("Marked godown",
-                                   options=list(mwh.keys()) or ["(none tagged)"],
-                                   key="xfer_wh")
-            wh_id = mwh.get(wh_name)
+            mwh = get_marked_warehouses_by_branch(tgt_br)      # {id: label}
+            # Keyed by godown id and by branch: two godowns of a branch can
+            # share a name, and a godown picked for one company must not
+            # carry over to another.
+            wh_id = st.selectbox(
+                "Marked godown",
+                options=list(mwh) or [None],
+                format_func=lambda wid: mwh.get(wid, "(none tagged)"),
+                key=f"xfer_wh_{tgt_br}",
+            )
         else:
             tgt_co = tgt_br = wh_id = None
             st.selectbox("Marked godown", options=["(select company)"],
@@ -254,9 +267,11 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
     n_src_mrs = prev["jute_mr_id"].nunique()
     st.caption(
         f"Will create {n_src_mrs} MR(s) at the target and {n_src_mrs} seller "
-        f"invoice(s) at the source (one per source MR)."
+        f"invoice(s) at the source (one per source MR). The source lines are "
+        "not changed: the invoice is the stock-out, and the ERP stock view "
+        "takes the moved kg off their balance."
     )
-    can_save = bool(tgt) and bool(wh_id)
+    can_save = bool(tgt) and wh_id is not None
     if st.button("Transfer selected lots", type="primary",
                  disabled=not can_save, key="btn_batch_move"):
         try:
@@ -280,21 +295,25 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
 def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
                        user_id: int) -> None:
     with st.expander("Tag godowns as marked"):
-        all_wh = get_markable_warehouses_by_branch(branch_id)
+        all_wh = get_markable_warehouses_by_branch(branch_id)     # {id: label}
         marked_wh = get_marked_warehouses_by_branch(branch_id)
         if not all_wh:
             st.write("No godowns for this branch.")
         else:
+            # Options are godown ids (the label is shown): branch 87 has two
+            # godowns called LCPL_JUTE, and a name-keyed list could only ever
+            # tag one of them -- and would untag the other on save.
             chosen = st.multiselect(
                 "Marked godowns (this branch)",
-                options=list(all_wh.keys()),
-                default=[n for n in marked_wh if n in all_wh],
+                options=list(all_wh),
+                default=[wid for wid in marked_wh if wid in all_wh],
+                format_func=lambda wid: all_wh.get(wid, str(wid)),
             )
             st.caption("Store godowns are not listed. Untagging gives a godown "
                        "back the jute godown type.")
             if st.button("Save godown tags"):
-                chosen_ids = {int(all_wh[n]) for n in chosen}
-                marked_ids = {int(w) for w in marked_wh.values()}
+                chosen_ids = {int(wid) for wid in chosen}
+                marked_ids = {int(wid) for wid in marked_wh}
                 # Only the godowns whose tag changes are written.
                 for wid in sorted(chosen_ids - marked_ids):
                     set_warehouse_marked(wid, True)
@@ -349,10 +368,13 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
             # (leaf-first guard) — disable rather than offer a doomed button.
             can_delete = (bool((grp["balance_kg"] >= grp["kg"]).all())
                           and not resold)
-            if st.button("Delete", key=f"del_mk_{mr_id}", disabled=not can_delete):
+            if st.button("Delete", key=f"del_mk_{mr_id}", disabled=not can_delete,
+                         help="Undo this move: its seller invoice and this MR are "
+                              "deleted; the kg come back on the source lines' balance"):
                 try:
                     delete_marked_move(mr_id, user_id)
-                    _flash("Deleted; source restored.")
+                    _flash(f"Move undone: MR {mr_id} and its seller invoice deleted; "
+                           "the balance is back on the source line(s).")
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
@@ -372,21 +394,26 @@ def warehouse_stock_page() -> None:
         return
     user_id = st.session_state.get("user_id", 1)
 
+    # persist_state: the filters survive a visit to another page.
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        co_name = st.selectbox("Company", options=list(companies.keys()))
+        co_name = st.selectbox("Company", options=list(companies.keys()),
+                               key="wh_company", persist_state="session")
         co_id = companies[co_name]
     with c2:
         branches = get_branches_by_company(co_id)
         br_names = list(branches.keys())
-        br_name = st.selectbox("Branch", options=br_names) if br_names else None
+        br_name = (st.selectbox("Branch", options=br_names, key="wh_branch",
+                                persist_state="session") if br_names else None)
         branch_id = branches.get(br_name) if br_name else None
     with c3:
         this_year = datetime.now().year
-        year = st.selectbox("Year", options=list(range(this_year, this_year - 6, -1)))
+        year = st.selectbox("Year", options=list(range(this_year, this_year - 6, -1)),
+                            key="wh_year", persist_state="session")
     with c4:
         month = st.selectbox("Month", options=list(range(1, 13)),
-                             index=datetime.now().month - 1)
+                             index=datetime.now().month - 1,
+                             key="wh_month", persist_state="session")
     if not branch_id:
         st.info("Select a branch.")
         return

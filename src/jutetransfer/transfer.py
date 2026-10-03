@@ -13,7 +13,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from . import po_ops
-from .database import DatabaseConnection, delete_by_ids, select_ids
+from .database import DatabaseConnection, delete_by_ids, named_locks, select_ids
 from .jute_mr_chain_helpers import (
     _calculate_line_item_amount, _reconstruct_chain, hop_rate,
     is_root_eligible_for_new_chain, step_multiplier,
@@ -23,6 +23,41 @@ from .queries import get_source_mr_full, _get_financial_year_bounds
 
 # Fixed invoice type for raw jute transfers
 RAW_JUTE_INVOICE_TYPE = 5
+
+# Every number a chain save allocates (hop MR / gate-entry / bill-pass no,
+# invoice and challan no, PO no) is MAX+1 on the transaction's read snapshot,
+# so two saves in the same seconds used to take the same numbers. One named
+# lock serialises this app's chain saves (database.named_locks: taken before
+# the transaction opens, released after it ends; '{db}' = the schema, user
+# locks being server-wide); the PO numbers are also guarded against the ERP
+# by its own lock, po_ops.po_no_lock. Deletes allocate nothing: no lock.
+CHAIN_SAVE_LOCK = "jt_chain_save:{db}"
+CHAIN_SAVE_LOCK_TIMEOUT = 30  # seconds: a save takes 4-12 s live
+
+
+def _ordered_lines(lines) -> list:
+    """Active lines in jute_mr_li_id order. Every positional pairing in this
+    module (root lines <-> hop lines at finalize and un-finalize) rests on
+    both sides being in id order; get_source_mr_full reads without ORDER BY,
+    so the order is fixed here."""
+    return sorted(lines or [], key=lambda li: int(li.get("jute_mr_li_id") or 0))
+
+
+def _load_mr_full(mr_id: int, conn) -> Optional[dict]:
+    """queries.get_source_mr_full on the caller's connection, lines ordered."""
+    mr = get_source_mr_full(mr_id, conn=conn)
+    if mr:
+        mr["line_items"] = _ordered_lines(mr.get("line_items"))
+    return mr
+
+
+def _branch_co_id(conn, branch_id) -> Optional[int]:
+    """Owner company of a branch, or None when the branch is unknown."""
+    row = conn.execute(
+        text("SELECT co_id FROM branch_mst WHERE branch_id = :bid"),
+        {"bid": int(branch_id or 0)},
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
 
 
 @dataclass
@@ -124,9 +159,10 @@ def _ensure_party_types(conn, party_id: int, updated_by: int) -> None:
 
 
 def _get_party_branch_id(conn, party_id: int) -> Optional[int]:
-    """Get the first party_branch for a given party_id."""
+    """The party's first (lowest-id) party_branch_mst row, or None."""
     result = conn.execute(
-        text("SELECT party_mst_branch_id FROM party_branch_mst WHERE party_id = :pid LIMIT 1"),
+        text("SELECT party_mst_branch_id FROM party_branch_mst WHERE party_id = :pid "
+             "ORDER BY party_mst_branch_id LIMIT 1"),
         {"pid": party_id},
     )
     row = result.fetchone()
@@ -307,11 +343,16 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
 def _ensure_party_branch_from_source_branch(
     conn, party_id: int, source_branch_id: int, updated_by: int
 ) -> Optional[int]:
-    """Ensure a party_branch_mst row exists for party_id matching branch_mst[source_branch_id].
+    """The party_branch_mst row of party_id that stands for
+    branch_mst[source_branch_id] (finalize: the last forwarding company's
+    branch, as a party of the mill).
 
-    Match by gst_no (case-insensitive, trimmed). If source branch_mst has no
-    gst_no, inserts a new row unconditionally. Returns the party_mst_branch_id
-    (existing or newly inserted), or None if source branch_mst is not found.
+    The party's branch carrying that branch's GST number when it has one,
+    else the party's lowest-id branch; a row is INSERTED from branch_mst only
+    when the party has no branch at all. (It used to insert a fresh copy on
+    every finalize when the branch had no GST number -- the live forwarders
+    have none -- leaving one more duplicate per finalized lorry.) Returns the
+    party_mst_branch_id, or None if source_branch_id is not in branch_mst.
     """
     br_row = conn.execute(
         text("SELECT * FROM branch_mst WHERE branch_id = :bid"),
@@ -327,11 +368,15 @@ def _ensure_party_branch_from_source_branch(
             text("""SELECT party_mst_branch_id FROM party_branch_mst
                     WHERE party_id = :pid
                       AND LOWER(TRIM(gst_no)) = LOWER(TRIM(:gst))
-                    LIMIT 1"""),
+                    ORDER BY party_mst_branch_id LIMIT 1"""),
             {"pid": party_id, "gst": src_gst},
         ).fetchone()
         if existing:
             return existing[0]
+
+    existing = _get_party_branch_id(conn, party_id)
+    if existing is not None:
+        return existing
 
     return DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO party_branch_mst (party_id, active, gst_no, address,
@@ -631,7 +676,8 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
                challan_date: Optional[date] = None,
                challan_no: Optional[str] = None,
                seller_invoice: Optional[dict] = None,
-               use_new_rounding: bool = False) -> int:
+               use_new_rounding: bool = False,
+               jute_supplier_id=None) -> int:
     """Create a new jute_mr + jute_mr_li records for a transfer step.
 
     Copies most fields from the source MR, overriding company/branch/party/rate.
@@ -645,10 +691,19 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
     just-created sales_invoice. When None (first-step / supplier delivery),
     those columns are written as NULL.
 
+    jute_supplier_id: the hop's jute supplier when it is not the source MR's
+    (a later hop: the supplier the selling sister company is mapped under).
+
+    The header's money is NOT the browser's: once the lines are written the
+    header is recomputed from them by the ERP's own rule
+    (_erp_recompute_money), as the mill MR's is at finalize.
+
     Returns the new jute_mr_id.
     """
     # Ensure the party has correct party types before creating MR
     _ensure_party_types(conn, party_id, updated_by)
+    if jute_supplier_id is None:
+        jute_supplier_id = source_mr.get("jute_supplier_id")
 
     # Generate bill_pass_no for this branch/financial year
     new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, step.branch_id, step.mr_date)
@@ -711,13 +766,15 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
         "branch_id": step.branch_id,
         "party_id": party_id,
         "party_branch_id": party_branch_id,
-        "jute_supplier_id": source_mr.get("jute_supplier_id"),
+        "jute_supplier_id": jute_supplier_id,
         "src_com_id": prev_co_id,  # received-from company
+        # Placeholders: the five money columns are rewritten from the lines
+        # below (_erp_recompute_money), never left as the browser sent them.
         "total_amount": step.total_amount,
         "claim_amount": step.claim_amount,
         "roundoff": step.roundoff,
         "net_total": step.net_amount,
-        "tds_amount": source_mr.get("tds_amount"),
+        "tds_amount": 0.0,
         "src_jute_mr_id": root_mr_id,  # always root
         "bill_pass_no": new_bill_pass_no,
         "bill_pass_date": step.mr_date,
@@ -726,9 +783,10 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
         "invoice_amount": seller_invoice["invoice_amount"] if seller_invoice else None,
     })
 
-    # Copy line items with per-item rate via rate_multiplier.
+    # Copy line items with per-item rate via rate_multiplier, in id order (the
+    # hop's lines then pair with the root's by position at finalize).
     li_data = []
-    for li in source_mr.get("line_items", []):
+    for li in _ordered_lines(source_mr.get("line_items", [])):
         accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
         original_rate = float(li.get("rate") or 0)
 
@@ -827,6 +885,14 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
             # production rate rides along unchanged; the hop mark-up is `rate` only
             "actual_rate": production_rate(li),
         })
+
+    # The header from the lines just written, by the ERP's rule (total and
+    # claim from the lines, 194Q TDS from what this company bought from the
+    # supplier before this lorry, roundoff, net to the rupee) -- what the
+    # ERP's own approve would write; the browser's totals (whole-rupee total,
+    # claim with water damage and premium) are not stored. The hop's date,
+    # number and id are already in the row, so the TDS sequence is right.
+    _erp_recompute_money(conn, new_mr_id, tds_amount=HOP_TDS_AMOUNT)
 
     return new_mr_id
 
@@ -936,9 +1002,21 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
     """Create a sales invoice from the seller to the buyer.
 
     Inserts into sales_invoice, sales_invoice_dtl, and sales_invoice_jute.
+    source_mr is the SELLER's MR (the newest hop): the invoice sells its
+    lines, and every sales_invoice_dtl row names the line it sells
+    (jute_mr_li_id) so the ERP's stock ledger (vw_jute_stock_outstanding)
+    takes the kg off the seller when the sale is booked (owner decision
+    2026-10-03, option A of the stock-view paper). The mill's own lines are
+    never sold through here (a first step has no invoice), so they are never
+    linked.
 
-    When use_new_rounding=True, rounds rates at kg level (2 decimals),
-    line item amounts to 2 decimals, and uses roundoff instead of largest-item adjustment.
+    Header amounts follow the lines, not the browser: invoice_amount is the
+    lines' sum to the rupee, round_off the paise between the two, the jute
+    claim the sum of the per-line claims (as the ERP's own invoice save
+    computes it).
+
+    When use_new_rounding=True, rounds rates at kg level (2 decimals) and
+    line item amounts to 2 decimals.
 
     Returns dict with keys:
         invoice_id (int): Newly created sales_invoice.invoice_id
@@ -957,13 +1035,13 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         invoice_no, co_prefix, branch_prefix, seller_step.mr_date, document_type="SI",
     )
 
-    # Calculate invoice amounts with precise decimal arithmetic
+    # Price the seller's lines (id order) with precise decimal arithmetic
+    seller_lines = _ordered_lines(source_mr.get("line_items", []))
     line_amounts = []
     line_rates_in_kg = []  # Store rates in kg for invoice storage
     line_weights = []  # Store weights for invoice storage
-    unrounded_sum = Decimal('0')  # Track unrounded total for accurate round_off calculation
 
-    for li in source_mr.get("line_items", []):
+    for li in seller_lines:
         accepted_weight = round(float(li.get("accepted_weight") or 0), 0)
         line_weights.append(accepted_weight)
 
@@ -975,30 +1053,27 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
             new_rate, rate_in_kg = hop_rate(original_rate, rate_multiplier)
             # Use shared function for amount (rounded to 2 decimals)
             amount = _calculate_line_item_amount(accepted_weight, new_rate)
-            unrounded_sum += Decimal(str(amount))
         else:
             new_rate = float((Decimal(str(original_rate)) * Decimal(str(rate_multiplier))).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
             rate_in_kg = float(
                 (Decimal(str(new_rate)) / Decimal('100'))
                 .quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
             )
-            unrounded_amount = Decimal(str(accepted_weight)) * Decimal(str(rate_in_kg))
-            unrounded_sum += unrounded_amount
             amount = float(
-                unrounded_amount.quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+                (Decimal(str(accepted_weight)) * Decimal(str(rate_in_kg)))
+                .quantize(Decimal('1'), rounding=ROUND_HALF_UP)
             )
 
         line_rates_in_kg.append(rate_in_kg)
         line_amounts.append(amount)
 
-    invoice_amount = float(seller_step.total_amount)
-    if use_new_rounding:
-        # round_off = rounded-to-0 header total - sum of 2-decimal line items
-        round_off = round(invoice_amount - float(unrounded_sum), 2)
-    else:
-        # Old behavior: round_off absorbs difference between display total and per-item sum
-        per_item_sum = float(unrounded_sum.quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-        round_off = round(invoice_amount - per_item_sum, 2)
+    # The header from its own lines: the lines' sum to the rupee (the same
+    # Python rounding the screen and the ERP's MR net use), round_off the
+    # paise between the two. The browser's total (a stale tab, or the % the
+    # page back-calculates on a three-step chain) is not stored.
+    lines_total = sum((Decimal(str(a)) for a in line_amounts), Decimal("0"))
+    invoice_amount = float(round(lines_total))
+    round_off = float((Decimal(str(invoice_amount)) - lines_total).quantize(Decimal("0.01")))
 
     invoice_id = DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO sales_invoice (
@@ -1037,16 +1112,10 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         "updated_by": updated_by,
     })
 
-    if not use_new_rounding:
-        # Old behavior: adjust largest line item to match invoice_amount exactly
-        li_sum = sum(line_amounts)
-        diff = round(invoice_amount - li_sum, 0)
-        if diff != 0 and line_amounts:
-            largest_idx = max(range(len(line_amounts)), key=lambda k: line_amounts[k])
-            line_amounts[largest_idx] += diff
-
-    # Line items from source MR with per-item rates
-    for idx, li in enumerate(source_mr.get("line_items", [])):
+    # Line items from the seller's MR with per-item rates, each naming the
+    # seller's line it sells (the ERP stock ledger nets the sale on it).
+    claim_total = Decimal("0")
+    for idx, li in enumerate(seller_lines):
         amount = line_amounts[idx]
         rate_in_kg = line_rates_in_kg[idx]
         accepted_weight = line_weights[idx]
@@ -1066,10 +1135,12 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         invoice_dtl_id = DatabaseConnection.execute_insert_returning_id(conn, """
             INSERT INTO sales_invoice_dtl (
                 invoice_id, item_id, hsn_code, quantity, sales_weight,
-                uom_id, rate, amount_without_tax, total_amount, remarks
+                uom_id, rate, amount_without_tax, total_amount, remarks,
+                jute_mr_li_id
             ) VALUES (
                 :invoice_id, :item_id, :hsn_code, :quantity, :weight,
-                :uom_id, :rate, :amount, :amount, :remarks
+                :uom_id, :rate, :amount, :amount, :remarks,
+                :jute_mr_li_id
             )
         """, {
             "invoice_id": invoice_id,
@@ -1081,6 +1152,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
             "rate": rate_in_kg,
             "amount": amount,
             "remarks": remarks,
+            "jute_mr_li_id": li.get("jute_mr_li_id"),
         })
 
         # Persist per-line claim breakdown into sales_invoice_jute_dtl.
@@ -1094,6 +1166,7 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
             (accepted_weight * li_claim_rate / 100.0) + li_water_damage - li_premium,
             2,
         )
+        claim_total += Decimal(str(claim_amount_dtl))
         try:
             qty_unit_conv = int(float(li.get("actual_qty") or 0))
         except (TypeError, ValueError):
@@ -1130,7 +1203,9 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         "mr_no": str(seller_step.mr_no),
         "mr_id": mr_id,
         "mukam_id": source_mr.get("mukam_id"),
-        "claim_amount": int(seller_step.claim_amount or 0),
+        # the sum of the per-line claims just written, as the ERP's own
+        # invoice save computes the header claim (round(sum, 2))
+        "claim_amount": float(claim_total.quantize(Decimal("0.01"))),
         "unit_conversion": source_mr.get("unit_conversion"),
     })
 
@@ -1157,6 +1232,60 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
 # step with those functions.
 ERP_TDS_THRESHOLD = 5000000.0   # 194Q: purchases from one party in a FY
 ERP_TDS_RATE = 0.001
+
+# A hop MR (the lorry as received at a forwarding company) carries the 194Q
+# TDS the ERP's own approve would derive for that company's purchase from the
+# supplier (owner ruling 2026-10-03: "apply the ERP rule to new hops"). None =
+# derive (_erp_money); the hops written before that date carry 0 and are
+# listed by scripts/repair_transfer_data.py --only hop-tds.
+HOP_TDS_AMOUNT: Optional[float] = None
+
+# The ERP's natural MR sequence (vowerp3be mr.py MR_BEFORE_SQL /
+# get_cumulative_mr_value_for_party_in_fy, owner ruling 2026-10-03): the
+# 194Q cumulative counts only the party's approved MRs that come BEFORE this
+# one in (jute_mr_date, COALESCE(branch_mr_no, 0), jute_mr_id) order, the
+# keys being the MR's OWN stored date / number / id -- at approve and at
+# every later bill pass alike, so an early MR keeps its share of the Rs 50
+# lakh exemption when later MRs are approved.
+_MR_BEFORE_SQL = """(jute_mr_date < :mr_date
+               OR (jute_mr_date = :mr_date AND COALESCE(branch_mr_no, 0) < :mr_no)
+               OR (jute_mr_date = :mr_date AND COALESCE(branch_mr_no, 0) = :mr_no
+                   AND jute_mr_id < :id))"""
+
+
+def mr_sequence_key(jute_mr_date, branch_mr_no, jute_mr_id) -> tuple:
+    """Python side of _MR_BEFORE_SQL: an MR's place in the ERP's sequence,
+    (date, number or 0, id); an MR without a date sorts first."""
+    d = jute_mr_date
+    if isinstance(d, datetime):
+        d = d.date() if d == d else None
+    elif isinstance(d, str):
+        try:
+            d = date.fromisoformat(d[:10])
+        except ValueError:
+            d = None
+    elif not isinstance(d, date):
+        d = None
+    return (d or date.min, int(branch_mr_no or 0), int(jute_mr_id))
+
+
+def _erp_cumulative_previous(conn, party_id, mr_date: date, branch_mr_no, mr_id: int) -> float:
+    """get_cumulative_mr_value_for_party_in_fy: total_amount of the party's
+    approved MRs of mr_date's financial year that come before (mr_date,
+    branch_mr_no, mr_id) -- READ ONLY."""
+    fy_start, fy_end = _get_financial_year_bounds(mr_date)
+    value = conn.execute(text(f"""
+        SELECT COALESCE(SUM(COALESCE(total_amount, 0)), 0)
+        FROM jute_mr
+        WHERE party_id = :party AND status_id = 3
+          AND jute_mr_date IS NOT NULL
+          AND jute_mr_date BETWEEN :fy_start AND :fy_end
+          AND jute_mr_id <> :id
+          AND {_MR_BEFORE_SQL}
+    """), {"party": str(party_id), "fy_start": fy_start.strftime("%Y-%m-%d"),
+           "fy_end": fy_end.strftime("%Y-%m-%d"), "id": int(mr_id),
+           "mr_date": mr_date, "mr_no": int(branch_mr_no or 0)}).scalar()
+    return float(value or 0)
 
 
 def _erp_tds_amount(cumulative_previous: float, current_total: float) -> float:
@@ -1187,10 +1316,12 @@ def _erp_money(conn, mr_id: int, tds_amount: Optional[float] = None,
     """The header money the ERP would compute for an MR from its active lines
     (calculate_mr_amounts + calculate_tds_amount + compute_jute_totals) --
     READ ONLY. tds_amount=None derives 194Q TDS as the ERP's approve and bill
-    pass do, from the party's other approved MRs in the FY of jute_mr_date --
-    or from cumulative_previous, when the caller knows what had been approved
-    before this MR (a repair of rows approved long ago: today every later MR
-    is approved too, and would wrongly count)."""
+    pass do (derive_mr_tds): from the party's approved MRs of the FY that come
+    BEFORE this one in the ERP's sequence, placed by the MR's own stored
+    jute_mr_date / branch_mr_no / jute_mr_id (so call it after those are
+    written) -- or from cumulative_previous, when the caller has computed
+    that figure itself (the repair script, which counts rows it has just
+    planned with their planned totals)."""
     sums = conn.execute(text("""
         SELECT COALESCE(SUM((COALESCE(accepted_weight, actual_weight, 0) / 100) * COALESCE(rate, 0)), 0),
                COALESCE(SUM((COALESCE(accepted_weight, actual_weight, 0) / 100) * COALESCE(claim_rate, 0)), 0)
@@ -1202,21 +1333,12 @@ def _erp_money(conn, mr_id: int, tds_amount: Optional[float] = None,
         tds_amount = _erp_tds_amount(float(cumulative_previous), raw_total)
     if tds_amount is None:
         hdr = conn.execute(text(
-            "SELECT party_id, jute_mr_date FROM jute_mr WHERE jute_mr_id = :id"
+            "SELECT party_id, jute_mr_date, branch_mr_no FROM jute_mr WHERE jute_mr_id = :id"
         ), {"id": mr_id}).fetchone()
         cumulative = 0.0
         if hdr and hdr[0] and hdr[1]:
             mr_date = hdr[1].date() if isinstance(hdr[1], datetime) else hdr[1]
-            fy_start, fy_end = _get_financial_year_bounds(mr_date)
-            cumulative = float(conn.execute(text("""
-                SELECT COALESCE(SUM(COALESCE(total_amount, 0)), 0)
-                FROM jute_mr
-                WHERE party_id = :party AND status_id = 3
-                  AND jute_mr_date IS NOT NULL
-                  AND jute_mr_date BETWEEN :fy_start AND :fy_end
-                  AND jute_mr_id <> :id
-            """), {"party": str(hdr[0]), "fy_start": fy_start.strftime("%Y-%m-%d"),
-                   "fy_end": fy_end.strftime("%Y-%m-%d"), "id": mr_id}).scalar() or 0)
+            cumulative = _erp_cumulative_previous(conn, hdr[0], mr_date, hdr[2], mr_id)
         tds_amount = _erp_tds_amount(cumulative, raw_total)
     tds_amount = round(float(tds_amount), 2)
     roundoff, net_total = _erp_jute_totals(total_amount, claim_amount, tds_amount)
@@ -1290,8 +1412,9 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
     # source_mr provides the jute_mr_li_id (which DB row to update).
     # rate_source_line_items (if given) provides the base rates from the
     # previous step's saved MR, so we apply only a single-step multiplier.
-    root_line_items = source_mr.get("line_items", [])
-    rate_items = rate_source_line_items or root_line_items
+    # Both sides in jute_mr_li_id order: the pairing is by position.
+    root_line_items = _ordered_lines(source_mr.get("line_items", []))
+    rate_items = _ordered_lines(rate_source_line_items) if rate_source_line_items else root_line_items
 
     li_updates = []
     for idx, li in enumerate(root_line_items):
@@ -1495,7 +1618,7 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
         {"id": jute_mr_id},
     ).fetchall()
 
-    step1_lis = step1_source_mr.get("line_items", [])
+    step1_lis = _ordered_lines(step1_source_mr.get("line_items", []))
     pair_count = min(len(step1_lis), len(root_lis))
 
     for idx in range(pair_count):
@@ -1597,6 +1720,13 @@ def save_transfer_step(
         original_source_mr_id: Root MR ID when source_mr_id is a prev step's MR.
             Used by _update_original_mr to find the correct jute_mr_li_id rows.
 
+    The browser's figures are not trusted: the hop's and the invoice's money
+    is derived from the lines priced here, and the endpoints are checked --
+    prev_co_id / prev_branch_id must be the source MR's own company / branch,
+    a first step's source must be the root, a final step's source_co_id /
+    source_branch_id the root's -- a stale or wrong tab is refused with a
+    ValueError and writes nothing.
+
     Returns:
         dict with keys: mr_id (int or None), invoice_id (int or None),
         po (the transfer PO written with this step — see po_ops — or None)
@@ -1609,20 +1739,56 @@ def save_transfer_step(
     # same arithmetic as the screen (see jute_mr_chain_helpers.hop_rate).
     rate_multiplier = step_multiplier(step.pct_rate_increase, rate_multiplier)
 
-    with DatabaseConnection.get_transaction() as conn:
+    # Named locks BEFORE the transaction opens, released AFTER it ends (see
+    # CHAIN_SAVE_LOCK): this app's own saves one at a time, and the ERP's PO
+    # numbering lock for every branch that may receive a PO in this save --
+    # the hop's (Forwarding PO), the mill's on the final step (Final PO).
+    locks = {CHAIN_SAVE_LOCK: CHAIN_SAVE_LOCK_TIMEOUT,
+             po_ops.po_no_lock(step.branch_id): po_ops.PO_NO_LOCK_TIMEOUT}
+    if is_final:
+        locks[po_ops.po_no_lock(source_branch_id)] = po_ops.PO_NO_LOCK_TIMEOUT
+
+    with named_locks(locks), DatabaseConnection.get_transaction() as conn:
         # Lock the root first: serialises every save / delete on this chain,
         # so a stale second tab cannot fork it or finalize it twice.
         root_row = conn.execute(
-            text("SELECT status_id, branch_mr_no FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE"),
+            text("SELECT status_id, branch_mr_no, branch_id FROM jute_mr "
+                 "WHERE jute_mr_id = :id FOR UPDATE"),
             {"id": root_mr_id},
         ).fetchone()
         if not root_row:
             raise ValueError(f"Root MR {root_mr_id} not found")
         root_status, root_branch_mr_no = root_row[0], root_row[1]
+        root_branch_id = int(root_row[2] or 0)
 
-        source_mr = get_source_mr_full(source_mr_id, conn=conn)
+        source_mr = _load_mr_full(source_mr_id, conn)
         if not source_mr:
             raise ValueError(f"Source MR {source_mr_id} not found")
+
+        # The endpoints the page sends, checked against the rows: the seller
+        # of this step IS the source MR's company and branch (the invoice is
+        # booked at that branch and the hop records it as received-from), a
+        # first step copies the root itself, and a final step re-prices and
+        # numbers the root at the root's own branch.
+        source_branch = int(source_mr.get("branch_id") or 0)
+        source_co = _branch_co_id(conn, source_branch)
+        if source_co is None or int(prev_branch_id) != source_branch or int(prev_co_id) != source_co:
+            raise ValueError(
+                f"This step says it receives from company {prev_co_id} / branch {prev_branch_id}, "
+                f"but its source MR {source_mr_id} belongs to company {source_co} / branch "
+                f"{source_branch}; refresh the page"
+            )
+        if is_first_step and int(source_mr_id) != int(root_mr_id):
+            raise ValueError(
+                f"A first step must start from the root MR {root_mr_id}, not from MR "
+                f"{source_mr_id}; refresh the page"
+            )
+        if is_final and (int(source_branch_id) != root_branch_id
+                         or int(source_co_id) != (_branch_co_id(conn, root_branch_id) or 0)):
+            raise ValueError(
+                f"The final step names company {source_co_id} / branch {source_branch_id} as the "
+                f"origin, but root MR {root_mr_id} belongs to branch {root_branch_id}; refresh the page"
+            )
 
         # Decision D1 (2026-09-03): a NEW chain may only start from an ERP
         # root at status 13 (Pending). Backend enforcement behind the UI
@@ -1727,7 +1893,7 @@ def save_transfer_step(
                 # We need the root MR for jute_mr_li_id (which rows to UPDATE).
                 root_mr_id_for_update = original_source_mr_id or root_mr_id
                 if root_mr_id_for_update != source_mr_id:
-                    root_mr = get_source_mr_full(root_mr_id_for_update, conn=conn)
+                    root_mr = _load_mr_full(root_mr_id_for_update, conn)
                     if not root_mr:
                         raise ValueError(f"Root MR {root_mr_id_for_update} not found")
                     rate_source_lis = source_mr.get("line_items", [])
@@ -1774,9 +1940,14 @@ def save_transfer_step(
                 seller_party_id, seller_party_branch_id = _ensure_company_as_party(
                     conn, prev_co_id, prev_branch_id, step.co_id, updated_by
                 )
-                jute_supplier_id = int(source_mr.get("jute_supplier_id") or 0)
-                _ensure_supplier_party_map(
-                    conn, jute_supplier_id, step.co_id, seller_party_id, updated_by
+                # The hop's jute supplier: the one the selling sister company
+                # is already mapped under in the buyer's books, else the
+                # lorry's own -- looked up exactly as its Forwarding PO does.
+                # A later hop adds no master row: pairing the outside jute
+                # supplier with a sister company in jute_supp_party_map put
+                # that pairing in the buyer's ERP party dropdown.
+                hop_supplier_id = po_ops.mapped_supplier(
+                    conn, step.co_id, seller_party_id, source_mr.get("jute_supplier_id")
                 )
                 mr_id = _create_mr(
                     conn, source_mr, step, seller_party_id, seller_party_branch_id,
@@ -1785,6 +1956,7 @@ def save_transfer_step(
                     challan_no=inv_challan_no,
                     seller_invoice=seller_invoice,
                     use_new_rounding=use_new_rounding,
+                    jute_supplier_id=hop_supplier_id,
                 )
                 # The buyer's PO on the selling company.
                 po = po_ops.create_forward_po(conn, mr_id, updated_by)
@@ -1890,21 +2062,11 @@ def _delete_transfer_step_in_txn(conn, jute_mr_id: int, updated_by: int) -> Opti
     return deleted_po
 
 
-def delete_transfer_step(jute_mr_id: int, updated_by: int) -> Optional[dict]:
-    """Delete a transfer MR with its invoices and transfer PO, in one
-    transaction with its root locked first (like every other chain write).
-    See _delete_transfer_step_in_txn."""
-    with DatabaseConnection.get_transaction() as conn:
-        root = conn.execute(
-            text("SELECT src_jute_mr_id FROM jute_mr WHERE jute_mr_id = :id"),
-            {"id": jute_mr_id},
-        ).scalar()
-        if root is not None:
-            conn.execute(
-                text("SELECT jute_mr_id FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE"),
-                {"id": int(root)},
-            )
-        return _delete_transfer_step_in_txn(conn, jute_mr_id, updated_by)
+# There is deliberately no public "delete one hop" entry point: a hop is only
+# ever removed through delete_chain_from_step, which locks the root before its
+# first read, deletes every later hop with it and un-finalizes the root when
+# the chain was finalized. (The former delete_transfer_step read before it
+# locked and could leave a later hop or a finalized root behind.)
 
 
 def _chain_rows(conn, root_mr_id: int) -> list:
@@ -1951,7 +2113,7 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
         if not locked:
             return summary
 
-        root_mr = get_source_mr_full(root_mr_id, conn=conn)
+        root_mr = _load_mr_full(root_mr_id, conn)
         if not root_mr:
             return summary
 
@@ -1975,7 +2137,7 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
         step1_source_mr = None
         if ordered:
             step1_id = ordered[0]["jute_mr_id"]
-            step1_source_mr = get_source_mr_full(step1_id, conn=conn)
+            step1_source_mr = _load_mr_full(step1_id, conn)
 
         # Branch A: root-return revert only (unfinalize the synthetic final step)
         if from_mr_id == root_mr_id:

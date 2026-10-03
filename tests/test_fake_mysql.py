@@ -481,6 +481,39 @@ def test_the_real_database_is_out_of_reach(fake_db):
         DatabaseConfig.get_connection_string()
 
 
+# --- user locks ------------------------------------------------------------------
+
+def test_user_locks_are_granted_recorded_and_released_as_mysql_answers(fake_db):
+    db = fake_db
+    assert one(db, "SELECT DATABASE() AS d")["d"] == "sls"
+    assert one(db, "SELECT GET_LOCK(:n, 5) AS g", n="jute_po_no:sls:29")["g"] == 1
+    assert db.locks == {"jute_po_no:sls:29"}
+    assert one(db, "SELECT GET_LOCK('jute_po_no:sls:29', 5) AS g")["g"] == 1   # re-entrant, as in MySQL
+    assert one(db, "SELECT RELEASE_LOCK(:n) AS r", n="jute_po_no:sls:29")["r"] == 1
+    assert db.locks == set()
+    assert one(db, "SELECT RELEASE_LOCK('jute_po_no:sls:29') AS r")["r"] is None   # nobody holds it
+    assert one(db, "SELECT GET_LOCK(NULL, 5) AS g")["g"] is None
+    db.busy_locks.add("jt_chain_save:sls")                       # "another connection" holds it
+    assert one(db, "SELECT GET_LOCK('jt_chain_save:sls', 30) AS g")["g"] == 0
+    assert one(db, "SELECT RELEASE_LOCK('jt_chain_save:sls') AS r")["r"] == 0
+    db.null_locks.add("broken")
+    assert one(db, "SELECT GET_LOCK('broken', 1) AS g")["g"] is None
+    assert db.locks == set()
+    assert db.lock_log == [
+        ("get", "jute_po_no:sls:29", 1), ("get", "jute_po_no:sls:29", 1),
+        ("release", "jute_po_no:sls:29", 1), ("release", "jute_po_no:sls:29", None),
+        ("get", None, None), ("get", "jt_chain_save:sls", 0),
+        ("release", "jt_chain_save:sls", 0), ("get", "broken", None)]
+
+
+def test_a_lock_name_longer_than_mysql_allows_is_refused(fake_db):
+    with pytest.raises(HarnessError):
+        fake_db.execute("SELECT GET_LOCK(:n, 1)", n="x" * 65)
+    assert any("longer than 64 characters" in str(e) for e in fake_db.harness_errors)
+    fake_db.harness_errors.clear()                                # the refusal was the point
+    assert fake_db.locks == set()
+
+
 # --- transactions -------------------------------------------------------------------
 
 def test_transaction_commits_on_clean_exit(fake_db):

@@ -29,7 +29,12 @@ Honesty rules
 
 What this does NOT prove (single SQLite connection)
     * Locking and concurrency: FOR UPDATE is dropped, there is no second
-      session, no isolation level, no deadlock, no PO-number race.
+      session, no isolation level, no deadlock, no PO-number race. User locks
+      (GET_LOCK / RELEASE_LOCK) are granted at once and only recorded
+      (FakeMySQL.locks / lock_log); a test names the ones "another
+      connection" holds in FakeMySQL.busy_locks. What IS checked: the lock
+      connection must end its own transaction before the app's begins (the
+      second-connection rule below), and no lock may be left held.
     * A second connection opened while a transaction is open (MySQL: a
       separate session that cannot see the uncommitted rows) is refused
       with HarnessError rather than emulated.
@@ -47,8 +52,9 @@ What this does NOT prove (single SQLite connection)
       approximation of the MySQL collation; no accent or trailing-space rules.
     * A DATE column compared with a bound *datetime* compares as text.
     * Ids used by a rolled-back transaction are not reused (as in InnoDB), but
-      no other InnoDB internals are modelled; triggers, views and foreign keys
-      of the live database do not exist here.
+      no other InnoDB internals are modelled; triggers and foreign keys of the
+      live database do not exist here. Of its views only the ERP stock ledger
+      vw_jute_stock_outstanding exists (VIEWS below, copied from sls).
 """
 
 import json
@@ -411,14 +417,25 @@ def _mysql_datetime(value):
 _TIME_TEXT = re.compile(r"^(-?)(\d{1,3}):(\d{2}):(\d{2})(?:\.\d+)?$")
 
 
+def _mysql_time(value):
+    """What a TIME column keeps of a DATETIME value (NOW(), as the marked-move
+    header writes into in_time / out_time): the time part, as MySQL does."""
+    if isinstance(value, str) and _DATE_PREFIX.match(value):
+        try:
+            return datetime.fromisoformat(value).strftime("%H:%M:%S")
+        except ValueError:
+            return value
+    return value
+
+
 def _mysql_temporal_ok(value, kind) -> int:
     """1 when `value` is acceptable to a DATE / DATETIME / TIME column."""
     if value is None:
         return 1
     if not isinstance(value, str):
         return 0
-    if kind == "time":
-        return int(bool(_TIME_TEXT.match(value)))
+    if kind == "time" and _TIME_TEXT.match(value):
+        return 1
     try:
         datetime.fromisoformat(value)
     except ValueError:
@@ -482,6 +499,15 @@ def _mysql_round(value, digits=0):
         ctx.prec = 60
         rounded = exact.quantize(exponent, rounding=ROUND_HALF_UP)
     return int(rounded) if isinstance(value, int) else float(rounded)
+
+
+def _date_part(value, index: int):
+    """YEAR() / MONTH() / DAY() of a DATE or DATETIME value (NULL -> NULL)."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _DATE_PREFIX.match(value):
+        raise HarnessError(f"YEAR()/MONTH()/DAY() of a non-date ({value!r}) is not emulated")
+    return int(value[:10].split("-")[index])
 
 
 def _least(*args):
@@ -633,6 +659,7 @@ class _Schema:
                 check, fix = f"mysql_temporal_ok({q}, 'datetime')", f"mysql_datetime({q})"
             elif base == "time":
                 sql_type, kind, check = "MYSQL_TIME", "time", f"mysql_temporal_ok({q}, 'time')"
+                fix = f"mysql_time({q})"
             else:
                 raise HarnessError(f"{table}.{name}: no SQLite mapping for {col['type']!r}")
 
@@ -672,6 +699,98 @@ class _Schema:
 
 
 _SCHEMAS = {}
+
+# The ERP's per-MR-line stock ledger, as it is on sls on 2026-10-03 (SHOW CREATE
+# VIEW; the same text as vowerp3be dbqueries/migrations/
+# 20260925_vw_jute_stock_outstanding_waste_kg_qty.sql). It is what the app's
+# _available_kg, the Lots / Transfer / Marked grids and the P&L read:
+#   bal_weight = actual_weight - issued (jute_issue, not status 4)
+#                              - sold (approved raw-jute invoice lines that name
+#                                      the MR line in sales_invoice_dtl.jute_mr_li_id)
+# over active lines of MRs not at status 4 / 6 / 21 / 48. (A pending ERP
+# migration, 20261003_vw_jute_stock_outstanding_returned_in_stock.sql, keeps
+# status 48 in stock; model that here only once it is on sls.) Written in the
+# MySQL dialect and run through translate() like any app statement.
+VIEWS = {
+    "vw_jute_stock_outstanding": """
+CREATE VIEW vw_jute_stock_outstanding AS
+SELECT
+    jml.jute_mr_li_id                                              AS jute_mr_li_id,
+    jm.out_date                                                    AS inward_date,
+    jm.branch_id                                                   AS branch_id,
+    jm.branch_mr_no                                                AS branch_mr_no,
+    jm.jute_gate_entry_no                                          AS jute_gate_entry_no,
+    wm.warehouse_name                                              AS warehouse_name,
+    jml.actual_quality                                             AS actual_quality,
+    jml.actual_item_id                                             AS actual_item_id,
+    CASE WHEN ig.item_type_id = 3
+         THEN jml.actual_weight
+         ELSE jml.actual_qty END                                   AS actual_qty,
+    jml.actual_weight                                              AS actual_weight,
+    jm.unit_conversion                                             AS unit_conversion,
+    CASE WHEN ig.item_type_id = 3
+         THEN ROUND((jml.actual_weight
+                - IFNULL(iss.isswt, 0)
+                - IFNULL(sold.soldwt, 0)), 3)
+         ELSE (jml.actual_qty
+                - IFNULL(iss.issqty, 0)
+                - CASE WHEN jml.actual_weight > 0
+                       THEN jml.actual_qty * IFNULL(sold.soldwt, 0) / jml.actual_weight
+                       ELSE 0 END) END                             AS bal_qty,
+    ROUND((jml.actual_weight
+       - IFNULL(iss.isswt, 0)
+       - IFNULL(sold.soldwt, 0)), 3)                               AS bal_weight,
+    jml.accepted_weight                                            AS accepted_weight,
+    (jml.accepted_weight
+       - ROUND(((jml.accepted_weight / jml.actual_qty) * IFNULL(iss.issqty, 0)), 3))
+                                                                   AS bal_accepted_weight,
+    jml.rate                                                       AS rate,
+    jml.actual_rate                                                AS actual_rate,
+    jm.status_id                                                   AS mr_status_id,
+    CASE WHEN ig.item_type_id = 3
+         THEN IFNULL(sold.soldwt, 0)
+         WHEN jml.actual_weight > 0
+         THEN jml.actual_qty * IFNULL(sold.soldwt, 0) / jml.actual_weight
+         ELSE 0 END                                                AS sold_qty,
+    IFNULL(sold.soldwt, 0)                                         AS sold_weight
+FROM jute_mr jm
+JOIN jute_mr_li jml
+    ON jm.jute_mr_id = jml.jute_mr_id
+LEFT JOIN warehouse_mst wm
+    ON wm.warehouse_id = jml.warehouse_id
+LEFT JOIN item_mst im
+    ON im.item_id = jml.actual_item_id
+LEFT JOIN item_grp_mst ig
+    ON ig.item_grp_id = im.item_grp_id
+LEFT JOIN (
+    SELECT
+        ji.jute_mr_li_id      AS jute_mr_li_id,
+        SUM(ji.quantity)      AS issqty,
+        SUM(ji.weight)        AS isswt
+    FROM jute_issue ji
+    WHERE ji.status_id <> 4
+    GROUP BY ji.jute_mr_li_id
+) iss
+    ON iss.jute_mr_li_id = jml.jute_mr_li_id
+LEFT JOIN (
+    SELECT
+        sid.jute_mr_li_id                                         AS jute_mr_li_id,
+        SUM(COALESCE(NULLIF(sid.sales_weight, 0), sid.quantity, 0)) AS soldwt
+    FROM sales_invoice_dtl sid
+    JOIN sales_invoice sinv
+        ON sinv.invoice_id = sid.invoice_id
+    WHERE sid.jute_mr_li_id IS NOT NULL
+      AND sinv.invoice_type = 5
+      AND sinv.status_id = 3
+      AND COALESCE(sinv.active, 1) = 1
+    GROUP BY sid.jute_mr_li_id
+) sold
+    ON sold.jute_mr_li_id = jml.jute_mr_li_id
+WHERE jm.status_id NOT IN (4, 6, 21, 48)
+  AND jml.active = 1
+  AND (jml.status IS NULL OR jml.status NOT IN ('4', '6'))
+""",
+}
 
 
 def _schema(path: Path) -> _Schema:
@@ -730,16 +849,31 @@ class FakeMySQL:
     read_only         True between START TRANSACTION READ ONLY and the end of
                       that transaction: a write is then refused as MySQL
                       refuses it (error 1792)
+    database_name     what SELECT DATABASE() answers (the schema name in the
+                      app's lock names)
+    locks             user locks held right now (GET_LOCK adds, RELEASE_LOCK
+                      removes); the fixture fails a test that leaves one held
+    busy_locks        names GET_LOCK answers 0 for (held by "another
+                      connection"); lock_log records every GET_LOCK /
+                      RELEASE_LOCK as ('get' | 'release', name, result).
+                      One connection: who holds a lock is not modelled beyond
+                      that
     insert / update / delete / rows / row / count / snapshot / diff
                       direct access for building and inspecting data
     """
 
-    def __init__(self, snapshot_path: Path = SNAPSHOT_PATH, now: datetime = DEFAULT_NOW):
+    def __init__(self, snapshot_path: Path = SNAPSHOT_PATH, now: datetime = DEFAULT_NOW,
+                 database_name: str = "sls"):
         self._now = now
         self.harness_errors = []
         self.statements = []
         self.parameters = []
         self.read_only = False
+        self.database_name = database_name
+        self.locks = set()
+        self.busy_locks = set()
+        self.null_locks = set()        # names GET_LOCK answers NULL for (an error)
+        self.lock_log = []
         self.schema = _schema(Path(snapshot_path))
         self.raw = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES,
                                    isolation_level=None, check_same_thread=False)
@@ -751,6 +885,8 @@ class FakeMySQL:
         self.raw.execute("PRAGMA recursive_triggers = OFF")
         for statement in self.schema.ddl:
             self.raw.execute(statement)
+        for view in VIEWS.values():
+            self.raw.execute(translate(view))
         self._listen()
 
     # -- clock ---------------------------------------------------------------
@@ -773,6 +909,9 @@ class FakeMySQL:
         create = self.raw.create_function
         create("NOW", 0, lambda: self._now.strftime("%Y-%m-%d %H:%M:%S"))
         create("CURDATE", 0, lambda: self._now.strftime("%Y-%m-%d"))
+        create("DATABASE", 0, lambda: self.database_name)
+        create("GET_LOCK", 2, self._get_lock)
+        create("RELEASE_LOCK", 1, self._release_lock)
         create("regexp", 2, _regexp, deterministic=True)
         for name in ("SUBSTRING", "SUBSTR", "MID"):
             create(name, 2, _substring, deterministic=True)
@@ -784,17 +923,57 @@ class FakeMySQL:
         create("ROUND", 2, _mysql_round, deterministic=True)
         create("LEAST", -1, _least, deterministic=True)
         create("GREATEST", -1, _greatest, deterministic=True)
+        create("YEAR", 1, lambda v: _date_part(v, 0), deterministic=True)
+        create("MONTH", 1, lambda v: _date_part(v, 1), deterministic=True)
+        create("DAY", 1, lambda v: _date_part(v, 2), deterministic=True)
         create("mysql_float", 1, _mysql_float, deterministic=True)
         create("mysql_decimal", 2, _mysql_decimal, deterministic=True)
         create("mysql_int", 1, _mysql_int, deterministic=True)
         create("mysql_date", 1, _mysql_date, deterministic=True)
         create("mysql_datetime", 1, _mysql_datetime, deterministic=True)
+        create("mysql_time", 1, _mysql_time, deterministic=True)
         create("mysql_temporal_ok", 2, _mysql_temporal_ok, deterministic=True)
 
     def _harness_error(self, message: str) -> HarnessError:
         error = HarnessError(message)
         self.harness_errors.append(error)
         return error
+
+    # -- user locks (GET_LOCK / RELEASE_LOCK) ----------------------------------
+
+    def _get_lock(self, name, timeout):
+        """GET_LOCK(name, timeout): 1 when granted, 0 when another connection
+        holds it (busy_locks), NULL for a NULL name -- as MySQL answers. A
+        name longer than 64 characters is refused as MySQL refuses it."""
+        if name is None:
+            self.lock_log.append(("get", None, None))
+            return None
+        name = str(name)
+        if len(name) > 64:
+            # recorded here: sqlite3 only reports "user-defined function raised exception"
+            raise self._harness_error(f"GET_LOCK name longer than 64 characters: {name!r}")
+        if name in self.null_locks:
+            result = None
+        else:
+            result = 0 if name in self.busy_locks else 1
+        if result:
+            self.locks.add(name)
+        self.lock_log.append(("get", name, result))
+        return result
+
+    def _release_lock(self, name):
+        """RELEASE_LOCK(name): 1 when this connection held it, 0 when another
+        does (busy_locks), NULL when nobody holds it."""
+        if name is None:
+            return None
+        name = str(name)
+        if name in self.locks:
+            self.locks.discard(name)
+            result = 1
+        else:
+            result = 0 if name in self.busy_locks else None
+        self.lock_log.append(("release", name, result))
+        return result
 
     def _listen(self) -> None:
         engine, raw = self.engine, self.raw
@@ -1016,9 +1195,11 @@ def fake_db(monkeypatch):
     db.install(monkeypatch)
     yield db
     errors = list(db.harness_errors)
+    held = sorted(db.locks)
     db.close()
     assert not errors, "statements the fake database could not run faithfully:\n" + \
         "\n".join(str(e) for e in errors)
+    assert not held, f"user locks still held at the end of the test: {held}"
 
 
 # ---------------------------------------------------------------------------

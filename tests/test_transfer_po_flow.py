@@ -256,9 +256,13 @@ def test_finalize_reprices_the_root_books_the_invoice_and_writes_the_final_po(sc
     assert [(d["quantity"], d["rate"], d["amount_without_tax"]) for d in dtl] == [
         (9312.0, 129.14, 1202551.68), (1441.0, 127.13, 183194.33)]
     jute = db.row("sales_invoice_jute", invoice_id=result["invoice_id"])
-    assert (jute["mr_id"], jute["claim_amount"]) == (hop, Decimal("13907.00"))
+    # the invoice claim is the sum of its line claims (as the ERP's invoice
+    # save computes it), not the screen's whole-rupee figure
+    assert (jute["mr_id"], jute["claim_amount"]) == (hop, Decimal("13907.45"))
     assert [db.row("sales_invoice_jute_dtl", invoice_line_item_id=d["invoice_line_item_id"])[
         "claim_amount_dtl"] for d in dtl] == [13287.2, 620.25]
+    # every invoice line names the SELLER hop's line it sells (ERP stock view)
+    assert [d["jute_mr_li_id"] for d in dtl] == sc.active_lines(hop)
 
     # the Final PO at the mill, on B, rates to the closest 50, remembering the old header
     final = result["po"]
@@ -456,9 +460,10 @@ def test_multi_hop_chain_and_delete_from_the_middle(scenario, po_on):
 
 
 def test_deleting_a_step_takes_the_invoice_of_the_highest_earlier_hop(scenario, po_on):
-    """A -> B -> C -> B visits B twice. Deleting the C step removes the sale
-    onward (C -> B, linked to it) and the sale that created it (B -> C,
-    linked to step 1 = the highest chain id below it) -- not the later B hop."""
+    """A -> B -> C -> B visits B twice. "Delete from step 2" removes the later
+    B hop and then C, each with the sale that created it: the later B hop's
+    seller is C (the highest chain id below it), not the first B hop, whose
+    MR, PO and sale onward (B -> C, linked to it) go only with C itself."""
     sc, db = scenario, scenario.db
     chain = Chain(sc)
     to_b = chain.save("B", mr_date=date(2026, 9, 1))
@@ -467,16 +472,25 @@ def test_deleting_a_step_takes_the_invoice_of_the_highest_earlier_hop(scenario, 
     assert [db.row("sales_invoice_jute", invoice_id=r["invoice_id"])["mr_id"]
             for r in (to_c, again_b)] == [to_b["mr_id"], to_c["mr_id"]]
     assert again_b["po"]["po_no_formatted"] == "JTSPL/JPO/26-27/00002"
-    keep = (mr_state(db, to_b["mr_id"]), po_state(db, to_b["po"]["po_id"]),
-            mr_state(db, again_b["mr_id"]), po_state(db, again_b["po"]["po_id"]))
+    keep = (mr_state(db, to_b["mr_id"]), po_state(db, to_b["po"]["po_id"]))
+    start = len(db.statements)
 
-    assert transfer.delete_transfer_step(to_c["mr_id"], sc.user) == {
-        "po_id": to_c["po"]["po_id"], "po_no_formatted": FORWARD_C}
+    out = chain.delete_from(2)
 
+    assert out == {"deleted_mr_ids": [again_b["mr_id"], to_c["mr_id"]],
+                   "deleted_pos": ["JTSPL/JPO/26-27/00002", FORWARD_C], "reverted": False}
+    # the later B hop went first and took C -> B (its seller's invoice) with it,
+    # then C took B -> C: the first B hop's invoice was deleted with C, not
+    # with the hop that visited B again
+    deletes = [(s, p) for s, p in zip(db.statements[start:], db.parameters[start:])
+               if s.startswith("DELETE FROM sales_invoice WHERE")]
+    assert [p["id"] for _s, p in deletes] == [again_b["invoice_id"], to_c["invoice_id"]]
     assert {t: db.count(t) for t in INVOICE_TABLES} == dict.fromkeys(INVOICE_TABLES, 0)
-    assert mr_state(db, to_c["mr_id"]) == ([], [])
-    assert (mr_state(db, to_b["mr_id"]), po_state(db, to_b["po"]["po_id"]),
-            mr_state(db, again_b["mr_id"]), po_state(db, again_b["po"]["po_id"])) == keep
+    assert mr_state(db, to_c["mr_id"]) == mr_state(db, again_b["mr_id"]) == ([], [])
+    assert (mr_state(db, to_b["mr_id"]), po_state(db, to_b["po"]["po_id"])) == keep
+    # there is no public "delete one hop" any more (it read before it locked
+    # and left later hops or a finalized root behind)
+    assert not hasattr(transfer, "delete_transfer_step")
 
 
 def test_delete_chain_from_step_without_anything_to_do_changes_nothing(scenario, po_on):
@@ -549,8 +563,9 @@ def test_open_chain_saved_then_deleted_from_step_1_leaves_no_trace(scenario, po_
                                     (27, "Jagrati Trade Services Pvt. Ltd.")]),
         "item_grp_mst": [(27, "JUTE"), (74, "JUTE")],
         "item_mst": [(27, "D TD-5"), (27, "D TD-6"), (74, "D TD-5"), (74, "D TD-6")],
-        "jute_supp_party_map": [(27, 2430, "Jagrati Trade Services Pvt. Ltd."),
-                                (74, 2430, "HONEYWELL COMMERCIAL PVT. LTD.")],
+        # only the first hop maps the outside supplier (as a party of B); the
+        # later hop at C never pairs the broker with its sister company B
+        "jute_supp_party_map": [(74, 2430, "HONEYWELL COMMERCIAL PVT. LTD.")],
     }
 
 
@@ -690,9 +705,14 @@ def test_a_chain_cannot_be_finalized_twice(scenario, po_on):
     assert db.diff(before, db.snapshot()) == []
 
 
+LOCK_SQL = ("SELECT DATABASE()", "SELECT GET_LOCK(:name, :timeout)", "SELECT RELEASE_LOCK(:name)")
+
+
 def test_every_save_and_delete_locks_the_root_row_first(scenario, po_on):
     """Row locks are not emulated; what is checked is that the root row's
-    SELECT ... FOR UPDATE is the first statement of each transaction."""
+    SELECT ... FOR UPDATE is the first statement of each transaction (a save's
+    named locks run before it, on their own connection -- see
+    test_review_fixes for that protocol)."""
     sc, db = scenario, scenario.db
     chain = Chain(sc)
     for action in (lambda: chain.save("B", mr_date=date(2026, 9, 1)),
@@ -700,8 +720,10 @@ def test_every_save_and_delete_locks_the_root_row_first(scenario, po_on):
                    chain.unfinalize, lambda: chain.delete_from(1)):
         start = len(db.statements)
         action()
-        assert db.statements[start].endswith("FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE")
-        assert db.parameters[start] == {"id": sc.root}
+        first = next(i for i in range(start, len(db.statements))
+                     if db.statements[i] not in LOCK_SQL)
+        assert db.statements[first].endswith("FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE")
+        assert db.parameters[first] == {"id": sc.root}
 
 
 def test_save_returns_the_mr_the_invoice_and_the_po(scenario, po_on):
@@ -722,30 +744,38 @@ def test_a_chain_only_starts_from_a_pending_root(scenario, po_on):
 
 
 @pytest.mark.parametrize("which", ["the root", "an ERP MR", "a marked-godown child"])
-def test_delete_transfer_step_refuses_an_mr_that_is_not_a_chain_step(scenario, po_on, which):
+def test_the_hop_delete_refuses_an_mr_that_is_not_a_chain_step(scenario, po_on, which):
+    """The one hop-deleting routine (the cascade's step) never hard-deletes a
+    gate-entry MR, a root or a marked-godown child."""
     sc, db = scenario, scenario.db
     Chain(sc).save("B", mr_date=date(2026, 9, 1))
     mr = {"the root": lambda: sc.root, "an ERP MR": sc.add_root,
           "a marked-godown child": lambda: sc.add_hop(transfer_mode=1)}[which]()
     before = db.snapshot()
     with pytest.raises(ValueError, match="is not a vertical-chain step; cannot delete"):
-        transfer.delete_transfer_step(mr, sc.user)
+        with DatabaseConnection.get_transaction() as conn:
+            transfer._delete_transfer_step_in_txn(conn, mr, sc.user)
     assert db.diff(before, db.snapshot()) == []
     before = db.snapshot()
-    assert transfer.delete_transfer_step(999999, sc.user) is None      # no such MR: no-op
+    with DatabaseConnection.get_transaction() as conn:
+        assert transfer._delete_transfer_step_in_txn(conn, 999999, sc.user) is None   # no such MR
+    assert db.diff(before, db.snapshot()) == []
+    # through the public entry point a foreign MR is simply not a step of the chain
+    assert transfer.delete_chain_from_step(sc.root, mr, sc.user) == {
+        "deleted_mr_ids": [], "deleted_pos": [], "reverted": False}
     assert db.diff(before, db.snapshot()) == []
 
 
-def test_delete_transfer_step_removes_one_hop_with_its_po_and_invoices(scenario, po_on):
+def test_delete_from_the_newest_step_removes_one_hop_with_its_po_and_invoices(scenario, po_on):
     sc, db = scenario, scenario.db
     chain = Chain(sc)
     to_b = chain.save("B", mr_date=date(2026, 9, 1))
     hop_b_before = mr_state(db, to_b["mr_id"]), po_state(db, to_b["po"]["po_id"])
     to_c = chain.save("C", pct=0.5, mr_date=date(2026, 9, 2))
 
-    out = transfer.delete_transfer_step(to_c["mr_id"], sc.user)
+    out = chain.delete_from(2)
 
-    assert out == {"po_id": to_c["po"]["po_id"], "po_no_formatted": FORWARD_C}
+    assert out == {"deleted_mr_ids": [to_c["mr_id"]], "deleted_pos": [FORWARD_C], "reverted": False}
     assert mr_state(db, to_c["mr_id"]) == ([], [])
     assert po_state(db, to_c["po"]["po_id"]) == ([], [], [])
     assert {t: db.count(t) for t in INVOICE_TABLES} == dict.fromkeys(INVOICE_TABLES, 0)

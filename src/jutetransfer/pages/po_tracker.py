@@ -24,7 +24,11 @@ from ..po_queries import clear_tracker_cache, get_tracker_index, load_tracker_da
 
 # Widget state. Each key is initialised once in st.session_state and the
 # widgets are created with key= only (no value= / index=), so a rerun never
-# overrides what the user chose.
+# overrides what the user chose. They are created with
+# persist_state="session" too: Streamlit drops a widget's key when the widget
+# is not rendered for a run, so without it the designed loop Transfer Chain
+# -> PO Tracker -> Transfer Chain came back to All mills / newest month / no
+# search every time.
 K_VIEW = "pot_view"
 K_MILL = "pot_mill"            # co_id of the mill, 0 = all mills
 K_PERIOD = "pot_period"        # 'M:2026-09' or 'FY:2026'
@@ -107,11 +111,14 @@ def _lorry_column_config() -> dict:
     text, number, day = (st.column_config.TextColumn, st.column_config.NumberColumn,
                          st.column_config.DateColumn)
     config = {
-        # The first four columns fit a 390 px phone next to the selection box.
-        "Lorry": text("Lorry", pinned=True, width=116),
-        "Orig PO": text("Orig PO", width=80, help="Original PO: the mill's ERP purchase order on the outside supplier"),
-        "Fwd PO": text("Fwd PO", width=86, help="Forwarding PO: the forwarding company's transfer PO"),
-        "Final PO": text("Final PO", width=80, help="Final PO: the mill's transfer PO on the forwarding company, made when the lorry is back at the mill"),
+        # The first four columns must fit a 390 px phone next to the ~32 px
+        # selection box: 100 + 70 + 78 + 78 = 326 px (the earlier 362 px cut
+        # the Final PO column, and the pilot's 'EJM 63' read 'EJM 6' -- the
+        # same text as its Orig PO cell).
+        "Lorry": text("Lorry", pinned=True, width=100),
+        "Orig PO": text("Orig PO", width=70, help="Original PO: the mill's ERP purchase order on the outside supplier"),
+        "Fwd PO": text("Fwd PO", width=78, help="Forwarding PO: the forwarding company's transfer PO"),
+        "Final PO": text("Final PO", width=78, help="Final PO: the mill's transfer PO on the forwarding company, made when the lorry is back at the mill"),
         "Status": text("Status", width=124),
         "GE No": number("GE No", format="%d"),
         "Days": number("Days", format="%d", help="Days since the lorry was transferred, while it is not back at the mill"),
@@ -385,20 +392,21 @@ def po_tracker_page() -> None:
                  if H.in_period(l["lorry_date"], period) and H.matches_show(l, show)]
 
     # -- filters, one per line (a phone stacks columns anyway) ---------------
+    keep = {"persist_state": "session"}
     st.segmented_control("View", H.VIEW_OPTIONS, key=K_VIEW, required=True,
-                         label_visibility="collapsed")
+                         label_visibility="collapsed", **keep)
     st.selectbox("Mill", mill_ids, format_func=lambda co: mill_labels.get(co, str(co)),
-                 key=K_MILL, label_visibility="collapsed")
+                 key=K_MILL, label_visibility="collapsed", **keep)
     st.selectbox("Period", list(period_labels),
                  format_func=lambda code: period_labels.get(code, str(code)),
-                 key=K_PERIOD, label_visibility="collapsed")
+                 key=K_PERIOD, label_visibility="collapsed", **keep)
     st.pills("Show", H.SHOW_OPTIONS, key=K_SHOW, required=True,
-             label_visibility="collapsed")
+             label_visibility="collapsed", **keep)
     st.text_input("Search", key=K_SEARCH, label_visibility="collapsed",
-                  placeholder="Search PO no, GE no, supplier, lorry no")
+                  placeholder="Search PO no, GE no, supplier, lorry no", **keep)
     with st.expander("More filters"):
         st.selectbox("Forwarding company", list(fwd_labels),
-                     format_func=lambda co: fwd_labels.get(co, str(co)), key=K_FWD)
+                     format_func=lambda co: fwd_labels.get(co, str(co)), key=K_FWD, **keep)
 
     mill_prefix = next((l["mill"] for l in in_mill), "") if ss[K_MILL] else ""
     fwd_prefix = ""
@@ -410,7 +418,7 @@ def po_tracker_page() -> None:
     # year for a search), Show chip, forwarder and search text.
     file_filters = {"show": show, "fwd_prefix": fwd_prefix, "search": search}
     with st.container(horizontal=True, vertical_alignment="center"):
-        st.toggle("All columns", key=K_FULL)
+        st.toggle("All columns", key=K_FULL, persist_state="session")
         _refresh_button()
         st.download_button(
             "Download CSV",
@@ -449,6 +457,11 @@ def po_tracker_page() -> None:
         po_rows = []
         totals = H.lorry_totals(shown)
         st.markdown(H.summary_line(totals))
+    # A month with '0 forwarding POs · 0 final POs' while the pilot's POs sit
+    # in another month read as 'the POs are missing': say where they are.
+    note = H.fy_po_note(totals, H.lorry_totals(scope), period, fy, bool(search))
+    if note:
+        st.caption(note)
 
     # One banner for the whole financial year instead of a warning per lorry.
     for kind, text in H.backfill_banners(lorries):

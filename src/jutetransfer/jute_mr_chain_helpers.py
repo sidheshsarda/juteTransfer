@@ -331,6 +331,16 @@ def _calculate_step_total_amount(step_index: int, line_items: list, step_dict: d
         return total
 
 
+def _stored_amount(value):
+    """A money figure read from the database as a float, or None when the
+    row had none (None / NaN / not a number)."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if amount != amount else amount
+
+
 def _recalculate_chain(steps: list, line_items: list, original_total_amount: float = 0.0,
                        use_new_rounding: bool = False) -> list:
     """Recalculate all derived values in a transfer chain.
@@ -377,12 +387,21 @@ def _recalculate_chain(steps: list, line_items: list, original_total_amount: flo
             continue
 
         if step.get("saved_mr_id"):
-            # Saved step: use DB-stored total as the authoritative value
+            # Saved step: the DB-stored money is authoritative. The claim and
+            # the net are kept as stored too -- the ERP's net of a finalized
+            # root carries 194Q TDS and the roundoff (what the P&L sums), so
+            # recomputing it as total - claim showed a Net the ERP does not
+            # have. Only a step without a stored figure gets the computed one.
             stored_total = float(step.get("total_amount") or 0)
             step["total_amount"] = round(stored_total, 0)
             step["roundoff"] = 0.0
-            step["claim_amount"] = total_claim
-            step["net_amount"] = round(step["total_amount"] - total_claim, 0)
+            stored_claim = _stored_amount(step.get("claim_amount"))
+            stored_net = _stored_amount(step.get("net_amount"))
+            step["claim_amount"] = total_claim if stored_claim is None else stored_claim
+            step["net_amount"] = (
+                round(step["total_amount"] - step["claim_amount"], 0)
+                if stored_net is None else stored_net
+            )
             step["weighted_avg_rate"] = (
                 step["total_amount"] / total_weight * 100
             ) if total_weight > 0 else 0.0

@@ -61,14 +61,33 @@ _ACTIVE_LINES = "(active = 1 OR active IS NULL)"
 _ENABLED_DEFAULT = "0"
 
 
-_OFF_VALUES = {"0", "false", "no", "off"}
+_ON_VALUES = {"1", "true", "yes", "on"}
 
 
 def transfer_po_enabled() -> bool:
-    """Kill switch: JT_TRANSFER_PO=0 (or false / no / off) stops PO creation
-    (deletes still run). Unset or empty: the default above."""
+    """Kill switch: PO creation runs only when JT_TRANSFER_PO is 1 / true /
+    yes / on (any case); anything else -- 0, off, a typo such as 'fasle' --
+    keeps it OFF, so a misspelling can never switch it on. Unset or empty:
+    the default above, read by the same rule. Deletes always run."""
     value = (os.getenv("JT_TRANSFER_PO") or "").strip().lower() or _ENABLED_DEFAULT
-    return value not in _OFF_VALUES
+    return value.strip().lower() in _ON_VALUES
+
+
+# -- the ERP's PO numbering lock (vowerp3be po_numbering.py, LOCK PROTOCOL) --
+# MAX(po_no)+1 per branch is read by the ERP and by this app without a unique
+# key; both now take the same server-wide user lock around "read MAX +
+# insert + commit". Name: jute_po_no:<schema>:<branch_id> -- '{db}' is filled
+# in by database.named_locks (SELECT DATABASE()). The lock must be held from
+# BEFORE the writing transaction's first read until AFTER its commit, which
+# is why the callers of create_*_po (save_transfer_step, the backfill) take
+# it around their transaction rather than _next_po_no itself.
+PO_NO_LOCK_PREFIX = "jute_po_no"
+PO_NO_LOCK_TIMEOUT = 5  # seconds, as the ERP: 0 after that = "save again"
+
+
+def po_no_lock(branch_id) -> str:
+    """The named lock guarding the PO number series of one branch."""
+    return f"{PO_NO_LOCK_PREFIX}:{{db}}:{int(branch_id)}"
 
 
 def _result(role: str, po_id=None, po_no=None, formatted: str = "",
@@ -182,7 +201,9 @@ def _db_today(conn) -> date:
 def _next_po_no(conn, branch_id: int, po_date: date) -> int:
     """ERP rule (vowerp3be jutePO.py): MAX(po_no)+1 per branch within the
     Apr-Mar financial year of po_date. Run inside the transaction so a second
-    PO of the same save sees the first."""
+    PO of the same save sees the first. The caller must hold
+    po_no_lock(branch_id) from before the transaction's first read (see
+    database.named_locks): without it two savers read the same MAX."""
     fy_start, fy_end = _get_financial_year_bounds(po_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(po_no), 0) AS max_no
@@ -202,10 +223,12 @@ def _has_supplier_party_triple(conn, co_id: int, supplier_id, party_id) -> bool:
     """), {"co": int(co_id), "sid": supplier_id, "pid": party_id}).fetchone() is not None
 
 
-def _mapped_supplier(conn, co_id: int, party_id, preferred_supplier_id) -> Optional[int]:
+def mapped_supplier(conn, co_id: int, party_id, preferred_supplier_id) -> Optional[int]:
     """Supplier under which party_id is already mapped in co_id (the MR's own
-    supplier if it is one of them). Lookup only: the origin company's
-    supplier/party masters are never extended from here."""
+    supplier if it is one of them; that supplier when the party is mapped
+    under none). Lookup only: the company's supplier/party masters are never
+    extended from here. Used for the Final PO, a later hop's Forwarding PO
+    and (transfer.save_transfer_step) the later hop MR itself."""
     party_id = _as_int(party_id)
     preferred = _as_int(preferred_supplier_id)
     if party_id:
@@ -350,7 +373,7 @@ def plan_forward_po(conn, hop_mr_id: int) -> dict:
         # is the one that sister company is already mapped under here (as on
         # the Final PO) -- never a new map row pairing the outside jute
         # supplier with a sister company.
-        supplier_id = _mapped_supplier(conn, plan["co_id"], party_id,
+        supplier_id = mapped_supplier(conn, plan["co_id"], party_id,
                                        hop.get("jute_supplier_id"))
     plan["supplier_id"] = supplier_id
     plan["close_remark"] = forward_close_remark(
@@ -388,7 +411,7 @@ def plan_final_po(conn, root_mr_id: int, original: Optional[dict] = None) -> dic
     if plan["skipped"]:
         return plan
     plan["party_id"] = _as_int(root.get("party_id"))
-    plan["supplier_id"] = _mapped_supplier(
+    plan["supplier_id"] = mapped_supplier(
         conn, plan["co_id"], root.get("party_id"), root.get("jute_supplier_id"))
     plan["close_remark"] = final_close_remark(
         root.get("jute_gate_entry_no"), _as_date(root.get("jute_gate_entry_date")),
@@ -603,13 +626,21 @@ def delete_transfer_po(conn, po_id: int, role: str, mr_id: int) -> Optional[dict
     PO of MR `mr_id` (the hop for a Forwarding PO, the root for a Final PO)
     and no other MR is linked to it. Unlinks the hop of a Forwarding PO.
     Returns {'po_id', 'po_no_formatted'}, or None when it is not that PO
-    (nothing is touched then)."""
-    po = _row(conn, """
-        SELECT jute_po_id, internal_note, po_no, po_date, branch_id
-        FROM jute_po WHERE jute_po_id = :id FOR UPDATE
-    """, {"id": int(po_id)})
-    marker = parse_marker(po["internal_note"]) if po else None
-    if not marker or marker["role"] != role or marker["mr_id"] != int(mr_id):
+    (nothing is touched then -- not even a row lock: an ERP PO a hop was
+    re-pointed to, or a dangling po_id, is only read; a locking read on it
+    would hold the ERP's PO row, or a gap at the end of jute_po, for the rest
+    of the delete transaction)."""
+    columns = "SELECT jute_po_id, internal_note, po_no, po_date, branch_id FROM jute_po WHERE jute_po_id = :id"
+
+    def is_ours(row) -> bool:
+        marker = parse_marker(row["internal_note"]) if row else None
+        return bool(marker and marker["role"] == role and marker["mr_id"] == int(mr_id))
+
+    if not is_ours(_row(conn, columns, {"id": int(po_id)})):
+        return None
+    # Ours by the plain read: lock it and check again on the locked row.
+    po = _row(conn, columns + " FOR UPDATE", {"id": int(po_id)})
+    if not is_ours(po):
         return None
     own = int(mr_id) if role == ROLE_FORWARD else None
     _refuse_if_other_mrs(conn, int(po_id), own)

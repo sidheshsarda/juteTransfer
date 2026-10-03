@@ -8,10 +8,19 @@ from mysql.connector.abstracts import MySQLConnectionAbstract
 from mysql.connector.pooling import PooledMySQLConnection
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
-from typing import Optional, Any, Literal, Union
+from typing import Iterable, Mapping, Optional, Any, Literal, Union
 from contextlib import contextmanager
 
 from .config import DatabaseConfig
+
+
+# Placeholder in a lock name for the current schema (SELECT DATABASE()): user
+# locks are server-wide, and the sls MySQL server hosts every tenant.
+LOCK_DB_PLACEHOLDER = "{db}"
+LOCK_BUSY_MESSAGE = (
+    "Another save is numbering documents at this branch right now "
+    "(lock {name!r} still held after {timeout} s); please save again in a moment."
+)
 
 
 class DatabaseConnection:
@@ -184,6 +193,105 @@ def delete_by_ids(conn, table: str, pk: str, ids) -> int:
         f"DELETE FROM {table} WHERE {pk} IN ({','.join(str(i) for i in ids)})"
     ))
     return result.rowcount
+
+
+def lock_sort_key(name: str) -> tuple:
+    """Sort key giving every process the SAME order of lock names (no two
+    savers can then wait for each other): segment by segment, numeric
+    segments ascending as numbers ('...:29' before '...:100', as the ERP's
+    "ascending branch_id" rule), text segments as text."""
+    return tuple((0, int(seg), "") if seg.isdigit() else (1, 0, seg)
+                 for seg in str(name).split(":"))
+
+
+def _drop_connection(conn) -> None:
+    """Throw a connection away instead of returning it to the pool: the
+    server then frees every user lock it still holds."""
+    try:
+        conn.invalidate()
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _release_locks(conn, held: list) -> None:
+    """RELEASE_LOCK each name on the lock connection, then give it back;
+    when that fails the connection is dropped so the server frees them."""
+    try:
+        for name in reversed(held):
+            conn.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": name})
+        conn.rollback()
+        conn.close()
+    except Exception:
+        _drop_connection(conn)
+
+
+@contextmanager
+def named_locks(names, timeout: int = 5):
+    """Hold MySQL named (user) locks for the duration of a `with` block, on a
+    DEDICATED connection -- the protocol the ERP's jute PO numbering follows
+    (vowerp3be src/juteProcurement/po_numbering.py):
+
+        with named_locks([...]):                  # GET_LOCK, in lock_sort_key order
+            with DatabaseConnection.get_transaction() as conn:
+                ...  MAX+1 reads, inserts ...     # COMMIT / ROLLBACK
+                                                  # then RELEASE_LOCK
+
+    Every document number this app allocates (MR, gate entry, bill pass, PO,
+    invoice, challan) is MAX+1 on a REPEATABLE READ snapshot, which is the
+    transaction's first plain read. Taking the lock BEFORE the transaction
+    opens makes that snapshot fresh (it holds everything committed before the
+    lock was granted), and releasing only AFTER it ends lets the next holder
+    see this save. The lock lives on its own connection because user locks
+    belong to the connection, survive ROLLBACK, and a pooled connection
+    returned while still holding one would block every later save.
+
+    names    lock names; a {name: timeout} mapping gives each its own wait.
+             '{db}' in a name is replaced by SELECT DATABASE() -- user locks
+             are server-wide and the server hosts every tenant.
+    timeout  seconds to wait for a lock not given its own (GET_LOCK's).
+    Raises ValueError when a lock is still held by another connection after
+    its timeout ("save again"), or when GET_LOCK fails (NULL). Yields the
+    list of names held. No names: nothing is locked.
+    """
+    waits = dict(names) if isinstance(names, Mapping) else {n: timeout for n in names}
+    waits = {str(n): int(t if t is not None else timeout) for n, t in waits.items() if n}
+    if not waits:
+        yield []
+        return
+    conn = DatabaseConnection.get_engine().connect()
+    held: list = []
+    try:
+        try:
+            if any(LOCK_DB_PLACEHOLDER in n for n in waits):
+                db_name = conn.execute(text("SELECT DATABASE()")).scalar()
+                if not db_name:
+                    raise ValueError("Could not take the save lock: SELECT DATABASE() is empty")
+                waits = {n.replace(LOCK_DB_PLACEHOLDER, str(db_name)): t for n, t in waits.items()}
+            for name in sorted(waits, key=lock_sort_key):
+                got = conn.execute(
+                    text("SELECT GET_LOCK(:name, :timeout)"),
+                    {"name": name, "timeout": waits[name]},
+                ).scalar()
+                if got is None:
+                    raise ValueError(f"Could not take the save lock {name!r} (database error)")
+                if int(got) != 1:
+                    raise ValueError(LOCK_BUSY_MESSAGE.format(name=name, timeout=waits[name]))
+                held.append(name)
+            # End the lock connection's own transaction before the caller's
+            # begins: a user lock survives ROLLBACK, the read snapshot does not.
+            conn.rollback()
+        except Exception:
+            _release_locks(conn, held)
+            conn = None
+            raise
+        yield list(held)
+    finally:
+        if conn is not None:
+            _release_locks(conn, held)
 
 
 @st.cache_resource

@@ -13,13 +13,13 @@ from sqlalchemy import text
 
 from .database import DatabaseConnection
 from .lot_helpers import (
-    validate_takes, line_price, primary_source_mr, restore_amounts, combine_takes,
-    production_rate,
+    validate_takes, line_price, primary_source_mr, reduce_amounts, restore_amounts,
+    combine_takes, production_rate,
 )
 from .warehouse_stock_ops import (
     _recompute_mr_header,
     _available_kg,
-    _reduce_source_line,
+    _assert_stock_line,
     _LI_INSERT_SQL,
 )
 
@@ -30,6 +30,7 @@ _LOCK_LINE_SQL = """
            li.unit_conversion, li.warehouse_id, li.jute_mr_id,
            li.actual_qty, li.actual_weight, li.actual_rate,
            li.challan_item_id, li.allowable_moisture, li.actual_moisture,
+           li.active, li.status,
            mr.branch_id, mr.transfer_mode, mr.status_id, mr.src_jute_mr_id,
            mr.party_id, mr.party_branch_id, bm.co_id
     FROM jute_mr_li li
@@ -38,6 +39,37 @@ _LOCK_LINE_SQL = """
     WHERE li.jute_mr_li_id = :id
     FOR UPDATE
 """
+
+
+def _reduce_source_line(conn, r: dict, qty: float, available: float) -> tuple:
+    """Take qty kg off a locked source line, accepted AND actual fields, for
+    an in-place re-lot: the kg re-appear on a new line of the same MR (or of
+    the merge target), so the branch's stock is conserved. (A marked move
+    never calls this: its stock-out is the seller invoice line that names
+    the source line -- see warehouse_stock_ops.)
+
+    Returns (actual_qty_delta, actual_weight_delta) for provenance storage.
+    Raises ValueError (via reduce_amounts) if actual_weight is missing or
+    less than qty -- moving more than the line's actual on-hand weight would
+    mint balance the ERP stock view doesn't have."""
+    new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta = reduce_amounts(
+        r["accepted_weight"], r["actual_weight"], r["actual_qty"], qty, available
+    )
+    conn.execute(text("""
+        UPDATE jute_mr_li
+        SET accepted_weight = :w, total_price = :p,
+            actual_weight = :aw, actual_qty = :aq,
+            updated_date_time = NOW()
+        WHERE jute_mr_li_id = :id
+    """), {
+        "w": new_accepted,
+        "p": line_price(new_accepted, float(r["rate"] or 0)),
+        "aw": new_actual_w,
+        "aq": new_actual_q,
+        "id": int(r["jute_mr_li_id"]),
+    })
+    return aq_delta, aw_delta
+
 
 _CHAIN_CHILD_SQL = """
     SELECT 1 FROM jute_mr
@@ -90,6 +122,8 @@ def create_lot(takes, updated_by: int, merge: bool = False) -> list:
             if not row:
                 raise ValueError(f"Source line {li_id} not found")
             rows[li_id] = dict(row._mapping)
+        for r in rows.values():
+            _assert_stock_line(r)            # soft-deleted / removed in the ERP: not stock
 
         available = {
             i: _available_kg(conn, i, float(r["accepted_weight"] or 0))
@@ -258,6 +292,16 @@ def delete_lot_line(li_id: int, updated_by: int) -> None:
         """), {"id": li_id}).fetchone():
             raise ValueError(
                 "Line feeds a newer lot or marked move; undo that first"
+            )
+        # A raw-jute sales invoice line that names this line
+        # (sales_invoice_dtl.jute_mr_li_id: an ERP sale, or a marked move's
+        # seller invoice) is the ERP's record that its stock was sold;
+        # deleting the line would orphan it.
+        if conn.execute(text("""
+            SELECT 1 FROM sales_invoice_dtl WHERE jute_mr_li_id = :id LIMIT 1
+        """), {"id": li_id}).fetchone():
+            raise ValueError(
+                "Line has sales invoice lines against it; cannot delete"
             )
 
         mr_id = int(r["jute_mr_id"])

@@ -213,6 +213,56 @@ def test_backfill_stops_when_a_number_is_used_twice(scenario, tmp_path, monkeypa
     assert twice["same_number_as"] == [sc.po]
 
 
+def test_backfill_takes_the_branch_po_lock_around_each_po(scenario, tmp_path):
+    """The ERP's PO numbering protocol: jute_po_no:<schema>:<branch> held from
+    before each PO's transaction opens until after it ends; a dry run locks
+    nothing."""
+    sc, db = scenario, scenario.db
+    legacy_chains(sc)
+    assert backfill.main([]) == 0
+    assert db.lock_log == []
+    start = len(db.statements)
+
+    assert backfill.main(["--apply", "--all", "--expect", "4", "--log-dir", str(tmp_path)]) == 0
+
+    lock = {b: f"jute_po_no:sls:{b}" for b in (sc.a_branch, sc.b_branch, sc.c_branch)}
+    gets = [n for kind, n, _r in db.lock_log if kind == "get"]
+    assert gets == [lock[sc.b_branch], lock[sc.c_branch], lock[sc.b_branch], lock[sc.a_branch]]
+    assert [n for kind, n, _r in db.lock_log if kind == "release"] == gets
+    assert db.locks == set()
+    # between a GET_LOCK and its RELEASE_LOCK lie exactly one PO's statements, root lock
+    # first; no PO is written outside a lock
+    stmts = db.statements[start:]
+    windows, open_at = [], None
+    for i, s in enumerate(stmts):
+        if s == "SELECT GET_LOCK(:name, :timeout)":
+            open_at = i
+        elif s == "SELECT RELEASE_LOCK(:name)":
+            windows.append(stmts[open_at + 1:i])
+            open_at = None
+    assert len(windows) == 4
+    for body in windows:
+        assert body[0].endswith("FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE")
+        assert sum(s.startswith("INSERT INTO jute_po (") for s in body) == 1
+    assert sum(s.startswith("INSERT INTO jute_po (") for s in stmts) == 4
+
+
+def test_backfill_stops_when_the_branch_lock_is_busy(scenario, tmp_path, capsys):
+    """An ERP user is numbering a PO at C for longer than the 5 s wait: that
+    PO fails, the run stops there (numbers stay in date order), nothing is
+    left locked."""
+    sc, db = scenario, scenario.db
+    ids = legacy_chains(sc)
+    db.busy_locks.add(f"jute_po_no:sls:{sc.c_branch}")
+
+    assert backfill.main(["--apply", "--all", "--expect", "4", "--log-dir", str(tmp_path)]) == 1
+
+    assert transfer_pos(db) == [(ROLE_FORWARD, ids["hop2"], sc.b_branch, 1, date(2026, 8, 28))]
+    out = capsys.readouterr().out
+    assert "FAILED" in out and "save again" in out and "Created 1 of 4 planned" in out
+    assert db.locks == set()
+
+
 def test_backfill_limit_takes_the_next_lorries_that_need_a_po(scenario, tmp_path):
     sc, db = scenario, scenario.db
     ids = legacy_chains(sc)
@@ -383,3 +433,28 @@ def test_repair_leaves_a_pending_root_alone_whose_party_is_not_a_group_company(s
     db.update("jute_mr", {"jute_mr_id": sc.root}, party_id=str(twin))
     with DatabaseConnection.get_transaction() as conn:
         assert repair.plan_unfinalized_party(conn) == []
+
+
+def test_repair_hop_tds_lists_and_rewrites_old_hops_by_the_erp_rule(scenario, tmp_path):
+    """A hop written by the old code carries the browser's totals and no TDS;
+    the ERP's approve would have put 0.1 % on it once B had bought Rs 50 lakh
+    from the supplier (dated before the lorry)."""
+    sc, db = scenario, scenario.db
+    supplier_in_b, _ = sc.party_in(sc.b_co, sc.supplier_party_name)
+    db.insert("jute_mr", branch_id=sc.b_branch, party_id=str(supplier_in_b), status_id=3,
+              jute_mr_date=date(2026, 8, 1), total_amount=6_000_000.0, transfer_mode=0)
+    hop = sc.add_hop("B", mr_date=date(2026, 9, 1))
+    assert db.row("jute_mr", jute_mr_id=hop)["tds_amount"] is None
+
+    with DatabaseConnection.get_transaction() as conn:
+        (planned,) = repair.plan_hop_tds(conn)
+    assert planned["jute_mr_id"] == hop and planned["approved_before"] == 6_000_000.0
+    assert planned["new"] == {"total_amount": 1378878.5, "claim_amount": 13757.3,
+                              "tds_amount": 1378.88, "roundoff": -0.32, "net_total": 1363742.0}
+
+    assert repair.main(["--apply", "--only", "hop-tds", "--expect", "1",
+                        "--log-dir", str(tmp_path)]) == 0
+    row = db.row("jute_mr", jute_mr_id=hop)
+    assert {k: row[k] for k in planned["new"]} == planned["new"]
+    with DatabaseConnection.get_transaction() as conn:
+        assert repair.plan_hop_tds(conn) == []

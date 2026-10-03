@@ -140,6 +140,18 @@ def reduce_amounts(accepted, actual_w, actual_q, qty, available):
     return new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta
 
 
+def sold_share(actual_q, actual_w, sold_kg):
+    """Bales (3dp) that go with `sold_kg` of a line holding `actual_q` bales
+    in `actual_w` kg -- the ERP stock view's own rule for a sale booked
+    against the line (sold_qty = actual_qty * sold_weight / actual_weight),
+    so the seller's bal_qty and the buyer's child line add up to the source's
+    bales. 0 when the line has no weight."""
+    actual_q, actual_w, sold_kg = float(actual_q or 0), float(actual_w or 0), float(sold_kg or 0)
+    if actual_w <= 0:
+        return 0.0
+    return round(actual_q * sold_kg / actual_w, 3)
+
+
 def restore_amounts(accepted, actual_w, actual_q, qty, aq_delta, aw_delta):
     """Undo reduce_amounts: add qty/aq_delta/aw_delta back (kg whole, bales 3dp)."""
     new_accepted = float(round_kg(float(accepted or 0) + float(qty)))
