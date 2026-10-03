@@ -57,7 +57,9 @@ def _all_sql_literals(path):
 
 def test_transfer_header_totals_and_unfinalize_ignore_inactive_lines():
     src = (SRC / "transfer.py").read_text(encoding="utf-8")
-    sites = re.findall(r"(?<!DELETE )FROM jute_mr_li\s+WHERE jute_mr_id = :\w+[^\n]*", src)
+    # an id-only read feeding a DELETE takes every line of the MR on purpose
+    sites = re.findall(
+        r"(?<!DELETE )(?<!SELECT jute_mr_li_id )FROM jute_mr_li\s+WHERE jute_mr_id = :\w+[^\n]*", src)
     assert sites, "expected jute_mr_li reads in transfer.py"
     bad = [s for s in sites if not ACTIVE.search(s)]
     assert not bad, bad
