@@ -186,6 +186,19 @@ def test_repair_counts_tds_in_the_order_the_lorries_were_finalized(scenario, po_
     assert in_txn(repair.plan_finalized_net) == []
 
 
+def test_a_lorry_without_rates_cannot_start_a_chain(scenario, po_on):
+    """Handed over before the ERP had its rates (Empire GE 69 / 73 / 77 on
+    2026-10-04): a step 1 would cascade 0 into hop, invoice and POs."""
+    sc, db = scenario, scenario.db
+    db.update("jute_mr_li", {"jute_mr_li_id": sc.root_lines[1]}, rate=None, total_price=0)
+    before = db.snapshot()
+    with pytest.raises(ValueError, match="1 line\\(s\\) without a rate"):
+        Chain(sc).save("B", mr_date=date(2026, 9, 1))
+    assert db.diff(before, db.snapshot()) == []
+    db.update("jute_mr_li", {"jute_mr_li_id": sc.root_lines[1]}, rate=12650.0)
+    assert Chain(sc).save("B", mr_date=date(2026, 9, 1))["mr_id"]
+
+
 # --- a transfer PO is deleted only when it is the one asked for ------------------------------
 
 def test_delete_transfer_po_deletes_exactly_the_given_po(scenario, po_on):

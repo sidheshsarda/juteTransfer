@@ -458,3 +458,59 @@ def test_repair_hop_tds_lists_and_rewrites_old_hops_by_the_erp_rule(scenario, tm
     assert {k: row[k] for k in planned["new"]} == planned["new"]
     with DatabaseConnection.get_transaction() as conn:
         assert repair.plan_hop_tds(conn) == []
+
+
+def test_repair_missing_rates_copies_the_po_line_of_the_same_item(scenario, tmp_path, capsys):
+    """A lorry handed over before its rates were typed (Empire GE 69 / 73 / 77):
+    each weighted active line takes the rate of its PO's line with the same
+    item; an item that is not on the PO leaves the whole MR out; inactive
+    lines are neither rated nor counted."""
+    sc, db = scenario, scenario.db
+    for line_id in sc.root_lines:
+        db.update("jute_mr_li", {"jute_mr_li_id": line_id}, rate=None, actual_rate=None, total_price=0)
+    db.update("jute_mr_li", {"jute_mr_li_id": sc.root_dead_line}, rate=None, accepted_weight=500)  # inactive
+    db.update("jute_mr", {"jute_mr_id": sc.root}, total_amount=0, net_total=0, claim_amount=0)
+    # a second lorry whose line's item is not on its PO
+    other = sc.add_root(ge_no=16, ge_date=date(2026, 8, 28))
+    db.update("jute_mr_li", {"jute_mr_id": other, "active": 1}, rate=None, actual_item_id=999)
+
+    assert repair.main(["--only", "missing-rates"]) == 0
+    out = capsys.readouterr().out
+    assert "1 MR(s) get their rates" in out and "1 listed but left out" in out
+    assert f"MR {other} " in out and "not on PO" in out
+    assert "--apply --only missing-rates --expect 1" in out
+
+    assert repair.main(["--apply", "--only", "missing-rates", "--expect", "1",
+                        "--log-dir", str(tmp_path)]) == 0
+    lines = {l["jute_mr_li_id"]: l for l in db.rows("jute_mr_li", jute_mr_id=sc.root)}
+    assert (lines[sc.root_lines[0]]["rate"], lines[sc.root_lines[0]]["actual_rate"]) == (12850.0, 12850.0)
+    assert (lines[sc.root_lines[1]]["rate"], lines[sc.root_lines[1]]["actual_rate"]) == (12650.0, 12650.0)
+    assert lines[sc.root_dead_line]["rate"] is None                       # inactive: untouched
+    root = db.row("jute_mr", jute_mr_id=sc.root)
+    # 9312 kg @ 12850 + 1441 kg @ 12650; claims 140 / 50 per quintal; no TDS on a hand-off
+    assert (root["total_amount"], root["claim_amount"], root["tds_amount"], root["net_total"]) == (
+        1378878.5, 13757.3, 0.0, 1365121.0)
+    assert db.row("jute_mr", jute_mr_id=other)["total_amount"] == 0.0        # left out: untouched
+    assert repair.main(["--only", "missing-rates"]) == 0
+    assert "0 MR(s) get their rates" in capsys.readouterr().out
+
+
+def test_repair_missing_rates_takes_a_given_rate_for_a_line_not_on_the_po(scenario, tmp_path, capsys):
+    """Empire GE 73: the TD-7 line is not on PO 55; the owner gave 12,750."""
+    sc, db = scenario, scenario.db
+    for line_id in sc.root_lines:
+        db.update("jute_mr_li", {"jute_mr_li_id": line_id}, rate=None, actual_rate=None, total_price=0)
+    db.update("jute_mr_li", {"jute_mr_li_id": sc.root_lines[1]}, actual_item_id=999)   # not on the PO
+    db.update("jute_mr", {"jute_mr_id": sc.root}, total_amount=0, net_total=0, claim_amount=0)
+
+    assert repair.main(["--only", "missing-rates"]) == 0
+    assert "1 listed but left out" in capsys.readouterr().out
+    assert repair.main(["--apply", "--only", "missing-rates", "--expect", "1",
+                        f"--rate", f"{sc.root_lines[1]}=12750", "--log-dir", str(tmp_path)]) == 0
+    lines = {l["jute_mr_li_id"]: l for l in db.rows("jute_mr_li", jute_mr_id=sc.root)}
+    assert lines[sc.root_lines[0]]["rate"] == 12850.0           # from the PO line of its item
+    assert lines[sc.root_lines[1]]["rate"] == 12750.0           # the given rate
+    root = db.row("jute_mr", jute_mr_id=sc.root)
+    assert root["total_amount"] == round(9312 * 128.50 + 1441 * 127.50, 2) == 1380319.5
+    with pytest.raises(SystemExit):
+        repair.main(["--only", "missing-rates", "--rate", "46118=0"])

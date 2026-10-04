@@ -1809,6 +1809,21 @@ def save_transfer_step(
                     f"Root MR {root_mr_id} already has a transfer chain "
                     "(saved from another session?); refresh the page"
                 )
+            # A lorry handed over before its rates were entered in the ERP
+            # (rate NULL / 0 on a weighted line) would cascade 0 into the hop
+            # MR, the sale invoice and the transfer POs: refuse until the ERP
+            # has the rates (seen live 2026-10-04: Empire GE 69, 73, 77).
+            unrated = conn.execute(text("""
+                SELECT COUNT(*) FROM jute_mr_li
+                WHERE jute_mr_id = :root AND (active = 1 OR active IS NULL)
+                  AND COALESCE(accepted_weight, actual_weight, 0) > 0
+                  AND COALESCE(rate, 0) <= 0
+            """), {"root": root_mr_id}).scalar()
+            if int(unrated or 0):
+                raise ValueError(
+                    f"MR {root_mr_id} has {int(unrated)} line(s) without a rate; enter the "
+                    "rates on the MR in the ERP before transferring it"
+                )
         else:
             # A later step must continue the chain as it stands NOW: a stale
             # tab or a double save would otherwise add a hop after the

@@ -79,6 +79,19 @@ Repairs:
                   MRs in MR-date order, roundoff, net); nothing else on the
                   row changes. Stops at the first row that fails. Run only
                   after accounts have seen the list.
+  missing-rates   MRs handed over to the transfer app (Pending, 13) before the
+                  rates were entered on them in the ERP: every weighted active
+                  line has rate NULL / 0, so the ERP's money is 0 (Empire GE
+                  69, 73, 77 on 2026-10-04). Owner ruling 2026-10-04: copy the
+                  rate from the MATCHING line of the MR's own PO -- the PO line
+                  with the same item as the MR line's actual item -- into rate
+                  and actual_rate, then rewrite the header by the ERP's rule
+                  (TDS 0: a Pending hand-off). An MR with a line whose item is
+                  not on its PO is listed and left out whole (enter that rate
+                  by hand, or give it: --rate <jute_mr_li_id>=<rate>, which
+                  wins over the PO for that line). Inactive lines are never
+                  touched or counted. --include-open adds Open (1) MRs that
+                  still lack rates.
 """
 
 import argparse
@@ -102,7 +115,7 @@ from src.jutetransfer.transfer import (
 DEFAULT_LOG_DIR = Path(__file__).resolve().parents[2] / ".logs"
 UPDATED_BY = 1  # same demo user id the app writes
 REPAIRS = ("finalized-net", "unfinalized-party", "godowns", "marked-stock", "invoice-links",
-           "hop-tds")
+           "hop-tds", "missing-rates")
 
 # Chain roots, driven from the hop rows: jute_mr.src_jute_mr_id has no index.
 _CHAIN_ROOTS_SQL = """
@@ -630,6 +643,84 @@ def plan_hop_tds(conn) -> list:
     return out
 
 
+# missing-rates scope: Pending (13) hand-offs by default; --include-open adds
+# the Open (1) MRs that have not been rated yet (their rates would normally be
+# typed at MR save in the ERP).
+MISSING_RATES_INCLUDE_OPEN = False
+# --rate <jute_mr_li_id>=<rate>: the owner's rate for a line whose item is not
+# on the MR's PO (or that should not take the PO's); wins for that line.
+MISSING_RATES_MANUAL: dict = {}
+
+
+def plan_missing_rates(conn) -> list:
+    """This financial year's lorries only: older Open MRs without rates are
+    migrated history (2019 data at Empire), not hand-offs waiting for rates."""
+    statuses = "13, 1" if MISSING_RATES_INCLUDE_OPEN else "13"
+    today = _as_date(conn.execute(text("SELECT CURDATE()")).scalar())
+    fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
+    mrs = _rows(conn, f"""
+        SELECT m.jute_mr_id, m.branch_id, b.branch_name, c.co_name, m.jute_gate_entry_no AS ge_no,
+               m.jute_gate_entry_date AS ge_date, m.status_id, m.po_id, m.party_id,
+               m.total_amount, m.claim_amount, m.tds_amount, m.roundoff, m.net_total
+        FROM jute_mr m
+        JOIN branch_mst b ON b.branch_id = m.branch_id
+        LEFT JOIN co_mst c ON c.co_id = b.co_id
+        WHERE m.transfer_mode = 0 AND m.src_jute_mr_id IS NULL AND m.status_id IN ({statuses})
+          AND m.jute_gate_entry_date >= :fy_start
+          AND EXISTS (SELECT 1 FROM jute_mr_li li WHERE li.jute_mr_id = m.jute_mr_id
+                      AND (li.active = 1 OR li.active IS NULL)
+                      AND COALESCE(li.accepted_weight, li.actual_weight, 0) > 0
+                      AND COALESCE(li.rate, 0) <= 0)
+        ORDER BY m.branch_id, m.jute_gate_entry_date, m.jute_mr_id
+    """, fy_start=fy_start.strftime("%Y-%m-%d"))
+    out = []
+    for m in mrs:
+        lines = _rows(conn, """
+            SELECT li.jute_mr_li_id, li.actual_item_id, i.item_name, li.accepted_weight, li.actual_weight,
+                   li.rate, li.actual_rate, li.claim_rate, li.jute_po_li_id
+            FROM jute_mr_li li LEFT JOIN item_mst i ON i.item_id = li.actual_item_id
+            WHERE li.jute_mr_id = :id AND (li.active = 1 OR li.active IS NULL)
+            ORDER BY li.jute_mr_li_id
+        """, id=m["jute_mr_id"])
+        po_lines = _rows(conn, """
+            SELECT jute_po_li_id, item_id, rate FROM jute_po_li
+            WHERE jute_po_id = :po AND (active = 1 OR active IS NULL) AND COALESCE(rate, 0) > 0
+            ORDER BY jute_po_li_id
+        """, po=m["po_id"]) if m["po_id"] else []
+        po_no = _rows(conn, "SELECT po_no FROM jute_po WHERE jute_po_id = :po", po=m["po_id"]) if m["po_id"] else []
+        by_item = {}
+        for pl in po_lines:
+            by_item.setdefault(int(pl["item_id"]), float(pl["rate"]))
+        fixes, problems, total, claim = [], [], 0.0, 0.0
+        for li in lines:
+            kg = float(li["accepted_weight"] if li["accepted_weight"] is not None else li["actual_weight"] or 0)
+            rate = float(li["rate"] or 0)
+            if kg > 0 and rate <= 0:
+                given = MISSING_RATES_MANUAL.get(int(li["jute_mr_li_id"]))
+                rate = given if given else by_item.get(int(li["actual_item_id"] or 0), 0.0)
+                if rate <= 0:
+                    problems.append(f"line {li['jute_mr_li_id']} ({li['item_name'] or li['actual_item_id']}, "
+                                    f"{kg:g} kg): its item is not on PO {po_no[0]['po_no'] if po_no else '?'}")
+                    continue
+                fixes.append({"jute_mr_li_id": li["jute_mr_li_id"], "item": li["item_name"],
+                              "kg": kg, "old_rate": li["rate"], "new_rate": rate,
+                              "source": "given" if given else f"PO {po_no[0]['po_no'] if po_no else '?'}"})
+            total += kg / 100 * rate
+            claim += kg / 100 * float(li["claim_rate"] or 0)
+        total, claim = round(total, 2), round(claim, 2)
+        roundoff, net = _erp_jute_totals(total, claim, 0.0)
+        out.append({
+            "jute_mr_id": m["jute_mr_id"], "ge_no": m["ge_no"], "ge_date": m["ge_date"],
+            "branch_id": m["branch_id"], "co_name": m["co_name"], "status_id": m["status_id"],
+            "po_no": po_no[0]["po_no"] if po_no else None, "lines": fixes, "problems": problems,
+            "old": {k: m[k] for k in _MONEY},
+            "new": {"total_amount": total, "claim_amount": claim, "tds_amount": 0.0,
+                    "roundoff": roundoff, "net_total": net},
+        })
+    # an MR with an unmatched line is reported but never written (all or nothing per MR)
+    return out
+
+
 PLANNERS = {
     "finalized-net": plan_finalized_net,
     "unfinalized-party": plan_unfinalized_party,
@@ -637,6 +728,7 @@ PLANNERS = {
     "marked-stock": plan_marked_stock,
     "invoice-links": plan_invoice_links,
     "hop-tds": plan_hop_tds,
+    "missing-rates": plan_missing_rates,
 }
 
 
@@ -746,10 +838,30 @@ def report(plans: dict, applying: bool = False) -> None:
                   f" | bought before {r['approved_before']:,.2f}"
                   f" | TDS {o['tds_amount']} -> {n['tds_amount']:,.2f}"
                   f" | net {o['net_total']} -> {n['net_total']:,.2f}")
+    if "missing-rates" in plans:
+        p = plans["missing-rates"]
+        ready = [r for r in p if not r["problems"]]
+        print(f"\n[missing-rates] {len(ready)} MR(s) get their rates from the matching line of their PO"
+              f" (same item) and the ERP's money; {len(p) - len(ready)} listed but left out")
+        for r in p:
+            state = {13: "Pending", 1: "Open"}.get(int(r["status_id"] or 0), str(r["status_id"]))
+            mark = "" if not r["problems"] else "   LEFT OUT"
+            print(f"  MR {r['jute_mr_id']} (GE {r['ge_no']} of {_as_date(r['ge_date']):%d-%m-%Y}, {r['co_name']}, "
+                  f"{state}, PO {r['po_no']}):{mark}")
+            for l in r["lines"]:
+                print(f"      line {l['jute_mr_li_id']} {l['item']}: {l['kg']:g} kg, rate {l['old_rate']} -> "
+                      f"{l['new_rate']:,.0f} ({l.get('source', 'PO')})")
+            for why in r["problems"]:
+                print(f"      {why} -> enter the rate by hand")
+            if not r["problems"]:
+                o, n = r["old"], r["new"]
+                print(f"      header: total {o['total_amount']} -> {n['total_amount']:,.2f} | claim {o['claim_amount']} -> "
+                      f"{n['claim_amount']:,.2f} | net {o['net_total']} -> {n['net_total']:,.2f} (TDS 0: hand-off)")
     if not applying:
         print("\nNothing was written. After the owner's OK, one repair at a time:")
         for name, items in plans.items():
-            print(f"    --apply --only {name} --expect {len(items)}")
+            n = len([i for i in items if not i.get("problems")]) if name == "missing-rates" else len(items)
+            print(f"    --apply --only {name} --expect {n}")
         print("Each run prints its rows and saves old and new values in "
               ".logs/jt_repair_<time>.json before it writes.")
 
@@ -789,6 +901,26 @@ def _repair_hop_tds(conn, it) -> None:
     if any(abs(float(got[k]) - float(it["new"][k])) > 0.005 for k in got):
         raise RuntimeError(f"money changed since the dry run: {got}")
     # updated_by / updated_date_time stay (when the hop was written).
+
+
+def _repair_missing_rates(conn, it) -> None:
+    if it["problems"]:
+        raise RuntimeError("an item is not on the PO; enter that rate by hand")
+    cur = conn.execute(text(
+        "SELECT status_id, src_jute_mr_id FROM jute_mr WHERE jute_mr_id = :id FOR UPDATE"
+    ), {"id": it["jute_mr_id"]}).fetchone()
+    if not cur or int(cur[0] or 0) not in (13, 1) or cur[1] is not None:
+        raise RuntimeError("no longer a Pending / Open MR without a chain")
+    for l in it["lines"]:
+        res = conn.execute(text("""
+            UPDATE jute_mr_li SET rate = :rate, actual_rate = COALESCE(actual_rate, :rate)
+            WHERE jute_mr_li_id = :id AND COALESCE(rate, 0) <= 0
+        """), {"rate": l["new_rate"], "id": l["jute_mr_li_id"]})
+        if res.rowcount != 1:
+            raise RuntimeError(f"line {l['jute_mr_li_id']} has a rate now (changed since the dry run)")
+    got = _erp_recompute_money(conn, it["jute_mr_id"], tds_amount=0.0)
+    if any(abs(float(got[k]) - float(it["new"][k])) > 0.005 for k in got):
+        raise RuntimeError(f"money changed since the dry run: {got}")
 
 
 def _repair_unfinalized_party(conn, it) -> None:
@@ -884,6 +1016,7 @@ REPAIR_FNS = {
     "marked-stock": _repair_marked_stock,
     "invoice-links": _repair_invoice_links,
     "hop-tds": _repair_hop_tds,
+    "missing-rates": _repair_missing_rates,
 }
 
 
@@ -895,6 +1028,8 @@ def apply(plans: dict, log_path: Path) -> int:
     log = {"planned": plans, "repaired": [], "failed": [], "not_attempted": []}
     _write_json(log_path, log)
     for name, items in plans.items():
+        if name == "missing-rates":
+            items = [it for it in items if not it.get("problems")]
         for position, it in enumerate(items):
             key = it.get("jute_mr_id") or it.get("warehouse_id") or it.get("invoice_id")
             try:
@@ -928,13 +1063,27 @@ def main(argv=None) -> int:
                     help="with --apply: the row count the dry-run showed for these repairs")
     ap.add_argument("--open-chains", action="store_true",
                     help="invoice-links: also the forward invoices of chains still awaiting return")
+    ap.add_argument("--include-open", action="store_true",
+                    help="missing-rates: also Open (1) MRs that have no rates yet")
+    ap.add_argument("--rate", action="append", default=[], metavar="LINE_ID=RATE",
+                    help="missing-rates: the rate for one MR line (repeatable), e.g. --rate 46118=12750")
     ap.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     args = ap.parse_args(argv)
     if args.apply and (not args.only or args.expect is None):
         ap.error("--apply needs --only <repair> and --expect N (the count the dry-run showed)")
     chosen = args.only or list(REPAIRS)
-    global INVOICE_LINKS_OPEN_CHAINS
+    global INVOICE_LINKS_OPEN_CHAINS, MISSING_RATES_INCLUDE_OPEN, MISSING_RATES_MANUAL
     INVOICE_LINKS_OPEN_CHAINS = bool(args.open_chains)
+    MISSING_RATES_INCLUDE_OPEN = bool(args.include_open)
+    MISSING_RATES_MANUAL = {}
+    for item in args.rate:
+        try:
+            line_id, rate = item.split("=", 1)
+            MISSING_RATES_MANUAL[int(line_id)] = float(rate)
+            if float(rate) <= 0:
+                raise ValueError
+        except ValueError:
+            ap.error(f"--rate needs LINE_ID=RATE with a positive rate, got {item!r}")
 
     with DatabaseConnection.get_engine().connect() as conn:
         # Read-only planning: a READ ONLY transaction, not SET SESSION (that
@@ -948,7 +1097,8 @@ def main(argv=None) -> int:
     if not args.apply:
         report(plans)
         return 0
-    found = sum(len(v) for v in plans.values())
+    found = sum(len([i for i in v if not i.get("problems")]) if name == "missing-rates" else len(v)
+                for name, v in plans.items())
     if found != args.expect:
         print(f"REFUSED: --expect {args.expect} but {found} row(s) would be repaired now; "
               "re-run the dry run and check")
