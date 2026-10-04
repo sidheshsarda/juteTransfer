@@ -56,9 +56,10 @@ DEFAULT_CHANNEL = "DOMESTIC"
 
 _ACTIVE_LINES = "(active = 1 OR active IS NULL)"
 
-# Default while the feature is being built and reviewed on the live preview
-# checkout: OFF. Flipped to "1" once verified.
-_ENABLED_DEFAULT = "0"
+# Default ON since 2026-10-04: the pilot was verified and the existing chains
+# are backfilled by scripts/backfill_transfer_pos.py. JT_TRANSFER_PO=0 in the
+# environment switches PO creation off again (deletes still remove POs).
+_ENABLED_DEFAULT = "1"
 
 
 _ON_VALUES = {"1", "true", "yes", "on"}
