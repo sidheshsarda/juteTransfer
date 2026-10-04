@@ -55,6 +55,43 @@ def _cascade_rate(original_rate: float, steps: list, up_to_index: int) -> float:
     return float(rate_quintal)
 
 
+def step_multiplier(pct_rate_increase, rate_multiplier=None) -> Decimal:
+    """Exact Decimal multiplier of one step: 1 + pct/100, built from the %
+    the user typed -- the same expression _cascade_rate uses for the screen.
+
+    A caller that only has the float multiplier (1.0 + pct / 100.0) passes it
+    as rate_multiplier: it is used when no pct is given or when the two
+    disagree (the pct then does not describe this multiplier)."""
+    pct = None
+    try:
+        if pct_rate_increase is not None and pct_rate_increase == pct_rate_increase:
+            pct = Decimal(str(float(pct_rate_increase)))
+    except (TypeError, ValueError):
+        pct = None
+    from_pct = None if pct is None else 1 + pct / 100
+    if rate_multiplier is None:
+        return from_pct if from_pct is not None else Decimal(1)
+    given = Decimal(str(rate_multiplier))
+    if from_pct is not None and abs(from_pct - given) < Decimal("0.000000001"):
+        return from_pct
+    return given
+
+
+def hop_rate(rate_per_quintal, multiplier) -> tuple:
+    """(quintal rate, kg rate) after one hop's mark-up, as floats.
+
+    The multiplication is done in Decimal and the KG rate is rounded to 2
+    decimals half-up -- exactly what _cascade_rate does for the screen, so
+    the rate posted on MR / invoice lines is the rate the user saw. In float,
+    13100 x 1.005 is 13165.499999999998, which lands on 131.65 per kg
+    instead of 131.66 and left the invoice lines short of the invoice total."""
+    if rate_per_quintal is None or rate_per_quintal != rate_per_quintal:
+        return 0.0, 0.0
+    quintal = Decimal(str(rate_per_quintal)) * Decimal(str(multiplier))
+    rate_kg = (quintal / 100).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    return float(rate_kg * 100), float(rate_kg)
+
+
 def _calculate_line_item_amount(weight: float, rate_per_quintal: float) -> float:
     """Amount = weight * rate / 100, rounded to 2 decimals (ROUND_HALF_UP).
 
@@ -294,6 +331,16 @@ def _calculate_step_total_amount(step_index: int, line_items: list, step_dict: d
         return total
 
 
+def _stored_amount(value):
+    """A money figure read from the database as a float, or None when the
+    row had none (None / NaN / not a number)."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if amount != amount else amount
+
+
 def _recalculate_chain(steps: list, line_items: list, original_total_amount: float = 0.0,
                        use_new_rounding: bool = False) -> list:
     """Recalculate all derived values in a transfer chain.
@@ -340,12 +387,21 @@ def _recalculate_chain(steps: list, line_items: list, original_total_amount: flo
             continue
 
         if step.get("saved_mr_id"):
-            # Saved step: use DB-stored total as the authoritative value
+            # Saved step: the DB-stored money is authoritative. The claim and
+            # the net are kept as stored too -- the ERP's net of a finalized
+            # root carries 194Q TDS and the roundoff (what the P&L sums), so
+            # recomputing it as total - claim showed a Net the ERP does not
+            # have. Only a step without a stored figure gets the computed one.
             stored_total = float(step.get("total_amount") or 0)
             step["total_amount"] = round(stored_total, 0)
             step["roundoff"] = 0.0
-            step["claim_amount"] = total_claim
-            step["net_amount"] = round(step["total_amount"] - total_claim, 0)
+            stored_claim = _stored_amount(step.get("claim_amount"))
+            stored_net = _stored_amount(step.get("net_amount"))
+            step["claim_amount"] = total_claim if stored_claim is None else stored_claim
+            step["net_amount"] = (
+                round(step["total_amount"] - step["claim_amount"], 0)
+                if stored_net is None else stored_net
+            )
             step["weighted_avg_rate"] = (
                 step["total_amount"] / total_weight * 100
             ) if total_weight > 0 else 0.0

@@ -1,0 +1,3249 @@
+{
+ "_meta": {
+  "source": "information_schema.COLUMNS of the sls tenant",
+  "captured": "2026-10-01",
+  "note": "Structure only (no data). Used by tests to check every INSERT/UPDATE the app issues against the real column lists."
+ },
+ "tables": {
+  "branch_mst": [
+   {
+    "column": "branch_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "branch_name",
+    "type": "varchar(255)",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "co_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "branch_address1",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_address2",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_zipcode",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "country_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "city_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "state_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "gst_no",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "contact_no",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "contact_person",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_email",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "active",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "gst_verified",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_prefix",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "co_mst": [
+   {
+    "column": "co_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "co_name",
+    "type": "varchar(255)",
+    "nullable": false,
+    "default": null,
+    "key": "UNI",
+    "extra": ""
+   },
+   {
+    "column": "co_prefix",
+    "type": "varchar(25)",
+    "nullable": false,
+    "default": null,
+    "key": "UNI",
+    "extra": ""
+   },
+   {
+    "column": "co_address1",
+    "type": "varchar(255)",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "co_address2",
+    "type": "varchar(255)",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "co_zipcode",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "country_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "state_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "city_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "co_logo",
+    "type": "longtext",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "auto_datetime_insert",
+    "type": "datetime",
+    "nullable": true,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "created_by_con_user",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "co_cin_no",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "co_email_id",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "co_pan_no",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "s3bucket_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "s3folder_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "tally_sync",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "alert_email_id",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   }
+  ],
+  "item_grp_mst": [
+   {
+    "column": "item_grp_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "parent_grp_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "active",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "co_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "item_grp_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "item_grp_code",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "purchase_code",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "item_type_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   }
+  ],
+  "item_mst": [
+   {
+    "column": "item_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "active",
+    "type": "int",
+    "nullable": false,
+    "default": "1",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "item_grp_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "item_code",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "tangible",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "item_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "item_photo",
+    "type": "mediumtext",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "legacy_item_code",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "hsn_code",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "uom_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "tax_percentage",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "saleable",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "consumable",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "purchaseable",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "manufacturable",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "assembly",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "uom_rounding",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "rate_rounding",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_issue": [
+   {
+    "column": "jute_issue_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "unit_conversion",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "issue_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "status_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "issue_value",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_quality_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_mr_li_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "waste_entry_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "quantity",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "weight",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "update_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "yarn_type_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "item_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_lorry_mst": [
+   {
+    "column": "jute_lorry_type_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "co_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "lorry_type",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "weight",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_lot_src": [
+   {
+    "column": "lot_src_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "new_jute_mr_li_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "src_jute_mr_li_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "qty_kg",
+    "type": "decimal(12,3)",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "actual_qty_delta",
+    "type": "decimal(12,3)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "actual_weight_delta",
+    "type": "decimal(12,3)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "created_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "created_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_mr": [
+   {
+    "column": "jute_mr_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "jute_gate_entry_no",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_mr_no",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_gate_entry_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_mr_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_no",
+    "type": "varchar(50)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_weight",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "gross_weight",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "tare_weight",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "net_weight",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "variable_shortage",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "actual_weight",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "in_time",
+    "type": "time",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "out_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "out_time",
+    "type": "time",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "qc_check",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "mukam_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "unit_conversion",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "mr_weight",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "remarks",
+    "type": "varchar(500)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "status_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "vehicle_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "marketing_slip",
+    "type": "tinyint(1)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transporter",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "driver_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "frieght_paid",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "po_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "branch_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "party_id",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "party_branch_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_supplier_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "src_com_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "bill_pass_no",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "bill_pass_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "total_amount",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_amount",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "roundoff",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "net_total",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "tds_amount",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_amount",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "payment_due_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_received_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_upload",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_upload",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "bill_pass_complete",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "approval_level",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "src_jute_mr_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transfer_mode",
+    "type": "tinyint",
+    "nullable": false,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_mr_li": [
+   {
+    "column": "jute_mr_li_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "jute_po_li_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_mr_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "actual_item_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "actual_quality",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "actual_qty",
+    "type": "float",
+    "nullable": true,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "actual_weight",
+    "type": "float",
+    "nullable": true,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_item_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_quality_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_quantity",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_weight",
+    "type": "float",
+    "nullable": true,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "allowable_moisture",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "actual_moisture",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "mill_moisture",
+    "type": "decimal(6,2)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_dust",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "shortage_kgs",
+    "type": "int",
+    "nullable": true,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "accepted_weight",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "rate",
+    "type": "float",
+    "nullable": true,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_rate",
+    "type": "float",
+    "nullable": false,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "water_damage_amount",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "default": "0.00",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "premium_amount",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "default": "0.00",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "total_price",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_quality",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "warehouse_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "remarks",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "status",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "marka",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "crop_year",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "active",
+    "type": "int",
+    "nullable": true,
+    "default": "1",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "unit_conversion",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "actual_rate",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_mukam_mst": [
+   {
+    "column": "mukam_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "mukam_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_po": [
+   {
+    "column": "jute_po_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "supplier_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "credit_term",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "delivery_days",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "footer_note",
+    "type": "longtext",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "frieght_charge",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_mukam_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "po_no",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "po_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "remarks",
+    "type": "varchar(4000)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "status_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_po_value",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "vehicle_quantity",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "vehicle_type_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "weight",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "channel_code",
+    "type": "varchar(50)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "contract_no",
+    "type": "varchar(50)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "contract_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "brokrage_rate",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "brokrage_percentage",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "penalty",
+    "type": "varchar(50)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "internal_note",
+    "type": "varchar(500)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_indent_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_uom",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "party_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "approval_level",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "closed_date",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "closed_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "close_type",
+    "type": "varchar(10)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "close_remark",
+    "type": "varchar(500)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_po_li": [
+   {
+    "column": "jute_po_li_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "jute_po_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "item_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_quality_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "quantity",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "rate",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "value",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "marka",
+    "type": "varchar(50)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "crop_year",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "allowable_moisture",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "active",
+    "type": "int",
+    "nullable": true,
+    "default": "1",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "status_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "jute_uom",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "percentage",
+    "type": "decimal(6,2)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_po_settle_rule": [
+   {
+    "column": "co_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": ""
+   },
+   {
+    "column": "lorry_rule_enabled",
+    "type": "tinyint",
+    "nullable": false,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "tolerance_lorry_fraction",
+    "type": "decimal(4,2)",
+    "nullable": false,
+    "default": "0.50",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "stale_days",
+    "type": "int",
+    "nullable": false,
+    "default": "30",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
+   }
+  ],
+  "jute_po_status_log": [
+   {
+    "column": "log_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "jute_po_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "old_status_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "new_status_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "close_type",
+    "type": "varchar(10)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "source",
+    "type": "varchar(10)",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "trigger_ref",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "remark",
+    "type": "varchar(500)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "user_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "created_at",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   }
+  ],
+  "jute_supp_party_map": [
+   {
+    "column": "map_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "co_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_supplier_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "party_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jute_supplier_mst": [
+   {
+    "column": "supplier_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "supplier_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "email",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "contact_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "party_branch_mst": [
+   {
+    "column": "party_mst_branch_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "party_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "active",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "created_date",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "created_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "gst_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "address",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "address_additional",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "zip_code",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "city_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "state_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "contact_no",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "contact_person",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   }
+  ],
+  "party_mst": [
+   {
+    "column": "party_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "active",
+    "type": "int",
+    "nullable": false,
+    "default": "1",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "prefix",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": false,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "phone_no",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "cin",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "co_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "supp_contact_person",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "supp_contact_designation",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "supp_email_id",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "supp_code",
+    "type": "varchar(25)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "party_pan_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "entity_type_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "supp_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "msme_certified",
+    "type": "varchar(30)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "country_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "party_type_id",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "sales_invoice": [
+   {
+    "column": "invoice_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "invoice_no",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "challan_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "party_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "sales_delivery_order_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "broker_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "billing_to_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "shipping_to_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "due_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "footer_notes",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "internal_note",
+    "type": "varchar(500)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "freight_charges",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "intra_inter_state",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_amount",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_type",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "active",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "status_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "shipping_state_code",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "approval_level",
+    "type": "int",
+    "nullable": true,
+    "default": "0",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "tax_amount",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "tax_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "terms",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "terms_conditions",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "type_of_sale",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": "CURRENT_TIMESTAMP",
+    "key": "",
+    "extra": "DEFAULT_GENERATED"
+   },
+   {
+    "column": "vehicle_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transporter_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transporter_name",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transporter_address",
+    "type": "varchar(500)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transporter_state_code",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transporter_state_name",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transporter_branch_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "transporter_doc_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "transporter_doc_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "buyer_order_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "buyer_order_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "irn",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "ack_no",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "ack_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "qr_code",
+    "type": "longtext",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "container_no",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "contract_no",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "contract_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "consignment_no",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "consignment_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "eway_bill_no",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "eway_bill_date",
+    "type": "date",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "round_off",
+    "type": "decimal(10,2)",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "tax_payable",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "payment_terms",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "sales_order_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "billing_state_code",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "bank_detail_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   }
+  ],
+  "sales_invoice_dtl": [
+   {
+    "column": "invoice_line_item_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "amount_without_tax",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "hsn_code",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "invoice_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "item_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "item_make_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "quantity",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "rate",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "total_amount",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "uom_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "sales_weight",
+    "type": "float",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "discount_type",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "discounted_rate",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "discount_amount",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "remarks",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "delivery_order_dtl_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "sales_order_dtl_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "jute_mr_li_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   }
+  ],
+  "sales_invoice_jute": [
+   {
+    "column": "sales_invoice_jute_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "invoice_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "mr_no",
+    "type": "varchar(50)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "mr_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_amount",
+    "type": "decimal(12,2)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "other_reference",
+    "type": "varchar(100)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "unit_conversion",
+    "type": "varchar(50)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_description",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "mukam_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "sales_invoice_jute_dtl": [
+   {
+    "column": "sales_invoice_jute_dtl_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "invoice_line_item_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_amount_dtl",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_desc",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "claim_rate",
+    "type": "double",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "unit_conversion",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "qty_untit_conversion",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "status_mst": [
+   {
+    "column": "status_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "status_name",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "created_date",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "created_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "status_grp",
+    "type": "varchar(255)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "warehouse_mst": [
+   {
+    "column": "warehouse_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "warehouse_name",
+    "type": "varchar(30)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "warehouse_type",
+    "type": "varchar(20)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "branch_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "parent_warehouse_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ]
+ }
+}
