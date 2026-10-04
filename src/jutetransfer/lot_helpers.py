@@ -37,6 +37,17 @@ def net_rate(line) -> float:
     return float(line["rate"] or 0) - float(line["claim_rate"] or 0)
 
 
+def advised_share(challan_weight, challan_qty, moved, accepted):
+    """Advised (challan) weight/bales that travel with `moved` kg of a line
+    holding `accepted` kg: the moved fraction of each, weight whole kg,
+    bales 3dp (like actual_qty). challan_qty None stays None; a zero
+    `accepted` (degenerate) carries the full advised figures."""
+    frac = float(moved) / float(accepted) if accepted else 1.0
+    adv_w = float(round_kg(float(challan_weight or 0) * frac))
+    adv_q = None if challan_qty is None else round(float(challan_qty) * frac, 3)
+    return adv_w, adv_q
+
+
 def validate_takes(takes, available):
     """Validate (jute_mr_li_id, qty_kg) takes against available kg per line.
 
@@ -127,6 +138,18 @@ def reduce_amounts(accepted, actual_w, actual_q, qty, available):
     new_actual_w = float(round_kg(max(0.0, actual_w - aw_delta)))
     new_actual_q = round(max(0.0, actual_q - aq_delta), 3)
     return new_accepted, new_actual_w, new_actual_q, aq_delta, aw_delta
+
+
+def sold_share(actual_q, actual_w, sold_kg):
+    """Bales (3dp) that go with `sold_kg` of a line holding `actual_q` bales
+    in `actual_w` kg -- the ERP stock view's own rule for a sale booked
+    against the line (sold_qty = actual_qty * sold_weight / actual_weight),
+    so the seller's bal_qty and the buyer's child line add up to the source's
+    bales. 0 when the line has no weight."""
+    actual_q, actual_w, sold_kg = float(actual_q or 0), float(actual_w or 0), float(sold_kg or 0)
+    if actual_w <= 0:
+        return 0.0
+    return round(actual_q * sold_kg / actual_w, 3)
 
 
 def restore_amounts(accepted, actual_w, actual_q, qty, aq_delta, aw_delta):
