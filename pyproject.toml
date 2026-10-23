@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pandas>=2.3.3",
-    "streamlit>=1.53.0",
+    "streamlit>=1.65.0",  # persist_state= on widgets; page tests fail on 1.59
     "streamlit-aggrid>=1.2.1.post2",
     "mysql-connector-python>=9.0.0",
     "sqlalchemy>=2.0.0",

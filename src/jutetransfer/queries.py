@@ -762,123 +762,102 @@ def get_company_wise_sales_by_month(fy_start, fy_end) -> pd.DataFrame:
     )
 
 
-def get_company_wise_unsold_stock(fy_start, fy_end) -> pd.DataFrame:
-    """Return per-company unsold-MR stock value (valued at purchase net_total).
+def get_company_wise_stock_as_of(as_of, transfer_mode=None) -> pd.DataFrame:
+    """Per-company raw-jute stock value held AS OF a date -- the closing stock
+    of that day -- from the ERP's per-line ledger evaluated with a date cutoff:
 
-    An MR is considered 'stock' iff ALL of:
-      - Dated within the FY (jute_mr_date in [fy_start, fy_end])
-      - status_id = 3 (active intermediate transfer MR; excludes pending
-        gate entries at status 0 and finalized roots at status 1)
-      - Its chain root (src_jute_mr_id -> jute_mr) is NOT in a closed
-        state (root.status_id NOT IN (1, 13)). Decision D3 (2026-09-03):
-        this app writes 13 (Pending) on the root for both an in-progress
-        chain and any rollback (partial or full) — never 0, never 1;
-        finalize (chain returns to origin) writes 3 (Approved) instead.
-        Status 1 here is retained only for legacy roots that predate the
-        D3 fix. Both values mean the chain is not a finalized/closed loop,
-        so any return MR sitting at the source company should not be counted.
-      - Not referenced by an active raw-jute sales_invoice_jute row
-        (i.e., the seller has not yet invoiced this MR forward).
+        balance(line, as_of) = actual_weight
+                               - issued (jute_issue, status <> 4, issue_date <= as_of)
+                               - sold   (approved raw-jute invoice lines that name
+                                         the MR line, invoice_date <= as_of)
 
-    Valuation: the MR's net_total -- except for an MR some of whose lines were
-    sold through a marked move (a mode-1 child names it as src_jute_mr_id).
-    Since 2026-10-03 a move no longer drains the source line: the stock-out is
-    the seller invoice line that names the source MR line, which the ERP
-    stock view nets off that line's balance (and the invoice itself is linked
-    to the CHILD MR, so the sales_invoice_jute test above does not see it).
-    Such an MR is valued like the marked-stock arm (get_company_wise_marked_
-    stock): remaining balance per active line, LEAST(view balance, accepted)
-    and never below 0, at the post-claim rate (rate - claim_rate) -- so what
-    was moved counts once, as marked stock at the holder, not twice.
+    which is vw_jute_stock_outstanding as it stood on `as_of`. Value = the
+    balance, never below 0 and capped at accepted_weight (legacy lines have
+    none -- then the receipt weight, i.e. no cap), x (rate - claim_rate) / 100
+    -- the post-claim rate, as the old marked-stock arm priced it.
 
+    Eligible MRs: jute_mr_date <= as_of (ANY financial year, so a lorry bought
+    last year and still held counts) at any status the ERP's stock view keeps
+    (not 4 Rejected / 6 Cancelled / 21 Draft / 48 Returned) -- the same net as
+    the Purchases arm, which has no status filter, so a Pending lorry or a
+    legacy status-1/17/24 MR is a purchase AND stock, never a bare cost. (The
+    old unsold-stock arm wanted status 3.) The chain rules of
+    the old unsold-stock arm are kept for mode-0 MRs: a hop whose root is at
+    1 / 13 is not stock, nor is an MR sold whole by a HEADER-ONLY invoice
+    dated <= as_of (sales_invoice_jute.mr_id names the MR and no line of the
+    invoice names an MR line: chain hop invoices, legacy migrated sales). An
+    invoice whose lines DO name MR lines is netted per line by `sold` instead
+    -- an ERP sale of 9 lines out of 10 leaves the 10th in stock.
+    Neither rule applies to a marked child (mode 1): its sales_invoice_jute
+    row is the invoice that CREATED it and its src_jute_mr_id is its parent.
+
+    transfer_mode: None = every MR, 0 = purchase / chain MRs, 1 = marked
+    children. Opening stock of a FY = this on the day before fy_start;
+    closing = on fy_end, or today inside the running FY.
     Columns: co_id, co_name, stock_value (float).
     """
-    common = """
-        FROM jute_mr mr
-        JOIN branch_mst bm ON mr.branch_id = bm.branch_id
-        JOIN co_mst    cm ON bm.co_id = cm.co_id
-        {mk_join} (
-            SELECT DISTINCT c.src_jute_mr_id AS src_id
-            FROM jute_mr c
-            WHERE c.transfer_mode = 1 AND c.src_jute_mr_id IS NOT NULL
-        ) mk ON mk.src_id = mr.jute_mr_id
-        {line_joins}
-        WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
-          AND mr.status_id = 3
-          AND mr.transfer_mode = 0
-          AND NOT EXISTS (
-              SELECT 1
-              FROM jute_mr root
-              WHERE root.jute_mr_id = mr.src_jute_mr_id
-                AND root.status_id IN (1, 13)
-          )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM sales_invoice_jute sij
-              JOIN sales_invoice si ON si.invoice_id = sij.invoice_id
-              WHERE sij.mr_id = mr.jute_mr_id
-                AND si.active = 1
-                AND si.invoice_type = 5
-          )
-    """
-    untouched = common.format(mk_join="LEFT JOIN", line_joins="") + " AND mk.src_id IS NULL"
-    moved_from = common.format(
-        mk_join="JOIN",
-        line_joins=f"""
-        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id AND {STOCK_LINE_SQL}
-        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
-        """,
-    )
     return DatabaseConnection.execute_query(
         f"""
-        SELECT s.co_id, s.co_name, COALESCE(SUM(s.stock_value), 0) AS stock_value
-        FROM (
-            SELECT cm.co_id AS co_id, cm.co_name AS co_name,
-                   COALESCE(mr.net_total, 0) AS stock_value
-            {untouched}
-            UNION ALL
-            SELECT cm.co_id AS co_id, cm.co_name AS co_name,
-                   LEAST(GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0),
-                         COALESCE(li.accepted_weight, 0))
-                   * (COALESCE(li.rate, 0) - COALESCE(li.claim_rate, 0)) / 100 AS stock_value
-            {moved_from}
-        ) s
-        GROUP BY s.co_id, s.co_name
-        """,
-        {
-            "fy_start": fy_start.strftime("%Y-%m-%d"),
-            "fy_end": fy_end.strftime("%Y-%m-%d"),
-        },
-    )
-
-
-def get_company_wise_marked_stock(fy_start, fy_end) -> pd.DataFrame:
-    """Return per-company warehouse-marked stock value, revalued from the
-    remaining balance (ERP stock view bal_weight, falling back to
-    accepted_weight) x rate — not the original net_total. Consumed stock
-    (balance <= 0) drops out naturally since GREATEST(...,0) zeroes its
-    contribution. Columns: co_id, co_name, stock_value (float)."""
-    return DatabaseConnection.execute_query(
-        """
         SELECT
             cm.co_id   AS co_id,
             cm.co_name AS co_name,
             COALESCE(SUM(
-                GREATEST(COALESCE(v.bal_weight, li.accepted_weight), 0)
-                * COALESCE(li.rate, 0) / 100
+                LEAST(GREATEST(COALESCE(li.actual_weight, li.accepted_weight, 0)
+                               - COALESCE(iss.wt, 0) - COALESCE(sold.wt, 0), 0),
+                      COALESCE(li.accepted_weight, li.actual_weight, 0))
+                * (COALESCE(li.rate, 0) - COALESCE(li.claim_rate, 0)) / 100
             ), 0) AS stock_value
         FROM jute_mr mr
         JOIN branch_mst bm ON mr.branch_id = bm.branch_id
         JOIN co_mst    cm ON bm.co_id = cm.co_id
-        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id
-        LEFT JOIN vw_jute_stock_outstanding v ON v.jute_mr_li_id = li.jute_mr_li_id
-        WHERE mr.jute_mr_date BETWEEN :fy_start AND :fy_end
-          AND mr.status_id = 3
-          AND mr.transfer_mode = 1
+        JOIN jute_mr_li li ON li.jute_mr_id = mr.jute_mr_id AND {STOCK_LINE_SQL}
+        LEFT JOIN (
+            SELECT ji.jute_mr_li_id AS jute_mr_li_id, SUM(ji.weight) AS wt
+            FROM jute_issue ji
+            WHERE ji.status_id <> 4 AND ji.issue_date <= :as_of
+            GROUP BY ji.jute_mr_li_id
+        ) iss ON iss.jute_mr_li_id = li.jute_mr_li_id
+        LEFT JOIN (
+            SELECT sid.jute_mr_li_id AS jute_mr_li_id,
+                   SUM(COALESCE(NULLIF(sid.sales_weight, 0), sid.quantity, 0)) AS wt
+            FROM sales_invoice_dtl sid
+            JOIN sales_invoice s ON s.invoice_id = sid.invoice_id
+            WHERE sid.jute_mr_li_id IS NOT NULL
+              AND s.invoice_type = 5
+              AND s.status_id = 3
+              AND COALESCE(s.active, 1) = 1
+              AND s.invoice_date <= :as_of
+            GROUP BY sid.jute_mr_li_id
+        ) sold ON sold.jute_mr_li_id = li.jute_mr_li_id
+        LEFT JOIN (
+            SELECT DISTINCT sij.mr_id AS mr_id
+            FROM sales_invoice_jute sij
+            JOIN sales_invoice si ON si.invoice_id = sij.invoice_id
+            WHERE si.active = 1
+              AND si.invoice_type = 5
+              AND si.invoice_date <= :as_of
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM sales_invoice_dtl sid
+                  WHERE sid.invoice_id = si.invoice_id
+                    AND sid.jute_mr_li_id IS NOT NULL
+              )
+        ) sold_whole ON sold_whole.mr_id = mr.jute_mr_id
+        WHERE mr.jute_mr_date <= :as_of
+          AND mr.status_id NOT IN (4, 6, 21, 48)
+          AND (:transfer_mode IS NULL OR mr.transfer_mode = :transfer_mode)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM jute_mr root
+              WHERE root.jute_mr_id = mr.src_jute_mr_id
+                AND mr.transfer_mode = 0
+                AND root.status_id IN (1, 13)
+          )
+          AND NOT (COALESCE(mr.transfer_mode, 0) = 0 AND sold_whole.mr_id IS NOT NULL)
         GROUP BY cm.co_id, cm.co_name
         """,
         {
-            "fy_start": fy_start.strftime("%Y-%m-%d"),
-            "fy_end": fy_end.strftime("%Y-%m-%d"),
+            "as_of": as_of.strftime("%Y-%m-%d"),
+            "transfer_mode": transfer_mode,
         },
     )

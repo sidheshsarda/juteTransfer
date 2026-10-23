@@ -60,7 +60,8 @@ class Chain:
         self.root = root or sc.root
         self.steps = []                 # saved steps: {"to", "pct", "mr_id", "final"}
 
-    def save(self, to: str, pct: float = 0.0, mr_date: date = date(2026, 9, 1)) -> dict:
+    def save(self, to: str, pct: float = 0.0, mr_date: date = date(2026, 9, 1),
+             **step_kw) -> dict:
         sc = self.sc
         index = len(self.steps)
         co_id, branch_id = sc.co(to), sc.branch(to)
@@ -80,7 +81,7 @@ class Chain:
             pct_rate_increase=pct, total_amount=shown["total_amount"],
             claim_amount=shown["claim_amount"], net_amount=shown["net_amount"],
             warehouse_id=sc.godown(to), mr_no=0, lc_reference_no="", lc_date=None,
-            po_no_for_lc="", order_date_for_lc=None, transfer_transport=True)
+            po_no_for_lc="", order_date_for_lc=None, transfer_transport=True, **step_kw)
         is_final = co_id == sc.a_co and branch_id == sc.a_branch
         source = self.steps[-1]["mr_id"] if self.steps and self.steps[-1]["mr_id"] else self.root
         result = transfer.save_transfer_step(

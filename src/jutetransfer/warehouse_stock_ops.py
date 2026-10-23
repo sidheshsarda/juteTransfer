@@ -57,6 +57,7 @@ from .transfer import (
     _get_next_gate_entry_no,
     _get_next_invoice_no,
     _get_next_mr_number_in_txn,
+    _invoice_party_branch,
     _get_next_bill_pass_no_in_txn,
     _get_seller_prefixes,
     _invoice_ids_for_mr,
@@ -227,7 +228,7 @@ _LI_INSERT_SQL = """
 
 def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
                                  src_branch_id: int,
-                                 buyer_party_id: int, buyer_party_branch_id,
+                                 buyer_party_id: int, bill_to_id, ship_to_id,
                                  inv_lines: list, mr_date: date,
                                  updated_by: int, hdr_fallback: dict = None) -> dict:
     """Seller-side Raw-Jute invoice for one marked child MR (owner amendment
@@ -289,8 +290,8 @@ def _create_marked_sales_invoice(conn, child_mr_id: int, src_mr_id: int,
         "invoice_type": RAW_JUTE_INVOICE_TYPE,
         "invoice_amount": invoice_amount,
         "party_id": buyer_party_id,
-        "billing_to_id": buyer_party_branch_id,
-        "shipping_to_id": buyer_party_branch_id,
+        "billing_to_id": bill_to_id,
+        "shipping_to_id": ship_to_id,
         "branch_id": src_branch_id,
         "challan_date": mr_date,
         "challan_no": challan_no,
@@ -610,9 +611,13 @@ def save_marked_batch(
             buyer_party_id, buyer_party_branch_id = _ensure_company_as_party(
                 conn, target_co_id, target_branch_id, src_co_id, updated_by
             )
+            # ships to the target branch: the material really goes there
+            ship_to_id = _invoice_party_branch(conn, buyer_party_id, target_co_id,
+                                               target_branch_id, buyer_party_branch_id,
+                                               updated_by)
             invoice = _create_marked_sales_invoice(
                 conn, child_mr_id, src_mr_id, src_branch_id,
-                buyer_party_id, buyer_party_branch_id, inv_lines,
+                buyer_party_id, buyer_party_branch_id, ship_to_id, inv_lines,
                 mr_date, updated_by, hdr_fallback=hdr,
             )
             conn.execute(text("""

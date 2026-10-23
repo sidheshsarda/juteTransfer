@@ -1134,6 +1134,31 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                         key=f"od_lc_{mr_id}_{step_index}",
                     )
 
+        # Row C: Bill To / Ship To (step 2+, unsaved) -- the buyer company's
+        # own branches the step's invoice names. The Tally export takes the
+        # buyer address from Bill To and the Destination from Ship To.
+        if step_index > 0 and not is_saved and step.get("company"):
+            _, co_branch_mapping = get_company_branch_options()
+            buyer = co_branch_mapping.get(step["company"])
+            if buyer:
+                if step.get("bill_ship_for") != step["company"]:
+                    # picks made for another receiving branch are dropped
+                    step.update(bill_to=None, ship_to=None, bill_ship_for=step["company"])
+                buyer_labels = [lbl for lbl, (co, _) in co_branch_mapping.items() if co == buyer[0]]
+                # ponytail: registered office = the branch named HO, as a default only
+                ho = next((lbl for lbl in buyer_labels if lbl.upper().endswith("-HO")), None)
+                col_bill, col_ship = st.columns(2)
+                for col, field, label, default in (
+                    (col_bill, "bill_to", "Bill To", ho or step["company"]),
+                    (col_ship, "ship_to", "Ship To", step["company"]),
+                ):
+                    kept = step.get(field) if step.get(field) in buyer_labels else default
+                    with col:
+                        step[field] = st.selectbox(
+                            label, options=buyer_labels, index=buyer_labels.index(kept),
+                            key=f"{field}_{mr_id}_{step_index}_{step['company']}",
+                        )
+
         # % Rate Increase input (for step 2+, unsaved only). The box is a
         # widget with a key and NO value=: it is seeded from the step dict
         # when it does not exist yet, and whenever it differs from the dict
@@ -1461,6 +1486,12 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             po_no_for_lc=step.get("po_no_for_lc", ""),
             order_date_for_lc=step.get("order_date_for_lc"),
             transfer_transport=step.get("transfer_transport", True),
+            # step 1 has no invoice; a label is checked against the buyer
+            # company on save (transfer._invoice_party_branch)
+            bill_to_branch_id=(co_branch_mapping.get(step.get("bill_to"), (None, None))[1]
+                               if step_index > 0 else None),
+            ship_to_branch_id=(co_branch_mapping.get(step.get("ship_to"), (None, None))[1]
+                               if step_index > 0 else None),
         )
 
         # Determine if this is the final step (returns to source company)

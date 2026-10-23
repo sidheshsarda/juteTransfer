@@ -75,12 +75,14 @@ Every chain transfer also writes ERP purchase orders (`jute_po` + `jute_po_li` +
 
 - Godowns tagged via `warehouse_mst.warehouse_type = 'MARKED'` (`queries.set_warehouse_marked`). That column is ERP master data ('J' jute godown, 'S' store …): tagging writes only godowns whose tag changes, untagging restores 'J', store godowns are not offered (it used to blank the type of every godown of the branch). Types compare case-insensitively (as MySQL does), and the godown lookups in `queries.py` return `{warehouse_id: label}` — the pages key every godown widget by id, because a branch can have two godowns of one name (sls branch 87: `LCPL_JUTE` 244 and 360).
 - `save_marked_batch` (the only move entry point; there is no single-lot `save_marked_move` any more): per source MR INSERTs one child MR (`transfer_mode=1`) at the target branch/godown with the moved kg at a possibly different rate, and books one seller Raw-Jute `sales_invoice` at the source branch (buyer = target company's party, auto-created if missing), stamps the child MR with invoice no/date/amount, and links via `sales_invoice_jute.mr_id` = child MR id (deletion linkage — different semantics from Type 1's hop linkage). **Since 2026-10-03 a move does not change the source line or its MR header**: the stock-out is the invoice line, which names the source MR line (`sales_invoice_dtl.jute_mr_li_id`), so the ERP stock view `vw_jute_stock_outstanding` nets the moved kg off that line's balance by itself. `delete_marked_move` deletes the invoice (the balance comes back) and the child; moves written by the older code (which drained the source row) are still undone by restoring the source from `jute_lot_src`'s deltas until `scripts/repair_transfer_data.py marked-stock` converts them.
-- P&L counts marked stock: `transfer_mode=1` MRs at status 3 (`get_company_wise_marked_stock`).
+- P&L counts marked stock as part of the as-of stock (`get_company_wise_stock_as_of(as_of, transfer_mode=1)` is the marked grid).
 - **Resale (2026-08-04):** marked stock held at a company can be resold onward — `get_available_lots(include_marked=True)` lists mode-1 lines on the Transfer tab and `save_marked_batch` accepts mode-1 sources. Each hop creates a new mode-1 child MR + seller invoice at the current holder's branch; `src_jute_mr_id` = direct parent per hop; `delete_marked_move` enforces leaf-first undo. Split/merge (lot ops) remain mode-0 only, so resale always moves a line's full remaining balance.
 
 ### P&L dashboard (`pages/company_pl_dashboard.py`)
 
-Per company per FY month: Purchases = SUM(`jute_mr.net_total`); Sales = SUM(invoice − claim) of `invoice_type=5` invoices by seller branch; Stock = unsold chain stock (mode 0, open root) + marked stock (mode 1); Adjusted P&L = (Sales − Purchases) + Stock.
+Per company per FY month: Purchases = SUM(`jute_mr.net_total`); Sales = SUM(invoice − claim) of `invoice_type=5` invoices by seller branch; **Adjusted P&L = Sales − Purchases − Opening stock + Closing stock** (2026-10-23; before that there was no opening term and "stock" was only the FY's own unsold MRs).
+
+Stock = `queries.get_company_wise_stock_as_of(as_of, transfer_mode=None)`: the ERP stock view (`vw_jute_stock_outstanding`) evaluated on a date — per active line, `actual_weight − jute_issue (status ≠ 4, issue_date ≤ as_of) − line-linked approved raw-jute sales (invoice_date ≤ as_of)`, never below 0, capped at `accepted_weight` (legacy lines have none → no cap), × (rate − claim_rate)/100 — over MRs dated ≤ as_of (any FY) at any status the view keeps (not 4/6/21/48; same net as Purchases, which has no status filter). Mode-0 rules kept from the old arm: a hop whose root is at 1/13 is not stock; an MR named by a **header-only** `sales_invoice_jute` invoice dated ≤ as_of (hop invoices, legacy whole-MR sales — no `sales_invoice_dtl.jute_mr_li_id`) is sold whole; a line-linked invoice nets per line instead. Opening = day before fy_start, Closing = fy_end or today. Issues exist only at Empire (br 29) and Limelight (br 87); the trading companies' pre-Apr-2026 lines are mostly legacy residue that sits in both Opening and Closing (P&L-neutral, Stock grid inflated) until zeroed br-29 style.
 
 ## Architecture
 
@@ -198,5 +200,5 @@ The pages have headless tests too (`tests/test_pages.py`, `streamlit.testing.v1.
 
 ---
 
-**Last Updated:** 2026-10-02
+**Last Updated:** 2026-10-23
 **Key Constraints:** sls tenant only; `transfer_mode` keeps the two transfer types disjoint; the vertical chain page is the sole chain-editing UI; gate-entry root MRs come from VoWERP, never from this app — lot split/merge edits `jute_mr_li` in place (no new mode-0 MRs), always traceable via `jute_lot_src`

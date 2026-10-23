@@ -54,7 +54,7 @@ Lives in `pages/new_transfer_chain.py` + `jute_mr_chain_helpers.py` (pure math) 
 5. **Rate cascade:** multiplicative and cumulative, rounded at the kg level at each hop boundary. **Claims do NOT cascade at all** — every step's `claim_amount` is the flat sum of the original per-line claims (the old CLAUDE.md's "claim breaks" phrasing was misleading; there is no claim-break flag).
 6. **Deletion:** deleting from a middle step cascades downstream deletes (MR + line items + both linked invoices per hop); deleting from the root reverts the root.
 
-**P&L wiring (company_pl_dashboard.py):** Purchases = SUM(`jute_mr.net_total`) per owning company; Sales = SUM(invoice_amount − claim) of `invoice_type=5` invoices per seller branch; Unsold chain stock = transfer_mode=0 MRs at status 3 whose root isn't closed (root status NOT IN 1,13) and not yet invoiced forward; Adjusted P&L = (Sales − Purchases) + stock.
+**P&L wiring (company_pl_dashboard.py, 2026-10-23):** Purchases = SUM(`jute_mr.net_total`) per owning company; Sales = SUM(invoice_amount − claim) of `invoice_type=5` invoices per seller branch; Stock = `get_company_wise_stock_as_of(as_of)` — the ERP stock view with a date cutoff (receipt − issues − line-linked sales up to the date, capped at accepted, post-claim rate) over MRs dated ≤ as_of at any status the view keeps, minus mode-0 MRs whose root is at 1/13 or that a header-only invoice (hop / legacy whole-MR sale) sold by the date; Adjusted P&L = Sales − Purchases − Opening (day before FY start) + Closing (FY end or today). Earlier the page had no opening term and counted only the FY's own unsold MRs at `net_total`.
 
 ---
 

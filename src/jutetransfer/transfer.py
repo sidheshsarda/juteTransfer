@@ -81,6 +81,10 @@ class TransferStep:
     po_no_for_lc: str = ""
     order_date_for_lc: Optional[date] = None
     transfer_transport: bool = True
+    # The buyer company's own branches (branch_mst ids) the step's invoice
+    # bills / ships to. None: the buyer party's first branch, as before.
+    bill_to_branch_id: Optional[int] = None
+    ship_to_branch_id: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -310,27 +314,7 @@ def _ensure_company_as_party(conn, company_co_id: int, company_branch_id: int,
 
     new_branch_id = None
     if br_row:
-        br = br_row._mapping
-        new_branch_id = DatabaseConnection.execute_insert_returning_id(conn, """
-            INSERT INTO party_branch_mst (party_id, active, gst_no, address,
-                address_additional, zip_code, city_id, state_id, contact_no,
-                contact_person, created_date, created_by, updated_by, updated_date_time)
-            VALUES (:party_id, 1, :gst_no, :address, :address2,
-                :zip_code, :city_id, :state_id, :contact_no, :contact_person,
-                NOW(), :created_by, :updated_by, NOW())
-        """, {
-            "party_id": new_party_id,
-            "gst_no": br.get("gst_no"),
-            "address": br.get("branch_address1"),
-            "address2": br.get("branch_address2"),
-            "zip_code": br.get("branch_zipcode"),
-            "city_id": br.get("city_id"),
-            "state_id": br.get("state_id"),
-            "contact_no": str(br.get("contact_no") or ""),
-            "contact_person": br.get("contact_person"),
-            "created_by": updated_by,
-            "updated_by": updated_by,
-        })
+        new_branch_id = _insert_party_branch(conn, new_party_id, br_row._mapping, updated_by)
 
     if new_branch_id is None:
         raise ValueError(
@@ -378,6 +362,11 @@ def _ensure_party_branch_from_source_branch(
     if existing is not None:
         return existing
 
+    return _insert_party_branch(conn, party_id, br, updated_by)
+
+
+def _insert_party_branch(conn, party_id: int, br, updated_by: int) -> int:
+    """A new party_branch_mst row of party_id copied from a branch_mst row."""
     return DatabaseConnection.execute_insert_returning_id(conn, """
         INSERT INTO party_branch_mst (party_id, active, gst_no, address,
             address_additional, zip_code, city_id, state_id, contact_no,
@@ -398,6 +387,41 @@ def _ensure_party_branch_from_source_branch(
         "created_by": updated_by,
         "updated_by": updated_by,
     })
+
+
+def _invoice_party_branch(conn, party_id: int, co_id: int, branch_id: Optional[int],
+                          fallback: int, updated_by: int) -> int:
+    """The party_branch_mst row an invoice bills / ships to for the buyer's
+    own branch branch_mst[branch_id]: the party's active row with that
+    branch's address, else a copy inserted from branch_mst. branch_id None:
+    fallback.
+
+    Matched by address, not GST: one GSTIN covers every branch of a company
+    in a state, so HO and FACTORY share it. Unlike finalize
+    (_ensure_party_branch_from_source_branch) this adds a row when the branch
+    is new to the party -- that is the point of picking it.
+    """
+    if branch_id is None:
+        return fallback
+    br_row = conn.execute(
+        text("SELECT * FROM branch_mst WHERE branch_id = :bid"), {"bid": branch_id},
+    ).fetchone()
+    if not br_row or int(br_row._mapping["co_id"]) != int(co_id):
+        raise ValueError(f"Branch {branch_id} is not a branch of company {co_id}; "
+                         "pick Bill To / Ship To again")
+    br = br_row._mapping
+    # ponytail: exact address match; a row retyped in Party Master stops
+    # matching and gets a fresh copy. Add a branch_id link column on
+    # party_branch_mst if that shows up.
+    existing = conn.execute(text("""
+        SELECT party_mst_branch_id FROM party_branch_mst
+        WHERE party_id = :pid AND active = 1
+          AND LOWER(TRIM(COALESCE(address, ''))) = LOWER(TRIM(COALESCE(:addr, '')))
+        ORDER BY party_mst_branch_id LIMIT 1
+    """), {"pid": party_id, "addr": br.get("branch_address1")}).fetchone()
+    if existing:
+        return existing[0]
+    return _insert_party_branch(conn, party_id, br, updated_by)
 
 
 def _ensure_supplier_party(conn, source_mr: dict, target_co_id: int,
@@ -995,7 +1019,8 @@ def _get_next_challan_no(conn, branch_id: int, challan_date: date) -> str:
 
 
 def _create_sales_invoice(conn, seller_step: TransferStep,
-                           buyer_party_id: int, buyer_party_branch_id: Optional[int],
+                           buyer_party_id: int, bill_to_id: Optional[int],
+                           ship_to_id: Optional[int],
                            mr_id: int, source_mr: dict,
                            updated_by: int, rate_multiplier: float,
                            use_new_rounding: bool = False) -> dict:
@@ -1097,8 +1122,8 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
         "invoice_type": RAW_JUTE_INVOICE_TYPE,
         "invoice_amount": invoice_amount,
         "party_id": buyer_party_id,
-        "billing_to_id": buyer_party_branch_id,
-        "shipping_to_id": buyer_party_branch_id,
+        "billing_to_id": bill_to_id,
+        "shipping_to_id": ship_to_id,
         "branch_id": seller_step.branch_id,
         "challan_date": seller_step.mr_date,
         "challan_no": challan_no,
@@ -1854,6 +1879,11 @@ def save_transfer_step(
             buyer_party_id, buyer_party_branch_id = _ensure_company_as_party(
                 conn, step.co_id, step.branch_id, prev_co_id, updated_by
             )
+            bill_to_id, ship_to_id = (
+                _invoice_party_branch(conn, buyer_party_id, step.co_id, branch_id,
+                                      buyer_party_branch_id, updated_by)
+                for branch_id in (step.bill_to_branch_id, step.ship_to_branch_id)
+            )
             # 2. Create sales invoice from seller
             prev_step_for_invoice = TransferStep(
                 co_id=prev_co_id, branch_id=prev_branch_id,
@@ -1879,7 +1909,7 @@ def save_transfer_step(
 
             seller_invoice = _create_sales_invoice(
                 conn, prev_step_for_invoice, buyer_party_id,
-                buyer_party_branch_id, prev_mr_id, source_mr,
+                bill_to_id, ship_to_id, prev_mr_id, source_mr,
                 updated_by, rate_multiplier,
                 use_new_rounding=use_new_rounding,
             )
