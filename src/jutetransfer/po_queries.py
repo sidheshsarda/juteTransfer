@@ -157,6 +157,7 @@ def load_tracker_data(fy_start_year: int) -> dict:
                 op.weight AS orig_po_weight,
                 op.jute_po_value AS orig_po_value,
                 op.vehicle_quantity AS orig_po_lorries,
+                olm.weight AS orig_po_lorry_qtl,
                 ops.supplier_name AS orig_po_supplier_name,
                 opp.supp_name AS orig_po_party_name,
                 opc.co_prefix AS orig_po_co_prefix,
@@ -183,6 +184,7 @@ def load_tracker_data(fy_start_year: int) -> dict:
             LEFT JOIN jute_supplier_mst s ON s.supplier_id = r.jute_supplier_id
             LEFT JOIN party_mst rp ON rp.party_id = r.party_id
             LEFT JOIN jute_po op ON op.jute_po_id = r.po_id
+            LEFT JOIN jute_lorry_mst olm ON olm.jute_lorry_type_id = op.vehicle_type_id
             LEFT JOIN jute_supplier_mst ops ON ops.supplier_id = op.supplier_id
             LEFT JOIN party_mst opp ON opp.party_id = op.party_id
             LEFT JOIN branch_mst opb ON opb.branch_id = op.branch_id

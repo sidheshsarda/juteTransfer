@@ -333,7 +333,8 @@ def transfer_chain_page():
     - Select an MR row to edit its transfer chain
     - Every saved step also gets a purchase order: a Forwarding PO at the
       forwarding company, and a Final PO at the mill when the chain returns
-      (PO rate rounded to the nearest ₹50) — see the PO Tracker page
+      (quantity = one lorry of the Original PO's lorry type, PO rate rounded
+      to the nearest ₹50) — see the PO Tracker page
     """)
 
     # Result of the last save / delete (queued before st.rerun()).

@@ -1,7 +1,10 @@
 """Transfer PO writes (po_ops.py) through the fake sls database.
 
 Row by row what a Forwarding / Final PO holds (DESIGN §3), when none is made
-(§4) and what deleting one removes or refuses (§7). Chain states are
+(§4) and what deleting one removes or refuses (§7). Quantity (owner rule
+2026-10-24): one lorry of X's lorry type -- 100 quintals = 10,000 kg -- in
+percentage mode, split over the MR's lines by received weight (9,312 / 1,441
+kg -> 86.60 % / 13.40 % -> 8,660 / 1,340 kg). Chain states are
 hand-built with the Scenario helpers of tests/fake_mysql.py;
 tests/test_transfer_po_flow.py drives the same code through transfer.py.
 PO creation is switched on explicitly (JT_TRANSFER_PO=1) wherever a PO is
@@ -80,8 +83,9 @@ def test_forwarding_po_header(scenario, po_on):
     assert po == header(
         db, jute_po_id=out["po_id"], branch_id=sc.b_branch, po_no=1, po_date=date(2026, 9, 1),
         supplier_id=sc.supplier, party_id=party, jute_mukam_id=sc.mukam, jute_uom="BALE",
-        vehicle_type_id=None, vehicle_quantity=1, weight=10800.0,
-        jute_po_value=Decimal("1384800.00"), channel_code="DOMESTIC",
+        # one lorry of X's lorry type: 100 quintals, as the ERP derives it
+        vehicle_type_id=sc.a_lorry_type, vehicle_quantity=1, weight=10000.0,
+        jute_po_value=Decimal("1282320.00"), channel_code="DOMESTIC",
         credit_term=sc.po_credit_term, delivery_days=sc.po_delivery_days,
         remarks=po_remarks(ROLE_FORWARD),
         # closed_by stays NULL like the ERP's own CLI closes: the app's user id
@@ -93,8 +97,8 @@ def test_forwarding_po_header(scenario, po_on):
     # the remark names the ROOT's lorry, the mill and the original PO
     assert ("for lorry GE 21 dt 31-08-2026 received at THE EMPIRE JUTE COMPANY LTD. "
             "Original PO EJM/F/JPO/26-27/00011. Do not reopen.") in po["close_remark"]
-    # vehicle_type_id stays NULL: the lorry master is neither read nor written
-    assert not [s for s in db.statements[start:] if "jute_lorry_mst" in s]
+    # the lorry master is only read (X's capacity), never written
+    assert not [s for s in db.writes(start) if "jute_lorry_mst" in s]
 
 
 def test_forwarding_po_lines_and_hop_links(scenario, po_on):
@@ -121,23 +125,24 @@ def test_forwarding_po_lines_and_hop_links(scenario, po_on):
     lines = lines_of(db, out["po_id"])
     ids = [l["jute_po_li_id"] for l in lines]
     common = dict(jute_po_id=out["po_id"], jute_uom="BALE")
+    # 11,453 kg received, 10,000 kg ordered for the lorry: shares 81.31 / 12.58 / 6.11 %
     assert lines == [
-        # 9312 kg -> 62 bales = 9300 kg; 93 q x 12,850
-        po_line(db, jute_po_li_id=ids[0], item_id=b_item[sc.items[0]], quantity=62.0,
-                rate=12850.0, value=Decimal("1195050.00"), crop_year=26,
-                allowable_moisture=20.0, **common),
-        # 1441 kg -> 10 bales = 1500 kg; 15 q x 12,650
-        po_line(db, jute_po_li_id=ids[1], item_id=b_item[sc.items[1]], quantity=10.0,
-                rate=12650.0, value=Decimal("189750.00"), crop_year=26,
-                allowable_moisture=20.0, **common),
+        # 9312 kg of 11453 -> 81.31 % of 10,000 = 8,131 kg (54 bales); 81.31 q x 12,850
+        po_line(db, jute_po_li_id=ids[0], item_id=b_item[sc.items[0]], quantity=54.0,
+                percentage=Decimal("81.31"), rate=12850.0, value=Decimal("1044833.50"),
+                crop_year=26, allowable_moisture=20.0, **common),
+        # 1441 kg -> 12.58 % = 1,258 kg (8 bales); 12.58 q x 12,650
+        po_line(db, jute_po_li_id=ids[1], item_id=b_item[sc.items[1]], quantity=8.0,
+                percentage=Decimal("12.58"), rate=12650.0, value=Decimal("159137.00"),
+                crop_year=26, allowable_moisture=20.0, **common),
         # active NULL counts as active; challan item when no actual item; own crop
-        # year; 700 kg -> 5 bales = 750 kg; 12,925 -> 12,950 (tie goes up)
-        po_line(db, jute_po_li_id=ids[2], item_id=b_item[sc.items[1]], quantity=5.0,
-                rate=12950.0, value=Decimal("97125.00"), marka=marka[:50], crop_year=25,
-                allowable_moisture=18.5, **common),
+        # year; 700 kg -> 6.11 % = 611 kg (4 bales); 12,925 -> 12,950 (tie goes up)
+        po_line(db, jute_po_li_id=ids[2], item_id=b_item[sc.items[1]], quantity=4.0,
+                percentage=Decimal("6.11"), rate=12950.0, value=Decimal("79124.50"),
+                marka=marka[:50], crop_year=25, allowable_moisture=18.5, **common),
     ]
     po = db.row("jute_po", jute_po_id=out["po_id"])
-    assert (po["weight"], po["jute_po_value"]) == (11550.0, Decimal("1481925.00"))
+    assert (po["weight"], po["jute_po_value"]) == (10000.0, Decimal("1283095.00"))
     # the hop and every USED line point at the PO; zero-weight / inactive lines do not
     assert db.row("jute_mr", jute_mr_id=hop)["po_id"] == out["po_id"]
     assert {l["jute_mr_li_id"]: l["jute_po_li_id"] for l in db.rows("jute_mr_li", jute_mr_id=hop)
@@ -163,15 +168,16 @@ def test_status_log_row(scenario, po_on, role):
                    "user_id": None, "created_at": db.now}
 
 
-@pytest.mark.parametrize("mr_uom, x_uom, uom, quantities, weight, value", [
-    ("BALE", "BALE", "BALE", [62.0, 10.0], 10800.0, "1384800.00"),
-    ("LOOSE", "LOOSE", "LOOSE", [194.0, 30.0], 10752.0, "1378752.00"),   # 48 kg units
-    (None, "BALE", "BALE", [62.0, 10.0], 10800.0, "1384800.00"),         # MR has none: X's
-    ("KG", "LOOSE", "LOOSE", [194.0, 30.0], 10752.0, "1378752.00"),      # not BALE/LOOSE: X's
-    (None, None, "LOOSE", [194.0, 30.0], 10752.0, "1378752.00"),         # neither: LOOSE
+@pytest.mark.parametrize("mr_uom, x_uom, uom, quantities", [
+    ("BALE", "BALE", "BALE", [58.0, 9.0]),          # 8,660 / 1,340 kg in 150 kg bales
+    ("LOOSE", "LOOSE", "LOOSE", [180.0, 28.0]),     # 48 kg units
+    (None, "BALE", "BALE", [58.0, 9.0]),            # MR has none: X's
+    ("KG", "LOOSE", "LOOSE", [180.0, 28.0]),        # not BALE/LOOSE: X's
+    (None, None, "LOOSE", [180.0, 28.0]),           # neither: LOOSE
 ])
-def test_unit_quantity_weight_and_value(fake_db, po_on, mr_uom, x_uom, uom, quantities,
-                                        weight, value):
+def test_unit_quantity_weight_and_value(fake_db, po_on, mr_uom, x_uom, uom, quantities):
+    """The unit only changes the (informational) unit count: weight and value
+    follow the percentages of the 10,000 kg lorry."""
     sc = build_scenario(fake_db, uom=x_uom or "BALE")
     if x_uom is None:
         fake_db.update("jute_po", {"jute_po_id": sc.po}, jute_uom=None)
@@ -181,9 +187,49 @@ def test_unit_quantity_weight_and_value(fake_db, po_on, mr_uom, x_uom, uom, quan
 
     po = fake_db.row("jute_po", jute_po_id=out["po_id"])
     lines = lines_of(fake_db, out["po_id"])
-    assert (po["jute_uom"], po["weight"], po["jute_po_value"]) == (uom, weight, Decimal(value))
-    assert [(l["quantity"], l["jute_uom"]) for l in lines] == [(q, uom) for q in quantities]
-    assert sum(l["value"] for l in lines) == Decimal(value)
+    assert (po["jute_uom"], po["weight"], po["jute_po_value"]) == (
+        uom, 10000.0, Decimal("1282320.00"))
+    assert [(l["quantity"], l["percentage"], l["jute_uom"]) for l in lines] == [
+        (quantities[0], Decimal("86.60"), uom), (quantities[1], Decimal("13.40"), uom)]
+    assert sum(l["value"] for l in lines) == Decimal("1282320.00")
+
+
+@pytest.mark.parametrize("how", ["no lorry type", "type without a master row", "capacity 0"])
+def test_without_a_lorry_type_the_po_follows_the_received_weight(scenario, po_on, how):
+    """No capacity to order: quantity mode as before -- whole bales nearest
+    the accepted weight, percentage and vehicle type NULL."""
+    sc, db = scenario, scenario.db
+    if how == "no lorry type":
+        db.update("jute_po", {"jute_po_id": sc.po}, vehicle_type_id=None)
+    elif how == "type without a master row":
+        db.update("jute_po", {"jute_po_id": sc.po}, vehicle_type_id=4040)
+    else:
+        db.update("jute_lorry_mst", {"jute_lorry_type_id": sc.a_lorry_type}, weight=0)
+    hop = sc.add_hop()
+
+    out = in_txn(po_ops.create_forward_po, hop, sc.user)
+
+    po = db.row("jute_po", jute_po_id=out["po_id"])
+    assert (po["vehicle_type_id"], po["vehicle_quantity"], po["weight"],
+            po["jute_po_value"]) == (None, 1, 10800.0, Decimal("1384800.00"))
+    assert [(l["quantity"], l["percentage"], l["value"]) for l in lines_of(db, out["po_id"])] == [
+        (62.0, None, Decimal("1195050.00")), (10.0, None, Decimal("189750.00"))]
+
+
+def test_every_lorry_of_a_multi_lorry_po_orders_one_lorry(scenario, po_on):
+    """X orders 2 lorries x 100 quintals: a second lorry received on X gets a
+    Forwarding PO of the same 10,000 kg -- X's quantity split equally."""
+    sc, db = scenario, scenario.db
+    first_hop = sc.add_hop()
+    second_root = sc.add_root(ge_no=22, ge_date=date(2026, 9, 2))
+    second_hop = sc.add_hop(root=second_root, mr_date=date(2026, 9, 2))
+
+    outs = [in_txn(po_ops.create_forward_po, hop, sc.user) for hop in (first_hop, second_hop)]
+
+    pos = [db.row("jute_po", jute_po_id=o["po_id"]) for o in outs]
+    assert [(p["vehicle_type_id"], p["vehicle_quantity"], p["weight"]) for p in pos] == [
+        (sc.a_lorry_type, 1, 10000.0), (sc.a_lorry_type, 1, 10000.0)]
+    assert [p["po_no"] for p in pos] == [1, 2]
 
 
 def test_po_number_per_branch_and_financial_year(scenario, po_on):
@@ -387,10 +433,11 @@ def test_final_po_header_and_lines(scenario, po_on):
     assert summary(out) == {"role": ROLE_FINAL, "po_no": 12,
                             "po_no_formatted": "EJM/F/JPO/26-27/00012", "skipped": None}
     po = db.row("jute_po", jute_po_id=out["po_id"])
-    assert po == header(            # vehicle_type_id, credit_term, delivery_days stay NULL
+    assert po == header(            # credit_term, delivery_days stay NULL
         db, jute_po_id=out["po_id"], branch_id=sc.a_branch, po_no=12, po_date=date(2026, 9, 3),
         supplier_id=sc.supplier, party_id=forwarder, jute_mukam_id=sc.mukam, jute_uom="BALE",
-        vehicle_quantity=1, weight=10800.0, jute_po_value=Decimal("1390200.00"),
+        vehicle_type_id=sc.a_lorry_type, vehicle_quantity=1, weight=10000.0,
+        jute_po_value=Decimal("1287320.00"),
         channel_code="DOMESTIC", status_id=5, close_type=CLOSE_TYPE_TRANSFER,
         remarks=po_remarks(ROLE_FINAL), closed_date=db.now, closed_by=None,
         close_remark=final_close_remark(sc.ge_no, sc.ge_date, FORWARDER_IN_A, ORIGINAL_PO),
@@ -402,10 +449,10 @@ def test_final_po_header_and_lines(scenario, po_on):
     common = dict(jute_po_id=out["po_id"], jute_uom="BALE", crop_year=26, allowable_moisture=20.0)
     ids = [l["jute_po_li_id"] for l in lines_of(db, out["po_id"])]
     assert lines_of(db, out["po_id"]) == [     # final rates 12,914 / 12,713 -> 12,900 / 12,700
-        po_line(db, jute_po_li_id=ids[0], item_id=sc.items[0], quantity=62.0, rate=12900.0,
-                value=Decimal("1199700.00"), **common),
-        po_line(db, jute_po_li_id=ids[1], item_id=sc.items[1], quantity=10.0, rate=12700.0,
-                value=Decimal("190500.00"), **common),
+        po_line(db, jute_po_li_id=ids[0], item_id=sc.items[0], quantity=58.0,
+                percentage=Decimal("86.60"), rate=12900.0, value=Decimal("1117140.00"), **common),
+        po_line(db, jute_po_li_id=ids[1], item_id=sc.items[1], quantity=9.0,
+                percentage=Decimal("13.40"), rate=12700.0, value=Decimal("170180.00"), **common),
     ]
     # nothing links to it: the root keeps X, its lines keep X's lines
     assert db.row("jute_mr", jute_mr_id=sc.root)["po_id"] == sc.po
@@ -502,16 +549,17 @@ def test_po_value_beyond_decimal_10_2_raises_and_writes_nothing(scenario, po_on)
     hop = sc.add_hop()
     first, second = sc.active_lines(hop)
     db.update("jute_mr_li", {"jute_mr_li_id": second}, active=0)
-    db.update("jute_mr_li", {"jute_mr_li_id": first}, rate=1075300)    # 93 q -> 100,002,900.00
+    # the one line is 100 % of the 10,000 kg lorry: 100 q x the rate
+    db.update("jute_mr_li", {"jute_mr_li_id": first}, rate=1000050)    # 100,005,000.00
     before = db.snapshot()
     with pytest.raises(ValueError, match="exceeds what jute_po.jute_po_value can hold"):
         in_txn(po_ops.create_forward_po, hop, sc.user)
     assert db.diff(before, db.snapshot()) == []
 
-    db.update("jute_mr_li", {"jute_mr_li_id": first}, rate=1075250)    # 99,998,250.00 fits
+    db.update("jute_mr_li", {"jute_mr_li_id": first}, rate=999950)     # 99,995,000.00 fits
     out = in_txn(po_ops.create_forward_po, hop, sc.user)
-    assert db.row("jute_po", jute_po_id=out["po_id"])["jute_po_value"] == Decimal("99998250.00")
-    assert [l["value"] for l in lines_of(db, out["po_id"])] == [Decimal("99998250.00")]
+    assert db.row("jute_po", jute_po_id=out["po_id"])["jute_po_value"] == Decimal("99995000.00")
+    assert [l["value"] for l in lines_of(db, out["po_id"])] == [Decimal("99995000.00")]
 
 
 def test_plans_write_nothing(scenario, po_on):
@@ -529,9 +577,10 @@ def test_plans_write_nothing(scenario, po_on):
     assert forward["skipped"] is None and final["skipped"] is None
     assert forward["map_row"] == {"co_id": sc.b_co, "supplier_id": sc.supplier, "party_id": party}
     assert final["map_row"] is None
-    assert [(l["rate"], l["quantity"]) for l in forward["lines"]] == [(12850.0, 62.0),
-                                                                       (12650.0, 10.0)]
-    assert (forward["weight"], forward["value"]) == (10800.0, 1384800.0)
+    assert [(l["rate"], l["percentage"], l["quantity"]) for l in forward["lines"]] == [
+        (12850.0, 86.6, 58.0), (12650.0, 13.4, 9.0)]
+    assert (forward["weight"], forward["value"], forward["lorry_kg"],
+            forward["vehicle_type_id"]) == (10000.0, 1282320.0, 10000.0, sc.a_lorry_type)
     assert [l["rate"] for l in final["lines"]] == [12900.0, 12700.0]
     assert (final["branch_id"], final["po_date"]) == (sc.a_branch, date(2026, 9, 3))
 

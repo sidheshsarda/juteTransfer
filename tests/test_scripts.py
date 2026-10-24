@@ -8,6 +8,7 @@ refuses a write there as MySQL does, and a write after it only works when
 that transaction was really ended."""
 import json
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
@@ -15,7 +16,9 @@ from scripts import backfill_transfer_pos as backfill
 from scripts import repair_transfer_data as repair
 from src.jutetransfer import po_ops
 from src.jutetransfer.database import DatabaseConnection
-from src.jutetransfer.po_helpers import ROLE_FINAL, ROLE_FORWARD, parse_marker
+from src.jutetransfer.po_helpers import (
+    ROLE_FINAL, ROLE_FORWARD, build_po_lines, parse_marker, po_totals,
+)
 
 from .fake_mysql import fake_db, scenario  # noqa: F401  (fixtures)
 from .test_transfer_po_flow import Chain
@@ -458,3 +461,120 @@ def test_repair_hop_tds_lists_and_rewrites_old_hops_by_the_erp_rule(scenario, tm
     assert {k: row[k] for k in planned["new"]} == planned["new"]
     with DatabaseConnection.get_transaction() as conn:
         assert repair.plan_hop_tds(conn) == []
+
+
+# --- repair: po-lorry-quantity -------------------------------------------------------------
+
+def _old_shape(db, po_id, mr_id, uom="BALE"):
+    """Put a transfer PO back into the pre-2026-10-24 shape: the received
+    weight in whole units, percentage NULL, no lorry type (as the pilot's)."""
+    old = build_po_lines(db.rows("jute_mr_li", jute_mr_id=mr_id), uom)
+    stored = sorted(db.rows("jute_po_li", jute_po_id=po_id), key=lambda l: l["jute_po_li_id"])
+    for s, o in zip(stored, old):
+        db.update("jute_po_li", {"jute_po_li_id": s["jute_po_li_id"]}, quantity=o["quantity"],
+                  percentage=None, value=Decimal(str(o["value"])))
+    kg, value = po_totals(old)
+    db.update("jute_po", {"jute_po_id": po_id}, vehicle_type_id=None, weight=kg,
+              jute_po_value=Decimal(str(value)))
+
+
+def test_repair_po_lorry_quantity_rewrites_old_shape_pos_in_place(scenario, tmp_path, monkeypatch):
+    """The pilot's POs order 10,800 kg of whole bales for a 10,000 kg lorry:
+    the repair rewrites header and lines to one lorry of X's type in the MR
+    lines' shares and keeps number, id, date, party, marker and the link."""
+    monkeypatch.setenv("JT_TRANSFER_PO", "1")
+    sc, db = scenario, scenario.db
+    hop = sc.add_hop()
+    with DatabaseConnection.get_transaction() as conn:
+        fwd = po_ops.create_forward_po(conn, hop, sc.user)["po_id"]
+    sc.finalize_root()
+    with DatabaseConnection.get_transaction() as conn:
+        fin = po_ops.create_final_po(conn, sc.root, sc.user)["po_id"]
+    _old_shape(db, fwd, hop)
+    _old_shape(db, fin, sc.root)
+    before = {po_id: db.row("jute_po", jute_po_id=po_id) for po_id in (fwd, fin)}
+    assert (before[fwd]["weight"], before[fwd]["vehicle_type_id"]) == (10800.0, None)
+
+    with DatabaseConnection.get_transaction() as conn:
+        planned = repair.plan_po_lorry_quantity(conn)
+    assert [(p["role"], p["jute_po_id"], p["mr_id"], p["lorry_kg"]) for p in planned] == [
+        (ROLE_FORWARD, fwd, hop, 10000.0), (ROLE_FINAL, fin, sc.root, 10000.0)]
+    assert planned[0]["old"]["header"] == {"vehicle_type_id": None, "weight": 10800.0,
+                                           "jute_po_value": 1384800.0}
+    assert planned[0]["new"]["header"] == {"vehicle_type_id": sc.a_lorry_type, "weight": 10000.0,
+                                           "jute_po_value": 1282320.0}
+    assert [tuple(l.values()) for l in planned[0]["old"]["lines"].values()] == [
+        (62.0, None, 12850.0, 1195050.0), (10.0, None, 12650.0, 189750.0)]
+    assert [tuple(l.values()) for l in planned[0]["new"]["lines"].values()] == [
+        (58.0, 86.6, 12850.0, 1112810.0), (9.0, 13.4, 12650.0, 169510.0)]
+    assert planned[1]["new"]["header"]["jute_po_value"] == 1287320.0
+
+    assert repair.main(["--apply", "--only", "po-lorry-quantity", "--expect", "2",
+                        "--log-dir", str(tmp_path)]) == 0
+
+    for po_id, value, lines in ((fwd, "1282320.00", [(58.0, "86.60", 12850.0, "1112810.00"),
+                                                     (9.0, "13.40", 12650.0, "169510.00")]),
+                                (fin, "1287320.00", [(58.0, "86.60", 12900.0, "1117140.00"),
+                                                     (9.0, "13.40", 12700.0, "170180.00")])):
+        po = db.row("jute_po", jute_po_id=po_id)
+        assert (po["vehicle_type_id"], po["vehicle_quantity"], po["weight"], po["jute_po_value"]
+                ) == (sc.a_lorry_type, 1, 10000.0, Decimal(value))
+        # everything else as it was
+        assert {k: v for k, v in po.items() if k not in ("vehicle_type_id", "weight",
+                                                          "jute_po_value", "updated_date_time")
+                } == {k: v for k, v in before[po_id].items()
+                      if k not in ("vehicle_type_id", "weight", "jute_po_value", "updated_date_time")}
+        assert [(l["quantity"], l["percentage"], l["rate"], l["value"])
+                for l in sorted(db.rows("jute_po_li", jute_po_id=po_id),
+                                key=lambda l: l["jute_po_li_id"])] == [
+            (q, Decimal(p), r, Decimal(v)) for q, p, r, v in lines]
+    assert db.row("jute_mr", jute_mr_id=hop)["po_id"] == fwd         # link kept
+    with DatabaseConnection.get_transaction() as conn:
+        assert repair.plan_po_lorry_quantity(conn) == []              # nothing left
+
+
+def test_repair_po_lorry_quantity_leaves_reopened_and_relinked_pos_out(scenario, tmp_path,
+                                                                       monkeypatch, capsys):
+    monkeypatch.setenv("JT_TRANSFER_PO", "1")
+    sc, db = scenario, scenario.db
+    hop = sc.add_hop()
+    with DatabaseConnection.get_transaction() as conn:
+        fwd = po_ops.create_forward_po(conn, hop, sc.user)["po_id"]
+    sc.finalize_root()
+    with DatabaseConnection.get_transaction() as conn:
+        fin = po_ops.create_final_po(conn, sc.root, sc.user)["po_id"]
+    _old_shape(db, fwd, hop)
+    _old_shape(db, fin, sc.root)
+    db.update("jute_po", {"jute_po_id": fwd}, status_id=3, close_type=None)   # reopened in the ERP
+    db.update("jute_mr", {"jute_mr_id": sc.root}, status_id=13, branch_mr_no=None)  # un-finalized
+
+    assert repair.main(["--only", "po-lorry-quantity"]) == 0
+    out = capsys.readouterr().out
+    assert "[po-lorry-quantity] 0 transfer PO(s)" in out
+    assert f"left out: PO id {fwd} (no 1, branch {sc.b_branch}): no longer Closed" in out
+    assert f"left out: PO id {fin}" in out and "is not finalized" in out
+    with DatabaseConnection.get_transaction() as conn:
+        assert repair.plan_po_lorry_quantity(conn) == []
+
+
+def test_repair_po_lorry_quantity_refuses_a_po_whose_plan_changed_after_the_dry_run(
+        scenario, tmp_path, monkeypatch):
+    monkeypatch.setenv("JT_TRANSFER_PO", "1")
+    sc, db = scenario, scenario.db
+    hop = sc.add_hop()
+    with DatabaseConnection.get_transaction() as conn:
+        fwd = po_ops.create_forward_po(conn, hop, sc.user)["po_id"]
+    _old_shape(db, fwd, hop)
+    with DatabaseConnection.get_transaction() as conn:
+        plans = {"po-lorry-quantity": repair.plan_po_lorry_quantity(conn)}
+    assert len(plans["po-lorry-quantity"]) == 1
+    before = (db.row("jute_po", jute_po_id=fwd), db.rows("jute_po_li", jute_po_id=fwd))
+    # the hop's first line is re-weighed between the dry run and the apply
+    db.update("jute_mr_li", {"jute_mr_li_id": sc.active_lines(hop)[0]}, accepted_weight=9000)
+
+    assert repair.apply(plans, tmp_path / "log.json") == 1
+
+    assert (db.row("jute_po", jute_po_id=fwd), db.rows("jute_po_li", jute_po_id=fwd)) == before
+    log = json.loads((tmp_path / "log.json").read_text())
+    assert [f["error"] for f in log["failed"]] == [
+        "the plan changed since the dry run (MR or Original PO edited?)"]

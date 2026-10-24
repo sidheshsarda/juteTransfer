@@ -35,6 +35,7 @@ from .po_helpers import (
     UOM_LOOSE,
     format_po_no,
     fy_label,
+    lorry_kg,
     parse_marker,
     unit_kg,
 )
@@ -72,15 +73,20 @@ MR_STATUS_APPROVED = 3            # root after finalize: the lorry is back at th
 MR_STATUS_PENDING = 13            # root while the chain is out
 
 # A PO rate is the MR rate rounded to the closest 50, so the two can differ
-# by 25 at most; a PO line is the nearest whole bale / loose unit, so its
-# weight can differ by half a unit at most. Anything beyond is not rounding.
+# by 25 at most. A PO line's weight is the MR line's share of the lorry the
+# Original PO ordered (percentage with two decimals), or -- without an
+# Original PO lorry type -- the nearest whole bale / loose unit; either way it
+# sits within half a unit of what it should be. Anything beyond is not rounding.
 RATE_TOLERANCE = PO_RATE_STEP / 2.0
 _EPS = 0.005
 
 ROUNDING_CAPTION = (
-    f"PO weight is in whole bales ({BALE_KG} kg) or loose units ({LOOSE_KG} kg). "
-    f"PO rate is rounded to the nearest ₹{PO_RATE_STEP}. The MR and the "
-    "invoice keep exact figures."
+    "A transfer PO orders one lorry of the Original PO's lorry type (its "
+    "capacity), split over the MR's lines by received weight: the Original "
+    "PO's quantity shared equally among its lorries. Without a lorry type it "
+    f"orders the received weight in whole bales ({BALE_KG} kg) or loose units "
+    f"({LOOSE_KG} kg). PO rate is rounded to the nearest ₹{PO_RATE_STEP}. The MR "
+    "and the invoice keep the received weight and exact rates."
 )
 
 _PO_STATUS_NAMES = {1: "Open", 3: "Approved", 4: "Rejected", 5: "Closed",
@@ -538,18 +544,28 @@ def _is_unit_uom(uom) -> bool:
     return isinstance(uom, str) and uom.strip().upper() in (UOM_BALE, UOM_LOOSE)
 
 
-def _recon_row(mr_line, po_line, po_uom, has_po: bool) -> dict:
-    mr_kg = mr_rate = mr_amount = None
+def _recon_row(mr_line, po_line, po_uom, has_po: bool, po_total_kg=None,
+               scale=None) -> dict:
+    """`scale` = lorry kg / MR kg: what the PO should carry per MR kg
+    (expected_kg = mr_kg x scale; the MR kg itself without an ordered lorry)."""
+    mr_kg = mr_rate = mr_amount = expected_kg = None
     if mr_line is not None:
         mr_kg = _f(mr_line.get("accepted_weight")) or 0.0
         mr_rate = _f(mr_line.get("rate")) or 0.0
         mr_amount = mr_kg * mr_rate / 100.0
-    po_kg = po_rate = po_value = po_units = unit = uom = None
+        expected_kg = mr_kg * scale if scale is not None else mr_kg
+    po_kg = po_rate = po_value = po_units = unit = uom = pct = None
     if po_line is not None:
         uom = po_line.get("jute_uom") if _is_unit_uom(po_line.get("jute_uom")) else po_uom
         unit = unit_kg(uom)
         po_units = _f(po_line.get("quantity")) or 0.0
-        po_kg = po_units * unit
+        pct = _f(po_line.get("percentage"))
+        if pct is not None and po_total_kg is not None:
+            # percentage mode: the ERP derives the line's weight from its
+            # percentage of the PO's lorry, never from the unit count
+            po_kg = pct / 100.0 * po_total_kg
+        else:
+            po_kg = po_units * unit
         po_rate = _f(po_line.get("rate")) or 0.0
         stored = _f(po_line.get("value"))
         po_value = stored if stored is not None else po_kg * po_rate / 100.0
@@ -569,7 +585,9 @@ def _recon_row(mr_line, po_line, po_uom, has_po: bool) -> dict:
     src = mr_line if mr_line is not None else po_line
     return {
         "quality": _s(src.get("item_name")) or "Item",
-        "mr_kg": mr_kg, "po_kg": po_kg, "po_units": po_units,
+        "mr_kg": mr_kg, "expected_kg": expected_kg, "po_kg": po_kg, "po_units": po_units,
+        "ordered": scale is not None,          # compared with its share of the lorry
+        "pct_mode": pct is not None and po_total_kg is not None,   # kg came from the %
         "unit_kg": unit, "uom": uom.strip().upper() if _is_unit_uom(uom) else None,
         "mr_rate": mr_rate, "po_rate": po_rate,
         "mr_amount": mr_amount, "po_value": po_value, "diff": diff,
@@ -580,9 +598,15 @@ def _recon_row(mr_line, po_line, po_uom, has_po: bool) -> dict:
     }
 
 
-def reconcile(mr_lines, po_lines, po_uom=None) -> list:
+def reconcile(mr_lines, po_lines, po_uom=None, lorry_kg=None, po_kg=None) -> list:
     """Reconciliation rows of one PO against the MR it mirrors: one row per
     MR line with accepted weight, paired with its PO line.
+
+    `lorry_kg` = what the Original PO ordered for one lorry (po_helpers.
+    lorry_kg): each MR line is then expected to be ordered in proportion
+    (expected_kg = its share of the lorry); None = the PO follows the received
+    weight. `po_kg` = the PO header's weight, which a percentage-mode line's
+    kg is a share of (the lorry when not given).
 
     Pairing: the stored link (jute_mr_li.jute_po_li_id, set on hop lines)
     first; then same item in line-id order (a Final PO is not linked from
@@ -601,6 +625,18 @@ def reconcile(mr_lines, po_lines, po_uom=None) -> list:
                 key=lambda l: _i(l.get("jute_po_li_id")) or 0)
     mr_active = sorted([l for l in (mr_lines or []) if is_active(l)],
                        key=lambda l: _i(l.get("jute_mr_li_id")) or 0)
+    mr_total = sum(_f(l.get("accepted_weight")) or 0.0 for l in mr_active)
+    pct_lines = any(_f(l.get("percentage")) is not None for l in po)
+    po_total_kg = _f(po_kg)
+    if po_total_kg is None and pct_lines:
+        po_total_kg = _f(lorry_kg)
+    # What one lorry should carry: the Original PO's lorry; when that is not
+    # known any more (its lorry type gone from the master), a percentage-mode
+    # PO's own header kg -- the lorry it was written for.
+    ordered_kg = _f(lorry_kg)
+    if ordered_kg is None and pct_lines:
+        ordered_kg = po_total_kg
+    scale = ordered_kg / mr_total if ordered_kg and mr_total > 0 else None
     po_by_id = {_i(p.get("jute_po_li_id")): p for p in po}
     taken, pairs, unlinked = set(), [], []
     for m in mr_active:
@@ -620,16 +656,17 @@ def reconcile(mr_lines, po_lines, po_uom=None) -> list:
             rest.remove(hit)
         pairs.append((m, hit))
     pairs.sort(key=lambda mp: _i(mp[0].get("jute_mr_li_id")) or 0)
-    ordered = ([mp for mp in pairs if mp[1] is not None]
-               + [mp for mp in pairs if mp[1] is None]
-               + [(None, p) for p in rest])
-    return [_recon_row(m, p, po_uom, has_po) for m, p in ordered]
+    rows = ([mp for mp in pairs if mp[1] is not None]
+            + [mp for mp in pairs if mp[1] is None]
+            + [(None, p) for p in rest])
+    return [_recon_row(m, p, po_uom, has_po, po_total_kg, scale) for m, p in rows]
 
 
 def recon_flags(rows) -> list:
     """What rounding cannot explain, in words (the 'Check' reasons): a line
-    without a counterpart, a weight more than half a unit off, a rate more
-    than 25 off."""
+    without a counterpart, a weight more than half a unit off what the line
+    should carry (its share of the ordered lorry, else the MR weight), a rate
+    more than 25 off."""
     out = []
     for r in rows:
         q = r["quality"]
@@ -640,14 +677,17 @@ def recon_flags(rows) -> list:
             out.append(f"{q}: PO line of {fmt_num(r['po_kg'])} kg has no MR line")
             continue
         unit = r["unit_kg"] or 0
-        off = abs(r["po_kg"] - r["mr_kg"])
+        expected = r["expected_kg"] if r["expected_kg"] is not None else r["mr_kg"]
+        off = abs(r["po_kg"] - expected)
         # A PO line is never less than one unit, so a lot lighter than half
         # a unit legitimately sits further away.
-        one_unit_floor = r["po_units"] == 1 and r["mr_kg"] < unit / 2.0
+        one_unit_floor = r["po_units"] == 1 and expected < unit / 2.0
         if off > unit / 2.0 + _EPS and not one_unit_floor:
+            against = (f"{fmt_num(expected)} kg ordered for the lorry "
+                       f"(MR {fmt_num(r['mr_kg'])} kg)" if r.get("ordered")
+                       else f"MR {fmt_num(r['mr_kg'])} kg")
             out.append(
-                f"{q}: PO {fmt_num(r['po_kg'])} kg against MR "
-                f"{fmt_num(r['mr_kg'])} kg is more than half a "
+                f"{q}: PO {fmt_num(r['po_kg'])} kg against {against} is more than half a "
                 f"{'bale' if unit == BALE_KG else 'loose unit'} apart"
             )
         if abs(r["po_rate"] - r["mr_rate"]) > RATE_TOLERANCE + _EPS:
@@ -665,8 +705,12 @@ def recon_totals(rows) -> dict:
     def total(key):
         vals = [r[key] for r in rows if r.get(key) is not None]
         return sum(vals) if vals else None
-    return {k: total(k) for k in ("mr_kg", "po_kg", "po_units", "mr_amount", "po_value",
-                                  "diff", "weight_part", "rate_part", "unmatched")}
+    out = {k: total(k) for k in ("mr_kg", "expected_kg", "po_kg", "po_units", "mr_amount",
+                                 "po_value", "diff", "weight_part", "rate_part", "unmatched")}
+    # the weight part of a percentage-mode PO is 'ordered vs received kg'; of a
+    # quantity-mode PO (the old shape, or no lorry type) whole-unit rounding
+    out["ordered"] = any(r.get("pct_mode") for r in rows)
+    return out
 
 
 RATE_PART_LABEL = f"rate to nearest ₹{PO_RATE_STEP}"
@@ -674,13 +718,14 @@ RATE_PART_LABEL = f"rate to nearest ₹{PO_RATE_STEP}"
 
 def difference_sentence(po_value, base_amount, totals: dict,
                         base_label: str = "MR", uom=None) -> str:
-    """'PO 1,390,200 vs invoice 1,385,746: +4,454 (+0.32 %) — whole bales
-    +5,945 · rate to nearest ₹50: -1,491.'
+    """'PO 1,282,320 vs invoice 1,385,746: -103,426 (-7.46 %) — ordered vs
+    received kg -101,935 · rate to nearest ₹50: -1,491.'
 
     `totals` = recon_totals of the PO's reconciliation rows. The difference
     is told in parts that are each exact and together make it up:
 
-      whole bales / loose units  (PO kg - MR kg) / 100 x PO rate    } paired
+      ordered vs received kg     (PO kg - MR kg) / 100 x PO rate    } paired
+        (whole bales / loose units when the PO follows the MR weight)
       rate to nearest ₹50        MR kg / 100 x (PO rate - MR rate)  } lines
       unmatched lines            lines without a counterpart, whole difference
       PO total vs its lines      the PO's value minus its lines (0 unless edited)
@@ -699,7 +744,10 @@ def difference_sentence(po_value, base_amount, totals: dict,
     paired = weight is not None or rate is not None
     parts = []                                    # [label, exact]
     if paired:
-        units = "whole bales" if _s(uom).upper() == UOM_BALE else "whole loose units"
+        if totals.get("ordered"):
+            units = "ordered vs received kg"
+        else:
+            units = "whole bales" if _s(uom).upper() == UOM_BALE else "whole loose units"
         parts += [[units, weight or 0.0], [RATE_PART_LABEL, rate or 0.0]]
     parts += [["unmatched lines", _f(totals.get("unmatched")) or 0.0],
               ["PO total vs its lines", po - (_f(totals.get("po_value")) or 0.0)],
@@ -809,7 +857,9 @@ def _hop_state(h: dict, root_id: int, lines_by_mr: dict, lines_by_po: dict) -> d
     # pairing its lines would only print differences that mean nothing: the
     # rows then carry the MR side alone, as when there is no PO.
     po_lines = lines_by_po.get(po_id, []) if is_transfer_po else None
-    recon = reconcile(mr_lines, po_lines, None if po is None else po["uom"])
+    recon = reconcile(mr_lines, po_lines, None if po is None else po["uom"],
+                      lorry_kg=lorry_kg(h.get("orig_po_lorry_qtl")),
+                      po_kg=None if po is None else po["kg"])
     if is_transfer_po:
         checks.extend(f"Forwarding PO {po['full']} — {text}" for text in recon_flags(recon))
         totals = recon_totals(recon)
@@ -859,9 +909,10 @@ def _final_po(tp: dict) -> dict:
 
 
 def _final_state(finals: list, root_status_id, root_status_name, root_mr_no,
-                 root_lines: list, lines_by_po: dict) -> dict:
+                 root_lines: list, lines_by_po: dict, ordered_kg=None) -> dict:
     """The Final PO side of a lorry: the PO(s) carrying its JT|FINAL marker,
-    or why there is none."""
+    or why there is none. `ordered_kg` = the Original PO's lorry (see
+    reconcile)."""
     status = _i(root_status_id)
     returned = is_back_at_mill(root_status_id, root_mr_no)
     pos = [_final_po(tp) for tp in sorted(finals, key=lambda t: _i(t.get("jute_po_id")) or 0)]
@@ -883,7 +934,8 @@ def _final_state(finals: list, root_status_id, root_status_name, root_mr_no,
                 checks.append(f"Final PO {p['full']} is no longer Closed "
                               f"(now {p['status']}) — reopened in the ERP")
         first = pos[0]
-        recon = reconcile(root_lines, lines_by_po.get(first["id"], []), first["uom"])
+        recon = reconcile(root_lines, lines_by_po.get(first["id"], []), first["uom"],
+                          lorry_kg=ordered_kg, po_kg=first["kg"])
         if returned:
             checks.extend(f"Final PO {first['full']} — {text}" for text in recon_flags(recon))
         totals = recon_totals(recon)
@@ -894,7 +946,7 @@ def _final_state(finals: list, root_status_id, root_status_name, root_mr_no,
     elif returned:
         missing = bool(used)
         cell = CELL_NOT_YET if missing else CELL_NA
-        recon = reconcile(root_lines, None)
+        recon = reconcile(root_lines, None, lorry_kg=ordered_kg)
     elif status == MR_STATUS_PENDING:
         cell = CELL_AWAITING
     else:
@@ -930,6 +982,9 @@ def _original_po(first: dict, lines_by_po: dict) -> Optional[dict]:
         "supplier_name": _s(first.get("orig_po_supplier_name")),
         "party_name": _s(first.get("orig_po_party_name")),
         "lorries_ordered": _i(first.get("orig_po_lorries")),
+        "lorry_qtl": _f(first.get("orig_po_lorry_qtl")),
+        # what every transfer PO of this lorry orders (po_helpers.lorry_kg)
+        "lorry_kg": lorry_kg(first.get("orig_po_lorry_qtl")),
         "weight_kg": weight_kg,
         "value": _f(first.get("orig_po_value")),
         "lines": [{
@@ -990,13 +1045,14 @@ def _build_lorry(root_id: int, rows: list, lines_by_mr: dict, lines_by_po: dict,
                  finals: list, positions: dict, siblings_by_po: dict, today) -> dict:
     first = rows[0]                     # the root's columns repeat on every hop row
     root_lines = lines_by_mr.get(root_id, [])
+    orig = _original_po(first, lines_by_po)
     hops = [_hop_state(h, root_id, lines_by_mr, lines_by_po)
             for h in sorted(rows, key=lambda r: _i(r.get("hop_mr_id")) or 0)]
     final = _final_state(finals, first.get("root_status_id"), first.get("root_status_name"),
-                         first.get("root_mr_no"), root_lines, lines_by_po)
+                         first.get("root_mr_no"), root_lines, lines_by_po,
+                         None if orig is None else orig["lorry_kg"])
     status, reason = lorry_status(first.get("root_status_id"),
                                   first.get("root_status_name"), hops, final)
-    orig = _original_po(first, lines_by_po)
     root_status = _i(first.get("root_status_id"))
     returned = final["returned"]
     ge_no = _i(first.get("ge_no"))
@@ -1315,9 +1371,9 @@ def lorries_csv_frame(lorries) -> pd.DataFrame:
 
 LINE_DETAIL_COLUMNS = [
     "GE No", "GE Date", "Mill", "Lorry No", "Supplier", "Party", "PO Kind",
-    "PO No", "PO Date", "PO Company", "MR No", "Quality", "MR Kg", "PO Units",
+    "PO No", "PO Date", "PO Company", "MR No", "Quality", "MR Kg", "Ordered Kg", "PO Units",
     "PO Kg", "MR Rate", "PO Rate", "MR Amount", "PO Value", "Diff",
-    "Whole Unit Diff", "Rate Rounding Diff", "Unmatched Diff", "Root MR Id",
+    "Weight Diff", "Rate Rounding Diff", "Unmatched Diff", "Root MR Id",
     "MR Id", "MR Line Id", "PO Id", "PO Line Id",
 ]
 
@@ -1342,11 +1398,13 @@ def line_detail_frame(lorries) -> pd.DataFrame:
                 "PO No": "" if po is None else po["full"],
                 "PO Date": None if po is None else po["date"],
                 "PO Company": company, "MR No": mr_no, "Quality": r["quality"],
-                "MR Kg": _r2(r["mr_kg"]), "PO Units": _r2(r["po_units"]),
+                "MR Kg": _r2(r["mr_kg"]),
+                "Ordered Kg": _r2(r["expected_kg"]) if r.get("ordered") else None,
+                "PO Units": _r2(r["po_units"]),
                 "PO Kg": _r2(r["po_kg"]), "MR Rate": _r2(r["mr_rate"]),
                 "PO Rate": _r2(r["po_rate"]), "MR Amount": _r2(r["mr_amount"]),
                 "PO Value": _r2(r["po_value"]), "Diff": _r2(r["diff"]),
-                "Whole Unit Diff": _r2(r["weight_part"]),
+                "Weight Diff": _r2(r["weight_part"]),
                 "Rate Rounding Diff": _r2(r["rate_part"]),
                 "Unmatched Diff": _r2(r["unmatched"]),
                 "Root MR Id": l["root_mr_id"], "MR Id": mr_id,
@@ -1411,14 +1469,18 @@ def nothing_found_text(search, fy_start_year: int) -> str:
 
 def recon_table(rows, full: bool = False) -> pd.DataFrame:
     """Reconciliation table of one PO block, ready to show (formatted text,
-    total row last). Compact: Quality | MR kg | PO kg | MR rate | PO rate |
-    Diff; `full` adds PO units, MR amount and PO value."""
+    total row last). Compact: Quality | MR kg | Ordered kg | PO kg | MR rate |
+    PO rate | Diff; `full` adds PO units, MR amount and PO value. 'Ordered
+    kg' -- each line's share of the lorry the Original PO ordered, what the
+    PO line should carry -- is shown only when that lorry is known."""
     totals = recon_totals(rows)
+    ordered = any(r.get("ordered") for r in rows)
 
     def line(label, r, rates=True):
         out = {
             "Quality": label,
             "MR kg": fmt_num(r["mr_kg"]),
+            "Ordered kg": fmt_num(r["expected_kg"]),
             "PO kg": fmt_num(r["po_kg"]),
             "PO units": fmt_num(r["po_units"]),
             "MR rate": fmt_num(r["mr_rate"]) if rates else "",
@@ -1432,9 +1494,11 @@ def recon_table(rows, full: bool = False) -> pd.DataFrame:
     body = [line(r["quality"], r) for r in rows]
     if rows:
         body.append(line("Total", {**totals, "mr_rate": None, "po_rate": None}, rates=False))
-    columns = (["Quality", "MR kg", "PO kg", "PO units", "MR rate", "PO rate",
+    columns = (["Quality", "MR kg", "Ordered kg", "PO kg", "PO units", "MR rate", "PO rate",
                 "MR amount", "PO value", "Diff"] if full
-               else ["Quality", "MR kg", "PO kg", "MR rate", "PO rate", "Diff"])
+               else ["Quality", "MR kg", "Ordered kg", "PO kg", "MR rate", "PO rate", "Diff"])
+    if not ordered:
+        columns.remove("Ordered kg")
     return pd.DataFrame(body, columns=columns)
 
 

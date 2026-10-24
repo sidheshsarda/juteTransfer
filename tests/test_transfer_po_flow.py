@@ -201,7 +201,11 @@ def test_step_1_saves_the_hop_with_a_forwarding_po_on_the_original_supplier(scen
         "supplier_id": sc.supplier, "credit_term": 45, "delivery_days": 7, "status_id": 5,
         "internal_note": build_marker(ROLE_FORWARD, sc.root, hop, sc.po)}
     po_lines = db.rows("jute_po_li", jute_po_id=po["po_id"])
-    assert [(l["quantity"], l["rate"]) for l in po_lines] == [(62.0, 12850.0), (10.0, 12650.0)]
+    # one lorry of X's type (10,000 kg) in the MR's shares, not the 10,753 kg received
+    assert (header["vehicle_type_id"], header["vehicle_quantity"], header["weight"]) == (
+        sc.a_lorry_type, 1, 10000.0)
+    assert [(l["percentage"], l["quantity"], l["rate"]) for l in po_lines] == [
+        (Decimal("86.60"), 58.0, 12850.0), (Decimal("13.40"), 9.0, 12650.0)]
     assert [l["jute_po_li_id"] for l in db.rows("jute_mr_li", jute_mr_id=hop)] == [
         l["jute_po_li_id"] for l in po_lines]
     assert db.count("jute_po_status_log", jute_po_id=po["po_id"]) == 1
@@ -276,9 +280,11 @@ def test_finalize_reprices_the_root_books_the_invoice_and_writes_the_final_po(sc
         "branch_id": sc.a_branch, "po_date": date(2026, 9, 3), "party_id": b_in_a,
         "supplier_id": sc.supplier, "credit_term": None, "delivery_days": None, "status_id": 5,
         "internal_note": build_marker(ROLE_FINAL, sc.root, sc.root, sc.po, ORIGINAL)}
-    assert [(l["quantity"], l["rate"], l["value"])
+    assert header["weight"] == 10000.0
+    assert [(l["percentage"], l["quantity"], l["rate"], l["value"])
             for l in db.rows("jute_po_li", jute_po_id=final["po_id"])] == [
-        (62.0, 12900.0, Decimal("1199700.00")), (10.0, 12700.0, Decimal("190500.00"))]
+        (Decimal("86.60"), 58.0, 12900.0, Decimal("1117140.00")),
+        (Decimal("13.40"), 9.0, 12700.0, Decimal("170180.00"))]
     assert po_state(db, sc.po) == x_before                   # X and its lines untouched
 
 
