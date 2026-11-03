@@ -60,7 +60,8 @@ class Chain:
         self.root = root or sc.root
         self.steps = []                 # saved steps: {"to", "pct", "mr_id", "final"}
 
-    def save(self, to: str, pct: float = 0.0, mr_date: date = date(2026, 9, 1)) -> dict:
+    def save(self, to: str, pct: float = 0.0, mr_date: date = date(2026, 9, 1),
+             **step_kw) -> dict:
         sc = self.sc
         index = len(self.steps)
         co_id, branch_id = sc.co(to), sc.branch(to)
@@ -80,7 +81,7 @@ class Chain:
             pct_rate_increase=pct, total_amount=shown["total_amount"],
             claim_amount=shown["claim_amount"], net_amount=shown["net_amount"],
             warehouse_id=sc.godown(to), mr_no=0, lc_reference_no="", lc_date=None,
-            po_no_for_lc="", order_date_for_lc=None, transfer_transport=True)
+            po_no_for_lc="", order_date_for_lc=None, transfer_transport=True, **step_kw)
         is_final = co_id == sc.a_co and branch_id == sc.a_branch
         source = self.steps[-1]["mr_id"] if self.steps and self.steps[-1]["mr_id"] else self.root
         result = transfer.save_transfer_step(
@@ -200,7 +201,11 @@ def test_step_1_saves_the_hop_with_a_forwarding_po_on_the_original_supplier(scen
         "supplier_id": sc.supplier, "credit_term": 45, "delivery_days": 7, "status_id": 5,
         "internal_note": build_marker(ROLE_FORWARD, sc.root, hop, sc.po)}
     po_lines = db.rows("jute_po_li", jute_po_id=po["po_id"])
-    assert [(l["quantity"], l["rate"]) for l in po_lines] == [(62.0, 12850.0), (10.0, 12650.0)]
+    # one lorry of X's type (10,000 kg) in the MR's shares, not the 10,753 kg received
+    assert (header["vehicle_type_id"], header["vehicle_quantity"], header["weight"]) == (
+        sc.a_lorry_type, 1, 10000.0)
+    assert [(l["percentage"], l["quantity"], l["rate"]) for l in po_lines] == [
+        (Decimal("86.60"), 58.0, 12850.0), (Decimal("13.40"), 9.0, 12650.0)]
     assert [l["jute_po_li_id"] for l in db.rows("jute_mr_li", jute_mr_id=hop)] == [
         l["jute_po_li_id"] for l in po_lines]
     assert db.count("jute_po_status_log", jute_po_id=po["po_id"]) == 1
@@ -275,9 +280,11 @@ def test_finalize_reprices_the_root_books_the_invoice_and_writes_the_final_po(sc
         "branch_id": sc.a_branch, "po_date": date(2026, 9, 3), "party_id": b_in_a,
         "supplier_id": sc.supplier, "credit_term": None, "delivery_days": None, "status_id": 5,
         "internal_note": build_marker(ROLE_FINAL, sc.root, sc.root, sc.po, ORIGINAL)}
-    assert [(l["quantity"], l["rate"], l["value"])
+    assert header["weight"] == 10000.0
+    assert [(l["percentage"], l["quantity"], l["rate"], l["value"])
             for l in db.rows("jute_po_li", jute_po_id=final["po_id"])] == [
-        (62.0, 12900.0, Decimal("1199700.00")), (10.0, 12700.0, Decimal("190500.00"))]
+        (Decimal("86.60"), 58.0, 12900.0, Decimal("1117140.00")),
+        (Decimal("13.40"), 9.0, 12700.0, Decimal("170180.00"))]
     assert po_state(db, sc.po) == x_before                   # X and its lines untouched
 
 
@@ -457,6 +464,25 @@ def test_multi_hop_chain_and_delete_from_the_middle(scenario, po_on):
     assert (mr_state(db, to_b["mr_id"]), po_state(db, to_b["po"]["po_id"])) == hop_b_before
     assert root_header(sc) == reverted_root(sc)
     assert root_rates(sc) == [12850.0, 12650.0]             # step 1's rates
+
+
+def test_every_hop_carries_the_roots_mill_moisture_marka_and_remarks(scenario, po_on):
+    sc, db = scenario, scenario.db
+    date_the_root(sc)
+    db.update("jute_mr", {"jute_mr_id": sc.root}, remarks="lorry 7")
+    for li_id, mill, marka in zip(sc.root_lines, ("26.50", "23.25"), ("RK", "SB/2")):
+        db.update("jute_mr_li", {"jute_mr_li_id": li_id}, mill_moisture=mill, marka=marka,
+                  remarks=f"line {marka}")
+    chain = Chain(sc)
+
+    hops = [chain.save("B", mr_date=date(2026, 9, 1))["mr_id"],
+            chain.save("C", pct=0.5, mr_date=date(2026, 9, 2))["mr_id"]]
+
+    keys = ("mill_moisture", "actual_moisture", "marka", "remarks")
+    root = [{k: l[k] for k in keys} for l in db.rows("jute_mr_li", jute_mr_id=sc.root, active=1)]
+    for hop in hops:
+        assert [{k: l[k] for k in keys} for l in db.rows("jute_mr_li", jute_mr_id=hop)] == root
+        assert db.row("jute_mr", jute_mr_id=hop)["remarks"] == "lorry 7"
 
 
 def test_deleting_a_step_takes_the_invoice_of_the_highest_earlier_hop(scenario, po_on):

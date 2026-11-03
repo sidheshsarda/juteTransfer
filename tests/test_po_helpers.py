@@ -1,5 +1,8 @@
-"""Pure math behind transfer POs: rate rounded to the closest 50, quantity in
-whole bales / loose units, value, provenance marker, printed PO number."""
+"""Pure math behind transfer POs: rate rounded to the closest 50, the quantity
+of one lorry of the Original PO's lorry type split over the MR's lines by
+received weight (percentage mode) -- or, without a lorry type, whole bales /
+loose units nearest the received weight -- value, provenance marker, printed
+PO number."""
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -15,10 +18,12 @@ from src.jutetransfer.po_helpers import (
     final_marker_like,
     format_po_no,
     fy_label,
+    lorry_kg,
     normalise_uom,
     parse_marker,
     po_totals,
     round_rate,
+    split_percentages,
     unit_kg,
 )
 
@@ -99,6 +104,122 @@ def _hop_28171_lines():
          "marka": None, "crop_year": None, "allowable_moisture": 20.0},
     ]
 
+
+# --- one lorry of the Original PO's lorry type (owner rule 2026-10-24) ------
+
+@pytest.mark.parametrize("capacity, expected", [
+    (100, 10000.0), (160.0, 16000.0), (Decimal("120"), 12000.0), ("140", 14000.0),
+    (100.5, 10050.0),
+])
+def test_lorry_kg_is_the_capacity_in_quintals_times_100(capacity, expected):
+    assert lorry_kg(capacity) == expected
+
+
+@pytest.mark.parametrize("capacity", [None, 0, 0.0, -5, float("nan"), "", "abc"])
+def test_lorry_kg_missing_capacity_is_none(capacity):
+    assert lorry_kg(capacity) is None
+
+
+@pytest.mark.parametrize("weights, expected", [
+    ([9312, 1441], ["86.60", "13.40"]),                 # live GE 21: 86.599 / 13.401
+    ([9312, 1441, 700], ["81.31", "12.58", "6.11"]),    # 81.306 / 12.582 / 6.112
+    ([1, 1, 1], ["33.34", "33.33", "33.33"]),           # leftover to the first of equals
+    ([2, 1, 1], ["50.00", "25.00", "25.00"]),
+    ([6250, 6250], ["50.00", "50.00"]),
+    ([100, 0, 50], ["66.67", "0.00", "33.33"]),         # a zero line keeps its place
+    ([5000], ["100.00"]),
+])
+def test_split_percentages_two_decimals_summing_to_100(weights, expected):
+    pcts = split_percentages(weights)
+    assert [str(p) for p in pcts] == expected
+    assert sum(pcts) == Decimal("100.00")
+
+
+def test_split_percentages_nothing_to_split():
+    assert split_percentages([]) == []
+    assert split_percentages([0, None, float("nan")]) == []
+
+
+def test_lorry_shares_percentage_mode_from_live_hop():
+    """GE 21 (10,753 kg received) on a 100-quintal lorry type: the PO orders
+    10,000 kg in the lines' shares; units are the ERP's informational count."""
+    lines = build_po_lines(_hop_28171_lines(), "BALE", default_crop_year=26, lorry_kg=10000)
+    assert [l["jute_mr_li_id"] for l in lines] == [45569, 45570]
+    assert [l["percentage"] for l in lines] == [86.6, 13.4]
+    assert [l["line_kg"] for l in lines] == [8660.0, 1340.0]
+    assert [l["quantity"] for l in lines] == [58.0, 9.0]          # 57.73 / 8.93 bales
+    assert [l["accepted_weight"] for l in lines] == [9312.0, 1441.0]   # the MR untouched
+    assert [l["rate"] for l in lines] == [12850.0, 12650.0]
+    assert [l["value"] for l in lines] == [1112810.0, 169510.0]  # 86.6 q / 13.4 q
+    assert po_totals(lines) == (10000.0, 1282320.0)
+
+
+def test_lorry_shares_loose_units_and_odd_capacities():
+    lines = build_po_lines(_hop_28171_lines(), "LOOSE", lorry_kg=12000)
+    assert [l["line_kg"] for l in lines] == [10392.0, 1608.0]
+    assert [l["quantity"] for l in lines] == [217.0, 34.0]       # 216.5 up / 33.5 up
+    assert po_totals(lines)[0] == 12000.0
+    lines = build_po_lines(_hop_28171_lines(), "BALE", lorry_kg=10050)   # 100.5 quintals
+    assert [l["line_kg"] for l in lines] == [8703.3, 1346.7]
+    assert po_totals(lines)[0] == 10050.0
+
+
+def test_lorry_shares_add_up_to_an_odd_lorry_to_the_gram():
+    """100.5 quintals over three equal lines: 33.34 / 33.33 / 33.33 % give
+    3,350.67 / 3,349.665 / 3,349.665 kg -- exact, so the header is the lorry."""
+    mr = [{"jute_mr_li_id": i, "actual_item_id": 1, "accepted_weight": 700, "rate": 13000,
+           "active": 1} for i in (1, 2, 3)]
+    lines = build_po_lines(mr, "BALE", lorry_kg=10050)
+    assert [l["line_kg"] for l in lines] == [3350.67, 3349.665, 3349.665]
+    assert po_totals(lines)[0] == 10050.0
+    assert [l["value"] for l in lines] == [435587.1, 435456.45, 435456.45]
+
+
+def test_lorry_shares_a_share_of_0_percent_has_no_units():
+    """As the ERP derives it (round(kg / unit)): a line too light to reach
+    0.01 % keeps its place with 0.00 %, 0 kg, 0 units, 0 value -- never the
+    one-unit floor of quantity mode."""
+    mr = [{"jute_mr_li_id": 1, "actual_item_id": 1, "accepted_weight": 100, "rate": 13000, "active": 1},
+          {"jute_mr_li_id": 2, "actual_item_id": 2, "accepted_weight": 0.01, "rate": 13000, "active": 1},
+          {"jute_mr_li_id": 3, "actual_item_id": 3, "accepted_weight": 5000, "rate": 13000, "active": 1}]
+    lines = build_po_lines(mr, "BALE", lorry_kg=10000)
+    assert [(l["percentage"], l["line_kg"], l["quantity"], l["value"]) for l in lines] == [
+        (1.96, 196.0, 1, 25480.0), (0.0, 0.0, 0, 0.0), (98.04, 9804.0, 65, 1274520.0)]
+    assert sum(l["percentage"] for l in lines) == 100.0
+    # a 60 kg share is 0 bales in the ERP's count too (0.4 rounds down)
+    light = build_po_lines([mr[0], dict(mr[2], accepted_weight=100 * 9940 / 60)], "BALE",
+                           lorry_kg=10000)
+    assert light[0]["line_kg"] == 60.0 and light[0]["quantity"] == 0
+
+
+def test_lorry_shares_value_follows_the_line_kg_not_the_units():
+    """As the ERP's percentage mode: value = percentage weight / 100 x rate;
+    quantity x 150 would give another figure (8,700 / 1,350 kg)."""
+    for l in build_po_lines(_hop_28171_lines(), "BALE", lorry_kg=10000):
+        assert l["value"] == float(
+            (Decimal(str(l["line_kg"])) / 100 * Decimal(str(l["rate"]))).quantize(Decimal("0.01")))
+        assert l["line_kg"] != l["quantity"] * 150
+
+
+def test_lorry_shares_skip_the_same_lines_as_quantity_mode():
+    mr_lines = _hop_28171_lines() + [
+        {"jute_mr_li_id": 45571, "actual_item_id": 5, "accepted_weight": 0, "rate": 100, "active": 1},
+        {"jute_mr_li_id": 45572, "actual_item_id": 5, "accepted_weight": 500, "rate": 100, "active": 0},
+    ]
+    lines = build_po_lines(mr_lines, "BALE", lorry_kg=10000)
+    assert [l["jute_mr_li_id"] for l in lines] == [45569, 45570]
+    assert sum(l["percentage"] for l in lines) == 100.0
+
+
+@pytest.mark.parametrize("no_lorry", [None, 0, 0.0, float("nan")])
+def test_without_a_lorry_the_quantity_mode_rule_applies(no_lorry):
+    lines = build_po_lines(_hop_28171_lines(), "BALE", lorry_kg=no_lorry)
+    assert [l["percentage"] for l in lines] == [None, None]
+    assert [l["quantity"] for l in lines] == [62.0, 10.0]
+    assert po_totals(lines) == (10800.0, 1384800.0)
+
+
+# --- quantity mode (no Original PO lorry type) ------------------------------
 
 def test_forward_po_lines_from_live_hop():
     lines = build_po_lines(_hop_28171_lines(), "BALE", default_crop_year=26)
