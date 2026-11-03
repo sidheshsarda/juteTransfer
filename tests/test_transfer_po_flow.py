@@ -466,6 +466,25 @@ def test_multi_hop_chain_and_delete_from_the_middle(scenario, po_on):
     assert root_rates(sc) == [12850.0, 12650.0]             # step 1's rates
 
 
+def test_every_hop_carries_the_roots_mill_moisture_marka_and_remarks(scenario, po_on):
+    sc, db = scenario, scenario.db
+    date_the_root(sc)
+    db.update("jute_mr", {"jute_mr_id": sc.root}, remarks="lorry 7")
+    for li_id, mill, marka in zip(sc.root_lines, ("26.50", "23.25"), ("RK", "SB/2")):
+        db.update("jute_mr_li", {"jute_mr_li_id": li_id}, mill_moisture=mill, marka=marka,
+                  remarks=f"line {marka}")
+    chain = Chain(sc)
+
+    hops = [chain.save("B", mr_date=date(2026, 9, 1))["mr_id"],
+            chain.save("C", pct=0.5, mr_date=date(2026, 9, 2))["mr_id"]]
+
+    keys = ("mill_moisture", "actual_moisture", "marka", "remarks")
+    root = [{k: l[k] for k in keys} for l in db.rows("jute_mr_li", jute_mr_id=sc.root, active=1)]
+    for hop in hops:
+        assert [{k: l[k] for k in keys} for l in db.rows("jute_mr_li", jute_mr_id=hop)] == root
+        assert db.row("jute_mr", jute_mr_id=hop)["remarks"] == "lorry 7"
+
+
 def test_deleting_a_step_takes_the_invoice_of_the_highest_earlier_hop(scenario, po_on):
     """A -> B -> C -> B visits B twice. "Delete from step 2" removes the later
     B hop and then C, each with the sale that created it: the later B hop's
