@@ -5,7 +5,9 @@ period / mill options, "PO Lorries n of m", banners, table and CSV frames.
 The fixtures mirror the live GE 21 lorry (Empire -> Jagrati -> Empire,
 31-Aug-2026, original PO EJM/F/JPO/26-27/00011), the worked example of
 design-review-3 section 2.2; PO lines are built with po_helpers.build_po_lines,
-i.e. exactly as po_ops writes them.
+i.e. exactly as po_ops writes them: since 2026-10-24 one lorry of the Original
+PO's lorry type (100 quintals = 10,000 kg) in the MR lines' shares -- 8,660 /
+1,340 kg against 9,312 / 1,441 kg received -- so a PO is ~7 % under the MR.
 """
 import re
 from datetime import date
@@ -19,6 +21,9 @@ from src.jutetransfer.po_helpers import build_po_lines, po_totals
 ROOT, HOP = 28137, 28290
 ORIG_PO, FWD_PO, FINAL_PO = 13314, 20001, 20002
 TODAY = date(2026, 10, 2)
+# the Original PO's lorry type: 100 quintals, so every transfer PO of the
+# lorry orders 10,000 kg (po_helpers.lorry_kg) in the MR lines' shares
+LORRY_QTL, LORRY_KG = 100.0, 10000.0
 
 # the marker po_ops writes today (po_helpers.build_marker); older tails are
 # covered by test_final_marker_with_trailing_fields_is_found
@@ -49,16 +54,17 @@ def root_lines(root=ROOT, returned=False):
             mr_line(root * 10 + 2, root, 106, 1441.0, r6, "TD-6")]
 
 
-def po_lines_for(po_id, mr_lines, uom="BALE"):
-    """PO lines as po_ops writes them; hop lines get linked like po_ops does."""
+def po_lines_for(po_id, mr_lines, uom="BALE", lorry_kg=LORRY_KG):
+    """PO lines as po_ops writes them (percentage mode on the ordered lorry;
+    `lorry_kg=None` = quantity mode); hop lines get linked like po_ops does."""
     names = {l["jute_mr_li_id"]: l["item_name"] for l in mr_lines}
     out = []
-    for n, pl in enumerate(build_po_lines(mr_lines, uom)):
+    for n, pl in enumerate(build_po_lines(mr_lines, uom, lorry_kg=lorry_kg)):
         out.append({"jute_po_li_id": po_id * 10 + n, "jute_po_id": po_id,
                     "item_id": pl["item_id"], "item_name": names[pl["jute_mr_li_id"]],
                     "quantity": pl["quantity"], "rate": pl["rate"], "value": pl["value"],
-                    "percentage": None, "jute_uom": uom, "active": 1,
-                    "_mr_li": pl["jute_mr_li_id"]})
+                    "percentage": pl["percentage"], "jute_uom": uom, "active": 1,
+                    "_mr_li": pl["jute_mr_li_id"], "_line_kg": pl["line_kg"]})
     return out
 
 
@@ -81,7 +87,8 @@ def hop_row(root=ROOT, hop=HOP, ge_no=21, ge_date=date(2026, 8, 31), returned=Fa
         "broker_name": "shyamji", "root_party_name": "JAGRATI TRADE SERVICES PVT. LTD.",
         "orig_po_no": orig_no, "orig_po_date": date(2026, 8, 25), "orig_po_status_id": 5,
         "orig_po_close_type": "AUTO", "orig_po_weight": 20000.0, "orig_po_value": 2570000.0,
-        "orig_po_lorries": 2, "orig_po_supplier_name": "shyamji",
+        "orig_po_lorries": 2, "orig_po_lorry_qtl": LORRY_QTL,
+        "orig_po_supplier_name": "shyamji",
         "orig_po_party_name": "HONEYWELL COMMERCIAL PVT. LTD.",
         "orig_po_co_prefix": "EJM", "orig_po_branch_prefix": "F",
     }
@@ -94,7 +101,7 @@ def hop_row(root=ROOT, hop=HOP, ge_no=21, ge_date=date(2026, 8, 31), returned=Fa
 
 def transfer_po_row(po_id, po_no, note, *, co_prefix, branch_prefix, lines,
                     status_id=5, po_date=date(2026, 9, 2), party="JAGRATI TRADE SERVICES PVT. LTD."):
-    kg, value = po_totals([{"line_kg": l["quantity"] * 150, "value": l["value"]} for l in lines])
+    kg, value = po_totals([{"line_kg": l["_line_kg"], "value": l["value"]} for l in lines])
     return {"jute_po_id": po_id, "po_no": po_no, "po_date": po_date, "branch_id": 29,
             "status_id": status_id, "close_type": "TRANSFER" if status_id == 5 else None,
             "weight": kg, "jute_po_value": value, "jute_uom": "BALE", "internal_note": note,
@@ -307,8 +314,77 @@ def test_check_final_po_on_an_approved_mr_without_its_number():
 def test_check_weight_more_than_half_a_unit_off():
     s = scenario()
     line = fwd_po_line(s, 0)
-    line["quantity"] = 64.0                         # 9,600 kg against 9,312
-    assert "more than half a bale apart" in _check_reason(s)
+    line["percentage"] = 80.0                       # 8,000 kg against 8,660 ordered
+    reason = _check_reason(s)
+    assert ("TD-5: PO 8,000 kg against 8,660 kg ordered for the lorry (MR 9,312 kg) "
+            "is more than half a bale apart") in reason
+
+
+def test_unit_count_of_a_percentage_line_is_informational():
+    """The ERP derives a percentage line's weight from its percentage, never
+    from the unit count: a wrong count is not a weight check."""
+    s = scenario()
+    fwd_po_line(s, 0)["quantity"] = 64.0
+    assert one(s)["status"] == "Awaiting return"
+    rows = one(s)["hops"][0]["recon"]
+    assert [(r["po_units"], r["po_kg"]) for r in rows] == [(64.0, 8660.0), (9.0, 1340.0)]
+
+
+def test_check_old_shape_po_against_the_ordered_lorry():
+    """A transfer PO written before 2026-10-24 (the pilot's: whole bales of
+    the received weight, no percentage) is flagged against the lorry the
+    Original PO ordered, until it is re-made."""
+    s = scenario()
+    s["po_lines"] = [p for p in s["po_lines"] if p["jute_po_id"] != FWD_PO]
+    old = po_lines_for(FWD_PO, hop_lines(), lorry_kg=None)        # 62 / 10 bales
+    by_li = {p["_mr_li"]: p["jute_po_li_id"] for p in old}
+    for m in s["mr_lines"]:
+        if m["jute_mr_id"] == HOP:
+            m["jute_po_li_id"] = by_li[m["jute_mr_li_id"]]
+    s["po_lines"] += old
+    s["hops"][0].update(fwd_po_weight=10800.0, fwd_po_value=1384800.0)
+    l = one(s)
+    assert l["status"] == "Check"
+    assert ("TD-5: PO 9,300 kg against 8,660 kg ordered for the lorry (MR 9,312 kg) is "
+            "more than half a bale apart") in l["status_reason"]
+    assert ("TD-6: PO 1,500 kg against 1,340 kg ordered for the lorry (MR 1,441 kg) is "
+            "more than half a bale apart") in l["status_reason"]
+
+
+def test_percentage_po_whose_original_lorry_is_gone_is_measured_against_its_own_lorry():
+    """The Original PO's lorry type was removed from the master after the
+    transfer PO was written: the PO still orders one lorry (its header kg),
+    so its lines are compared with their share of that, not with the MR."""
+    s = scenario(returned=True)
+    s["hops"][0]["orig_po_lorry_qtl"] = None
+    l = one(s)
+    assert l["status"] == "Completed" and l["orig"]["lorry_kg"] is None
+    rows = l["hops"][0]["recon"]
+    assert [(r["po_kg"], round(r["expected_kg"], 2), r["ordered"], r["pct_mode"]) for r in rows] == [
+        (8660.0, 8659.91, True, True), (1340.0, 1340.09, True, True)]
+    assert list(H.recon_table(rows).columns)[2] == "Ordered kg"
+    assert H.recon_flags(l["final"]["recon"]) == []
+
+
+def test_original_po_without_a_lorry_type_compares_with_the_received_weight():
+    """No capacity to order from: the PO follows the MR weight (quantity
+    mode) and the old wording and tolerance apply."""
+    s = scenario()
+    s["hops"][0]["orig_po_lorry_qtl"] = None
+    s["po_lines"] = [p for p in s["po_lines"] if p["jute_po_id"] != FWD_PO]
+    old = po_lines_for(FWD_PO, hop_lines(), lorry_kg=None)
+    by_li = {p["_mr_li"]: p["jute_po_li_id"] for p in old}
+    for m in s["mr_lines"]:
+        if m["jute_mr_id"] == HOP:
+            m["jute_po_li_id"] = by_li[m["jute_mr_li_id"]]
+    s["po_lines"] += old
+    s["hops"][0].update(fwd_po_weight=10800.0, fwd_po_value=1384800.0)
+    l = one(s)
+    assert l["status"] == "Awaiting return" and l["orig"]["lorry_kg"] is None
+    t = H.recon_totals(l["hops"][0]["recon"])
+    assert not t["ordered"]
+    assert H.difference_sentence(l["fwd_value"], l["mr_amt"], t, "MR", "BALE") == (
+        "PO 1,384,800 vs MR 1,378,878: +5,922 (+0.43 %) — whole bales +5,922 · rate unchanged.")
 
 
 def test_check_rate_more_than_25_off():
@@ -321,7 +397,8 @@ def test_rounding_within_tolerance_is_not_a_check():
     s = scenario(returned=True)
     # live-like rounding: 12,914 -> 12,900 (14 off), 1,441 kg -> 10 bales (59 off)
     assert one(s)["status"] == "Completed"
-    rows = H.reconcile(hop_lines(), [dict(fwd_po_line(s, 0), rate=12875.0)])
+    rows = H.reconcile(hop_lines(), [dict(fwd_po_line(s, 0), rate=12875.0)], "BALE",
+                       lorry_kg=LORRY_KG)
     assert H.recon_flags(rows[:1]) == []            # 25 off: still rounding
 
 
@@ -441,15 +518,19 @@ def test_forwarding_po_reconciles_with_the_hop_mr():
     l = one(scenario())
     rows = l["hops"][0]["recon"]
     assert [(r["quality"], r["mr_kg"], r["po_kg"], r["mr_rate"], r["po_rate"]) for r in rows] == [
-        ("TD-5", 9312.0, 9300.0, 12850.0, 12850.0),
-        ("TD-6", 1441.0, 1500.0, 12650.0, 12650.0),
+        ("TD-5", 9312.0, 8660.0, 12850.0, 12850.0),
+        ("TD-6", 1441.0, 1340.0, 12650.0, 12650.0),
     ]
-    assert l["fwd_kg"] == 10800.0 and l["fwd_value"] == 1384800.0
-    assert l["fwd_diff"] == pytest.approx(5921.5)
+    # each line's share of the 10,000 kg lorry: 9312 / 10753, 1441 / 10753
+    assert [round(r["expected_kg"], 2) for r in rows] == [8659.91, 1340.09]
+    assert l["orig"]["lorry_kg"] == 10000.0 and l["orig"]["lorry_qtl"] == 100.0
+    assert l["fwd_kg"] == 10000.0 and l["fwd_value"] == 1282320.0
+    assert l["fwd_diff"] == pytest.approx(-96558.5)
     t = H.recon_totals(rows)
+    assert t["ordered"] and t["po_kg"] == 10000.0
     # no rate moved: 'rate unchanged', never the old 'rate to nearest 50 0'
     assert H.difference_sentence(l["fwd_value"], l["mr_amt"], t, "MR", "BALE") == (
-        "PO 1,384,800 vs MR 1,378,878: +5,922 (+0.43 %) — whole bales +5,922 · "
+        "PO 1,282,320 vs MR 1,378,878: -96,558 (-7.00 %) — ordered vs received kg -96,558 · "
         "rate unchanged.")
 
 
@@ -457,14 +538,14 @@ def test_final_po_reproduces_the_worked_example():
     l = one(scenario(returned=True))
     rows = l["final"]["recon"]
     assert [(r["po_kg"], r["po_rate"], r["mr_rate"]) for r in rows] == [
-        (9300.0, 12900.0, 12914.0), (1500.0, 12700.0, 12713.0)]
-    assert (l["final_value"], l["inv_amt"], l["final_diff"]) == (1390200.0, 1385746.0, 4454.0)
+        (8660.0, 12900.0, 12914.0), (1340.0, 12700.0, 12713.0)]
+    assert (l["final_value"], l["inv_amt"], l["final_diff"]) == (1287320.0, 1385746.0, -98426.0)
     t = H.recon_totals(rows)
-    assert round(t["weight_part"], 2) == 5945.0
+    assert round(t["weight_part"], 2) == -96935.0
     assert round(t["rate_part"], 2) == -1491.01
     assert H.difference_sentence(l["final_value"], l["inv_amt"], t, "invoice", "BALE") == (
-        "PO 1,390,200 vs invoice 1,385,746: +4,454 (+0.32 %) — whole bales +5,945 · "
-        "rate to nearest ₹50: -1,491.")
+        "PO 1,287,320 vs invoice 1,385,746: -98,426 (-7.10 %) — ordered vs received kg "
+        "-96,935 · rate to nearest ₹50: -1,491.")
 
 
 def test_weight_part_plus_rate_part_is_exactly_the_difference():
@@ -520,10 +601,10 @@ def test_reconcile_pairs_unlinked_lines_by_item_and_flags_leftovers():
     mr = root_lines(returned=True)
     po = po_lines_for(FINAL_PO, mr)
     po.append(dict(po[0], jute_po_li_id=999, item_id=4242, item_name="TD-4"))
-    rows = H.reconcile(mr, po, "BALE")
+    rows = H.reconcile(mr, po, "BALE", lorry_kg=LORRY_KG)
     assert [(r["quality"], r["mr_kg"] is None) for r in rows] == [
         ("TD-5", False), ("TD-6", False), ("TD-4", True)]
-    assert H.recon_flags(rows) == ["TD-4: PO line of 9,300 kg has no MR line"]
+    assert H.recon_flags(rows) == ["TD-4: PO line of 8,660 kg has no MR line"]
 
 
 def test_unpaired_lines_are_unmatched_and_listed_after_the_paired_ones():
@@ -534,7 +615,7 @@ def test_unpaired_lines_are_unmatched_and_listed_after_the_paired_ones():
     po = po_lines_for(FINAL_PO, mr)
     po.append(dict(po[0], jute_po_li_id=999, item_id=4242, item_name="TD-4"))   # no MR line
     no_po_line = mr_line(ROOT * 10, ROOT, 107, 480.0, 12000.0, "TD-7")          # first by id
-    rows = H.reconcile([no_po_line] + mr, po, "BALE")
+    rows = H.reconcile([no_po_line] + mr, po, "BALE", lorry_kg=LORRY_KG)
     assert [(r["quality"], r["paired"]) for r in rows] == [
         ("TD-5", True), ("TD-6", True), ("TD-7", False), ("TD-4", False)]
     td7, td4 = rows[2], rows[3]
@@ -543,7 +624,7 @@ def test_unpaired_lines_are_unmatched_and_listed_after_the_paired_ones():
     assert (td4["weight_part"], td4["rate_part"]) == (None, None)
     assert td4["unmatched"] == td4["diff"] == td4["po_value"]
     t = H.recon_totals(rows)
-    assert round(t["weight_part"], 2) == 5945.0 and round(t["rate_part"], 2) == -1491.01
+    assert round(t["weight_part"], 2) == -96935.0 and round(t["rate_part"], 2) == -1491.01
     assert t["unmatched"] == td7["diff"] + td4["diff"]
     assert t["weight_part"] + t["rate_part"] + t["unmatched"] == pytest.approx(t["diff"], abs=1e-6)
 
@@ -558,10 +639,10 @@ def test_final_po_without_its_lines_is_told_as_unmatched_not_as_rate():
     t = H.recon_totals(l["final"]["recon"])
     assert t["weight_part"] is None and t["rate_part"] is None
     assert H.difference_sentence(l["final_value"], l["inv_amt"], t, "invoice", "BALE") == (
-        "PO 1,390,200 vs invoice 1,385,746: +4,454 (+0.32 %) — unmatched lines -1,385,746 · "
-        "PO total vs its lines +1,390,200.")
+        "PO 1,287,320 vs invoice 1,385,746: -98,426 (-7.10 %) — unmatched lines -1,385,746 · "
+        "PO total vs its lines +1,287,320.")
     final_rows = H.line_detail_frame([l]).query("`PO Kind` == 'Final'")
-    assert final_rows["Whole Unit Diff"].isna().all() and final_rows["Rate Rounding Diff"].isna().all()
+    assert final_rows["Weight Diff"].isna().all() and final_rows["Rate Rounding Diff"].isna().all()
     assert final_rows["Unmatched Diff"].sum() == pytest.approx(final_rows["Diff"].sum())
 
 
@@ -571,9 +652,9 @@ def test_split_adds_up_with_paired_and_unmatched_lines():
     hop = one(s)["hops"][0]
     t = H.recon_totals(hop["recon"])
     assert H.difference_sentence(hop["po"]["value"], hop["mr_amount"], t, "MR", "BALE") == (
-        "PO 1,384,800 vs MR 1,378,878: +5,922 (+0.43 %) — whole bales -1,542 · rate unchanged"
-        " · unmatched lines -182,286 · PO total vs its lines +189,750.")
-    assert -1542 - 182286 + 189750 == 5922    # the printed parts add up to the difference
+        "PO 1,282,320 vs MR 1,378,878: -96,558 (-7.00 %) — ordered vs received kg -83,782 · "
+        "rate unchanged · unmatched lines -182,286 · PO total vs its lines +169,510.")
+    assert -83782 - 182286 + 169510 == -96558   # the printed parts add up to the difference
 
 
 def test_hand_linked_erp_po_is_not_compared_line_by_line():
@@ -598,14 +679,20 @@ def test_hand_linked_erp_po_is_not_compared_line_by_line():
 def test_recon_table_compact_and_full():
     l = one(scenario(returned=True))
     compact = H.recon_table(l["final"]["recon"])
-    assert list(compact.columns) == ["Quality", "MR kg", "PO kg", "MR rate", "PO rate", "Diff"]
+    assert list(compact.columns) == ["Quality", "MR kg", "Ordered kg", "PO kg", "MR rate",
+                                     "PO rate", "Diff"]
+    assert compact.iloc[0]["Ordered kg"] == "8,660"          # 9,312 / 10,753 of the lorry
     assert compact.iloc[-1].to_dict() == {"Quality": "Total", "MR kg": "10,753",
-                                          "PO kg": "10,800", "MR rate": "", "PO rate": "",
-                                          "Diff": "+4,454"}
+                                          "Ordered kg": "10,000", "PO kg": "10,000",
+                                          "MR rate": "", "PO rate": "", "Diff": "-98,426"}
     full = H.recon_table(l["final"]["recon"], full=True)
-    assert list(full.columns) == ["Quality", "MR kg", "PO kg", "PO units", "MR rate",
+    assert list(full.columns) == ["Quality", "MR kg", "Ordered kg", "PO kg", "PO units", "MR rate",
                                   "PO rate", "MR amount", "PO value", "Diff"]
-    assert full.iloc[0]["PO units"] == "62"
+    assert full.iloc[0]["PO units"] == "58"
+    # no Original PO lorry type: nothing is ordered per line, the column goes
+    rows = H.reconcile(hop_lines(), po_lines_for(FWD_PO, hop_lines(), lorry_kg=None), "BALE")
+    assert list(H.recon_table(rows).columns) == ["Quality", "MR kg", "PO kg", "MR rate",
+                                                 "PO rate", "Diff"]
 
 
 # --- search (design-review-3 section 3.9) ----------------------------------------
@@ -789,7 +876,7 @@ def test_totals_and_summary_lines():
         "2 original POs · 3 lorries transferred · 2 forwarding POs · 0 final POs · "
         "3 awaiting return · 1 without PO yet · 0 need attention")
     assert H.totals_line(t) == ("Total 3 lorries: MR 32,259 kg, amount 4,136,636 · 2 Fwd POs "
-                                "21,600 kg, value 2,769,600 (diff +11,843) · no Final PO")
+                                "20,000 kg, value 2,564,640 (diff -193,117) · no Final PO")
 
 
 def test_summary_counts_only_check_and_other_as_attention():
@@ -877,7 +964,7 @@ def test_lorries_frame_compact_and_full():
     assert len(full.columns) == 31 and full.columns[0] == "Lorry"
     assert full.iloc[0]["Lorry"] == "GE 21 · 31 Aug"
     assert full.iloc[0]["MR Kg"] == 10753 and str(full["MR Kg"].dtype) == "Int64"
-    assert full.iloc[0]["Final Diff"] == 4454 and full.iloc[0]["Fwd Rate"] == "12,650–12,850"
+    assert full.iloc[0]["Final Diff"] == -98426 and full.iloc[0]["Fwd Rate"] == "12,650–12,850"
     compact = H.lorries_frame(lorries, full=False)
     assert list(compact.columns) == ["Lorry", "Orig PO", "Fwd PO", "Final PO", "Status",
                                      "Supplier", "MR Kg"]
@@ -917,7 +1004,7 @@ def test_line_detail_csv_one_row_per_po_line():
     ]
     final_rows = frame[frame["PO Kind"] == "Final"]
     assert round(final_rows["Diff"].sum(), 2) == round(
-        final_rows["Whole Unit Diff"].sum() + final_rows["Rate Rounding Diff"].sum(), 2)
+        final_rows["Weight Diff"].sum() + final_rows["Rate Rounding Diff"].sum(), 2)
     assert frame["Unmatched Diff"].isna().all()       # every line paired
 
 
@@ -1076,10 +1163,10 @@ def test_page_renders_every_chip_view_and_search(monkeypatch):
     at.session_state["pot_period"] = "M:2026-08"
     at.session_state["pot_sel_root"] = 101
     markdown, _info, _rows = run()
-    assert ("PO 1,384,800 vs MR 1,378,878: +5,922 (+0.43 %) — whole bales +5,922 · "
-            "rate unchanged.") in markdown
-    assert ("PO 1,390,200 vs invoice 1,385,746: +4,454 (+0.32 %) — whole bales +5,945 · "
-            "rate to nearest ₹50: -1,491.") in markdown
+    assert ("PO 1,282,320 vs MR 1,378,878: -96,558 (-7.00 %) — ordered vs received kg "
+            "-96,558 · rate unchanged.") in markdown
+    assert ("PO 1,287,320 vs invoice 1,385,746: -98,426 (-7.10 %) — ordered vs received kg "
+            "-96,935 · rate to nearest ₹50: -1,491.") in markdown
 
     at.session_state["pot_view"] = "Original POs"
     for chip in H.SHOW_OPTIONS:

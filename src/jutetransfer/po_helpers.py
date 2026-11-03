@@ -4,6 +4,14 @@ A transfer PO is the purchase order juteTransfer writes for a vertical-chain
 transfer: a FORWARD PO with every hop MR at a forwarding company, and a FINAL
 PO at the origin company when the chain is finalized. Design:
 docs/superpowers/specs/2026-10-01-transfer-po-design.md.
+
+Quantity (owner rule 2026-10-24): a transfer PO orders what the Original PO
+ordered for ONE lorry -- the capacity of the Original PO's lorry type -- not
+what the lorry weighed. It is written in the ERP's percentage mode (one lorry
+of that type, each line a percentage), so the ERP PO page shows the same
+quantity as the Original PO, split equally over its lorries. Without an
+Original PO lorry type the PO falls back to the received weight in whole
+bales / loose units (quantity mode).
 """
 
 import re
@@ -98,34 +106,78 @@ def equivalent_units(weight_kg, unit: int) -> int:
     return max(1, int(units))
 
 
+def lorry_kg(capacity_qtl) -> Optional[float]:
+    """What the ERP orders for one lorry of a lorry type: its capacity in
+    quintals x 100 kg (jutePO.derive_from_percentage with vehicle_quantity 1).
+    None when there is no capacity, so the caller falls back to the received
+    weight."""
+    cap = _num(capacity_qtl)
+    if cap is None or cap <= 0:
+        return None
+    return float(Decimal(str(cap)) * 100)
+
+
+def split_percentages(weights) -> list:
+    """Each weight's share of their total, as a percentage with two decimals
+    (jute_po_li.percentage is DECIMAL(5,2)), summing to exactly 100.00 -- the
+    ERP refuses a PO whose percentages do not. Rounding's leftover goes to the
+    largest share (the first of equals). Empty or all-zero input: []."""
+    ws = [Decimal(str(_num(w) or 0.0)) for w in weights]
+    total = sum(ws)
+    if not ws or total <= 0:
+        return []
+    cent = Decimal("0.01")
+    pcts = [(w / total * 100).quantize(cent, rounding=ROUND_HALF_UP) for w in ws]
+    left = Decimal("100.00") - sum(pcts)
+    if left:
+        biggest = max(range(len(ws)), key=lambda i: (ws[i], -i))
+        pcts[biggest] += left
+    return pcts
+
+
 def _is_active(line) -> bool:
     active = line.get("active")
     a = _num(active)
     return active is None or a is None or int(a) == 1
 
 
-def build_po_lines(mr_lines, uom: str, default_crop_year=None) -> list:
+def build_po_lines(mr_lines, uom: str, default_crop_year=None, lorry_kg=None) -> list:
     """PO lines for one MR: one per active MR line with accepted weight > 0,
     in jute_mr_li_id order.
 
-    The PO is written in the ERP's quantity mode (no percentages): quantity
-    is the whole number of bales / loose units nearest the accepted weight,
-    line weight is quantity x unit kg, value is line kg / 100 x the rate
-    rounded to the closest 50. That keeps the stored figures identical to
-    what the ERP PO page re-derives from quantity."""
+    With `lorry_kg` (the Original PO's quantity for one lorry, po_helpers.
+    lorry_kg) the PO is written in the ERP's percentage mode: each line's
+    percentage is its share of the MR's accepted weight (two decimals,
+    summing to 100), line kg = percentage x lorry kg (exact), quantity = the
+    whole bales / loose units nearest that (informational, as the ERP derives
+    it; 0 for a share of 0.00 %), value = line kg / 100 x the rate rounded to
+    the closest 50. The lines then add up to exactly the lorry's quantity.
+
+    Without `lorry_kg` (no Original PO, or one without a lorry type) the PO
+    is written in quantity mode (percentage NULL): quantity is the whole
+    number of units nearest the accepted weight, line kg = quantity x unit kg.
+    Either way the stored figures equal what the ERP PO page re-derives."""
     unit = unit_kg(uom)
+    used = [li for li in sorted(mr_lines, key=lambda r: int(r.get("jute_mr_li_id") or 0))
+            if _is_active(li) and (_num(li.get("accepted_weight")) or 0.0) > 0]
+    per_lorry = _num(lorry_kg)
+    pcts = (split_percentages([li.get("accepted_weight") for li in used])
+            if per_lorry and per_lorry > 0 else [None] * len(used))
     out = []
-    for li in sorted(mr_lines, key=lambda r: int(r.get("jute_mr_li_id") or 0)):
-        if not _is_active(li):
-            continue
+    for li, pct in zip(used, pcts):
         accepted = _num(li.get("accepted_weight")) or 0.0
-        if accepted <= 0:
-            continue
-        quantity = equivalent_units(accepted, unit)
-        line_kg = quantity * unit
+        if pct is None:
+            quantity = equivalent_units(accepted, unit)
+            line_kg = Decimal(quantity * unit)
+        else:
+            # exact (percentage x lorry kg), so the lines add up to the lorry
+            # to the gram; the ERP's informational count is round(kg / unit),
+            # 0 for a share that rounds to 0.00 % -- no one-unit floor here
+            line_kg = pct * Decimal(str(per_lorry)) / 100
+            quantity = int((line_kg / unit).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         mr_rate = _num(li.get("rate")) or 0.0
         rate = round_rate(mr_rate)
-        value = (Decimal(line_kg) * Decimal(str(rate)) / Decimal(100)).quantize(
+        value = (line_kg * Decimal(str(rate)) / Decimal(100)).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
         item_id = _num(li.get("actual_item_id"))
@@ -146,6 +198,7 @@ def build_po_lines(mr_lines, uom: str, default_crop_year=None) -> list:
             "item_id": None if item_id is None else int(item_id),
             "accepted_weight": accepted,
             "quantity": float(quantity),
+            "percentage": None if pct is None else float(pct),
             "line_kg": float(line_kg),
             "mr_rate": mr_rate,
             "rate": rate,

@@ -79,6 +79,21 @@ Repairs:
                   MRs in MR-date order, roundoff, net); nothing else on the
                   row changes. Stops at the first row that fails. Run only
                   after accounts have seen the list.
+  po-lorry-quantity
+                  Transfer POs written before 2026-10-24, which order the
+                  received weight in whole bales / loose units (the pilot's
+                  two POs of root 28052: 9,504 kg against an Original PO of
+                  10,000 kg for 1 lorry). Owner rule 2026-10-24: a transfer
+                  PO orders one lorry of the Original PO's lorry type (its
+                  capacity), in the ERP's percentage mode, split over the
+                  MR's lines by received weight -- the Original PO's quantity
+                  shared equally among its lorries. Rewrites each PO's header
+                  (lorry type, weight, value) and lines (quantity, percentage,
+                  rate, value) to what po_ops plans today; PO number, id,
+                  date, party, marker and the hop's link stay. A PO reopened
+                  in the ERP, no longer pointed at by its MR, or with other
+                  lines than the plan's is listed as left out. One transaction
+                  per PO.
 """
 
 import argparse
@@ -91,7 +106,9 @@ from pathlib import Path
 
 from sqlalchemy import text
 
+from src.jutetransfer import po_ops
 from src.jutetransfer.database import DatabaseConnection
+from src.jutetransfer.po_helpers import ROLE_FINAL, ROLE_FORWARD, format_po_no, parse_marker
 from src.jutetransfer.queries import _get_financial_year_bounds, get_source_mr_full
 from src.jutetransfer.lot_helpers import line_price, restore_amounts
 from src.jutetransfer.transfer import (
@@ -102,7 +119,7 @@ from src.jutetransfer.transfer import (
 DEFAULT_LOG_DIR = Path(__file__).resolve().parents[2] / ".logs"
 UPDATED_BY = 1  # same demo user id the app writes
 REPAIRS = ("finalized-net", "unfinalized-party", "godowns", "marked-stock", "invoice-links",
-           "hop-tds")
+           "hop-tds", "po-lorry-quantity")
 
 # Chain roots, driven from the hop rows: jute_mr.src_jute_mr_id has no index.
 _CHAIN_ROOTS_SQL = """
@@ -297,6 +314,69 @@ def plan_godowns(conn) -> list:
 
 _HEADER_COLS = ("total_amount", "claim_amount", "tds_amount", "roundoff", "net_total", "mr_weight")
 _LINE_COLS = ("accepted_weight", "actual_weight", "actual_qty", "total_price")
+
+
+def _repair_po_lorry_quantity(conn, it) -> None:
+    """One transfer PO: header and every planned line locked and checked
+    against the plan's old values, then rewritten to the plan's figures.
+    Number, date, party, marker and the hop's link are not touched."""
+    cur = conn.execute(text(f"""
+        SELECT status_id, close_type, internal_note, {', '.join(_PO_HEADER_COLS)}
+        FROM jute_po WHERE jute_po_id = :id FOR UPDATE
+    """), {"id": int(it["jute_po_id"])}).fetchone()
+    if not cur or int(cur[0] or 0) != 5 or (cur[1] or "") != "TRANSFER":
+        raise RuntimeError("no longer Closed as a transfer PO")
+    if cur[2] != it["internal_note"]:
+        raise RuntimeError("marker changed since the dry run")
+    for col, now in zip(_PO_HEADER_COLS, cur[3:]):
+        if not _same(now, it["old"]["header"][col]):
+            raise RuntimeError(f"jute_po.{col} changed since the dry run: {now!r}")
+    # The MR lines and the Original PO are not locked: plan again here and
+    # write only what the dry run showed.
+    marker = parse_marker(cur[2])
+    mr, root = po_ops._load_mr(conn, marker["mr_id"]), po_ops._load_mr(conn, marker["root_mr_id"])
+    if not mr or not root:
+        raise RuntimeError("its MR or root is gone")
+    fresh = po_ops._plan(conn, role=marker["role"], mr=mr, root=root,
+                         source_po=po_ops._load_source_po(conn, root["po_id"]),
+                         original=marker.get("original"))
+    h = it["new"]["header"]
+    planned_lines = list(it["new"]["lines"].values())      # in plan-line order
+    if (fresh.get("skipped") or len(fresh["lines"]) != len(planned_lines)
+            or not (_same(fresh["vehicle_type_id"], h["vehicle_type_id"])
+                    and _same(fresh["weight"], h["weight"])
+                    and _same(fresh["value"], h["jute_po_value"]))
+            or any(not _same(line[k], new[k]) for line, new in zip(fresh["lines"], planned_lines)
+                   for k in _PO_LINE_COLS)):
+        raise RuntimeError("the plan changed since the dry run (MR or Original PO edited?)")
+    for li_id, new in it["new"]["lines"].items():
+        line = conn.execute(text(f"""
+            SELECT {', '.join(_PO_LINE_COLS)}, active FROM jute_po_li
+            WHERE jute_po_li_id = :id AND jute_po_id = :po FOR UPDATE
+        """), {"id": int(li_id), "po": int(it["jute_po_id"])}).fetchone()
+        if not line or (line[-1] is not None and int(line[-1]) != 1):
+            raise RuntimeError(f"PO line {li_id} is gone or inactive")
+        for col, now in zip(_PO_LINE_COLS, line):
+            if not _same(now, it["old"]["lines"][li_id][col]):
+                raise RuntimeError(f"PO line {li_id}.{col} changed since the dry run: {now!r}")
+        res = conn.execute(text("""
+            UPDATE jute_po_li SET quantity = :quantity, percentage = :percentage,
+                   rate = :rate, value = :value, updated_date_time = NOW()
+            WHERE jute_po_li_id = :id
+        """), {**new, "id": int(li_id)})
+        if res.rowcount != 1:
+            raise RuntimeError(f"PO line {li_id}: expected 1 row, changed {res.rowcount}")
+    h = it["new"]["header"]
+    res = conn.execute(text("""
+        UPDATE jute_po SET vehicle_type_id = :vt, weight = :weight, jute_po_value = :value,
+               updated_date_time = NOW()
+        WHERE jute_po_id = :id
+    """), {"vt": h["vehicle_type_id"], "weight": h["weight"], "value": h["jute_po_value"],
+           "id": int(it["jute_po_id"])})
+    if res.rowcount != 1:
+        raise RuntimeError(f"jute_po: expected 1 row, changed {res.rowcount}")
+
+
 # the tables a marked-stock plan row touches and their primary keys
 _MARKED_TABLES = {"jute_mr_li": "jute_mr_li_id", "jute_mr": "jute_mr_id",
                   "sales_invoice_dtl": "invoice_line_item_id", "jute_lot_src": "lot_src_id"}
@@ -630,6 +710,131 @@ def plan_hop_tds(conn) -> list:
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# po-lorry-quantity: transfer POs in the pre-2026-10-24 shape
+# ---------------------------------------------------------------------------
+
+_TRANSFER_POS_SQL = """
+    SELECT p.jute_po_id, p.branch_id, p.po_no, p.po_date, p.status_id, p.close_type,
+           p.internal_note, p.vehicle_type_id, p.weight, p.jute_po_value
+    FROM jute_po p
+    WHERE p.internal_note LIKE 'JT|%'
+    ORDER BY p.jute_po_id
+"""
+_PO_HEADER_COLS = ("vehicle_type_id", "weight", "jute_po_value")
+_PO_LINE_COLS = ("quantity", "percentage", "rate", "value")
+
+# why a transfer PO was left out of the plan (printed, never repaired)
+PO_LORRY_SKIPPED: list = []
+
+
+def _po_lines(conn, po_id) -> list:
+    return _rows(conn, """
+        SELECT jute_po_li_id, item_id, quantity, percentage, rate, value
+        FROM jute_po_li
+        WHERE jute_po_id = :id AND (active = 1 OR active IS NULL)
+        ORDER BY jute_po_li_id
+    """, id=int(po_id))
+
+
+def _pair_po_lines(conn, role: str, mr_id: int, stored: list, planned: list):
+    """{planned line index: stored jute_po_li_id}, or None when the stored
+    lines are not the plan's lines. A hop's lines are paired through the link
+    po_ops wrote (jute_mr_li.jute_po_li_id); a Final PO is not linked from
+    the root, so its lines pair by position (po_ops writes one PO line per
+    root line, in root-line order) and must carry the same items."""
+    if len(stored) != len(planned):
+        return None
+    if role == ROLE_FORWARD:
+        links = {int(r["jute_mr_li_id"]): r["jute_po_li_id"] for r in _rows(conn, """
+            SELECT jute_mr_li_id, jute_po_li_id FROM jute_mr_li WHERE jute_mr_id = :id
+        """, id=int(mr_id)) if r["jute_po_li_id"] is not None}
+        pairs = {i: links.get(int(l["jute_mr_li_id"])) for i, l in enumerate(planned)}
+        if None in pairs.values() or set(pairs.values()) != {int(s["jute_po_li_id"]) for s in stored}:
+            return None
+        return pairs
+    for s, l in zip(stored, planned):
+        if not _same(s["item_id"], l["item_id"]):
+            return None
+    return {i: int(s["jute_po_li_id"]) for i, s in enumerate(stored)}
+
+
+def plan_po_lorry_quantity(conn) -> list:
+    """Every transfer PO (JT| marker) whose header and lines are not what the
+    app writes today -- one lorry of the Original PO's lorry type in
+    percentage mode (owner rule 2026-10-24) -- e.g. the pilot's two POs of
+    2026-10-02, which order the received weight in whole loose units. The
+    fresh plan comes from po_ops._plan, the function every save and the
+    backfill use; PO number, id, marker, date, party and links stay. A PO
+    that is reopened in the ERP, whose MR no longer points at it, or whose
+    lines are not the plan's lines is listed under 'left out', never written."""
+    PO_LORRY_SKIPPED.clear()
+    out = []
+    for po in _rows(conn, _TRANSFER_POS_SQL):
+        po_id = int(po["jute_po_id"])
+        marker = parse_marker(po["internal_note"])
+
+        def leave(reason):
+            PO_LORRY_SKIPPED.append({"jute_po_id": po_id, "po_no": po["po_no"],
+                                     "branch_id": po["branch_id"], "reason": reason})
+
+        if marker is None:
+            continue
+        if int(po["status_id"] or 0) != 5 or (po["close_type"] or "") != "TRANSFER":
+            leave("no longer Closed as a transfer PO (reopened in the ERP?)")
+            continue
+        role, mr_id, root_id = marker["role"], marker["mr_id"], marker["root_mr_id"]
+        mr, root = po_ops._load_mr(conn, mr_id), po_ops._load_mr(conn, root_id)
+        if not mr or not root:
+            leave(f"its MR {mr_id} / root {root_id} is gone")
+            continue
+        if role == ROLE_FORWARD and (mr["po_id"] is None or int(mr["po_id"]) != po_id):
+            leave(f"hop MR {mr_id} no longer points at it (po_id {mr['po_id']})")
+            continue
+        if role == ROLE_FINAL and (int(root["status_id"] or 0) != 3 or root["branch_mr_no"] is None):
+            leave(f"root MR {root_id} is not finalized")
+            continue
+        try:
+            plan = po_ops._plan(conn, role=role, mr=mr, root=root,
+                                source_po=po_ops._load_source_po(conn, root["po_id"]),
+                                original=marker.get("original"))
+        except Exception as exc:       # one odd PO must not abort the dry run
+            leave(f"cannot be planned: {exc}")
+            continue
+        if plan["skipped"]:
+            leave(plan["skipped"])
+            continue
+        stored = _po_lines(conn, po_id)
+        pairs = _pair_po_lines(conn, role, mr_id, stored, plan["lines"])
+        if pairs is None:
+            leave("its lines are not the plan's lines (edited in the ERP?)")
+            continue
+        by_id = {int(s["jute_po_li_id"]): s for s in stored}
+        old = {"header": {k: _num(po[k]) for k in _PO_HEADER_COLS}, "lines": {}}
+        new = {"header": {"vehicle_type_id": plan["vehicle_type_id"],
+                          "weight": plan["weight"], "jute_po_value": plan["value"]},
+               "lines": {}}
+        for i, line in enumerate(plan["lines"]):
+            li_id = pairs[i]
+            old["lines"][str(li_id)] = {k: _num(by_id[li_id][k]) for k in _PO_LINE_COLS}
+            new["lines"][str(li_id)] = {k: line[k] for k in _PO_LINE_COLS}
+        same = (all(_same(old["header"][k], new["header"][k]) for k in _PO_HEADER_COLS)
+                and all(_same(old["lines"][li][k], new["lines"][li][k])
+                        for li in new["lines"] for k in _PO_LINE_COLS))
+        if same:
+            continue
+        out.append({
+            "jute_po_id": po_id, "role": role, "mr_id": mr_id, "root_mr_id": root_id,
+            "branch_id": po["branch_id"], "co_name": plan.get("co_name"),
+            "po_no_formatted": format_po_no(po["po_no"], plan.get("co_prefix"),
+                                            plan.get("branch_prefix"), _as_date(po["po_date"])),
+            "ge_no": root.get("jute_gate_entry_no"), "uom": plan["uom"],
+            "lorry_kg": plan.get("lorry_kg"), "internal_note": po["internal_note"],
+            "old": old, "new": new,
+        })
+    return out
+
 PLANNERS = {
     "finalized-net": plan_finalized_net,
     "unfinalized-party": plan_unfinalized_party,
@@ -637,6 +842,7 @@ PLANNERS = {
     "marked-stock": plan_marked_stock,
     "invoice-links": plan_invoice_links,
     "hop-tds": plan_hop_tds,
+    "po-lorry-quantity": plan_po_lorry_quantity,
 }
 
 
@@ -746,6 +952,34 @@ def report(plans: dict, applying: bool = False) -> None:
                   f" | bought before {r['approved_before']:,.2f}"
                   f" | TDS {o['tds_amount']} -> {n['tds_amount']:,.2f}"
                   f" | net {o['net_total']} -> {n['net_total']:,.2f}")
+    if "po-lorry-quantity" in plans:
+        p = plans["po-lorry-quantity"]
+        print(f"\n[po-lorry-quantity] {len(p)} transfer PO(s) not ordering the Original PO's"
+              " lorry -> one lorry of the Original PO's lorry type (its capacity), in"
+              " percentage mode, split over the MR's lines by received weight (owner rule"
+              " 2026-10-24); PO number, id, date, party, marker and links stay")
+
+        def fmt(v, pct=False):
+            if v is None:
+                return "NULL"
+            return f"{v:,.2f} %" if pct else f"{v:,.2f}"
+
+        for r in p:
+            o, n = r["old"]["header"], r["new"]["header"]
+            print(f"  {r['role']:7} {r['po_no_formatted']} (PO id {r['jute_po_id']}, MR {r['mr_id']},"
+                  f" lorry GE {r['ge_no']} of root {r['root_mr_id']}, {r['co_name']}):"
+                  f" weight {fmt(o['weight'])} -> {fmt(n['weight'])}"
+                  f" | value {fmt(o['jute_po_value'])} -> {fmt(n['jute_po_value'])}"
+                  f" | lorry type {o['vehicle_type_id']} -> {n['vehicle_type_id']}")
+            for li, nl in r["new"]["lines"].items():
+                ol = r["old"]["lines"][li]
+                print(f"      line {li}: {fmt(ol['quantity'])} {r['uom'].lower()} / "
+                      f"{fmt(ol['percentage'], True)} / rate {fmt(ol['rate'])} / value "
+                      f"{fmt(ol['value'])} -> {fmt(nl['quantity'])} / {fmt(nl['percentage'], True)}"
+                      f" / rate {fmt(nl['rate'])} / value {fmt(nl['value'])}")
+        for s in PO_LORRY_SKIPPED:
+            print(f"  left out: PO id {s['jute_po_id']} (no {s['po_no']}, branch {s['branch_id']}):"
+                  f" {s['reason']}")
     if not applying:
         print("\nNothing was written. After the owner's OK, one repair at a time:")
         for name, items in plans.items():
@@ -884,6 +1118,7 @@ REPAIR_FNS = {
     "marked-stock": _repair_marked_stock,
     "invoice-links": _repair_invoice_links,
     "hop-tds": _repair_hop_tds,
+    "po-lorry-quantity": _repair_po_lorry_quantity,
 }
 
 
@@ -896,7 +1131,8 @@ def apply(plans: dict, log_path: Path) -> int:
     _write_json(log_path, log)
     for name, items in plans.items():
         for position, it in enumerate(items):
-            key = it.get("jute_mr_id") or it.get("warehouse_id") or it.get("invoice_id")
+            key = (it.get("jute_mr_id") or it.get("warehouse_id") or it.get("invoice_id")
+                   or it.get("jute_po_id"))
             try:
                 with DatabaseConnection.get_transaction() as conn:
                     REPAIR_FNS[name](conn, it)

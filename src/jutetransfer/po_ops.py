@@ -12,8 +12,11 @@ Every chain transfer is backed by purchase orders in the ERP's own tables
   through an MR.
 
 Both are built from the MR's own lines as stored (one PO per lorry), with the
-rate rounded to the closest 50 (po_helpers). They are inserted CLOSED so the
-ERP never offers them for a real gate entry or lists them as outstanding.
+rate rounded to the closest 50 and the quantity of ONE lorry of the Original
+PO's lorry type -- the ERP's percentage mode, so the PO orders what the
+Original PO ordered per lorry, not what the lorry weighed (po_helpers). They
+are inserted CLOSED so the ERP never offers them for a real gate entry or
+lists them as outstanding.
 
 Two phases: plan_* only READS and returns everything the PO would contain
 (the backfill dry-run and the tests use it as is); create_* = plan + insert.
@@ -45,6 +48,7 @@ from .po_helpers import (
     final_marker_like,
     format_po_no,
     forward_close_remark,
+    lorry_kg,
     normalise_uom,
     parse_marker,
     po_remarks,
@@ -162,10 +166,12 @@ def _load_source_po(conn, po_id) -> dict:
     po = _row(conn, """
         SELECT p.jute_po_id, p.po_no, p.po_date,
                p.channel_code, p.credit_term, p.delivery_days, p.jute_uom,
+               p.vehicle_type_id, lm.weight AS lorry_capacity_qtl,
                cm.co_prefix, bm.branch_prefix
         FROM jute_po p
         LEFT JOIN branch_mst bm ON bm.branch_id = p.branch_id
         LEFT JOIN co_mst cm ON cm.co_id = bm.co_id
+        LEFT JOIN jute_lorry_mst lm ON lm.jute_lorry_type_id = p.vehicle_type_id
         WHERE p.jute_po_id = :id
     """, {"id": po_id})
     if not po:
@@ -286,10 +292,16 @@ def _plan(conn, *, role: str, mr: dict, root: dict, source_po: dict,
     mr_id = int(mr["jute_mr_id"])
     root_mr_id = int(root["jute_mr_id"])
     uom = normalise_uom(mr.get("unit_conversion"), source_po.get("jute_uom"))
+    # Owner rule 2026-10-24: the PO orders one lorry of the Original PO's
+    # lorry type (its capacity), split over the MR's lines by received weight
+    # -- the Original PO's quantity shared equally among its lorries. No lorry
+    # type known: the received weight in whole units, as before.
+    per_lorry = lorry_kg(source_po.get("lorry_capacity_qtl"))
     lines = build_po_lines(_load_mr_lines(conn, mr_id), uom,
-                           default_crop_year=source_po.get("crop_year"))
+                           default_crop_year=source_po.get("crop_year"),
+                           lorry_kg=per_lorry)
     plan = {"role": role, "mr_id": mr_id, "root_mr_id": root_mr_id,
-            "skipped": None, "lines": lines, "uom": uom}
+            "skipped": None, "lines": lines, "uom": uom, "lorry_kg": per_lorry}
     if not lines:
         plan["skipped"] = f"MR {mr_id} has no line with accepted weight"
         return plan
@@ -319,13 +331,15 @@ def _plan(conn, *, role: str, mr: dict, root: dict, source_po: dict,
         "internal_note": build_marker(role, root_mr_id, mr_id,
                                       source_po.get("jute_po_id"), original),
         "map_row": None,
-        # No lorry type on a transfer PO: it is one lorry's actual receipt in
-        # whole bales / loose units, not "N lorries of a master capacity".
-        # With a type set the ERP PO page checks the weight against that
-        # capacity and paints it red when it is more than 5 % off -- which a
-        # real lorry load usually is. (Lorry types are per company anyway and
-        # the forwarding companies have almost none.)
-        "vehicle_type_id": None,
+        # Percentage mode needs the lorry type: the ERP PO page derives every
+        # line's weight as percentage x capacity x vehicle_quantity (1 here),
+        # which is exactly the stored weight, so the page never paints it red.
+        # The type is the mill's master row (the ERP reads it by id, without a
+        # company filter); the forwarding companies have none of their own.
+        # Fallback (quantity mode) keeps it NULL: the stored weight is then
+        # quantity x unit kg, and a lorry type would only mark it as off.
+        "vehicle_type_id": (_as_int(source_po.get("vehicle_type_id"))
+                            if per_lorry else None),
     })
     return plan
 
@@ -482,16 +496,18 @@ def _apply(conn, plan: dict, updated_by: int) -> dict:
     for l in plan["lines"]:
         line_ids.append(int(DatabaseConnection.execute_insert_returning_id(conn, """
             INSERT INTO jute_po_li (
-                jute_po_id, item_id, quantity, rate, value, marka, crop_year,
-                allowable_moisture, active, status_id, updated_date_time, jute_uom
+                jute_po_id, item_id, quantity, percentage, rate, value, marka,
+                crop_year, allowable_moisture, active, status_id, updated_date_time,
+                jute_uom
             ) VALUES (
-                :po_id, :item_id, :quantity, :rate, :value, :marka, :crop_year,
-                :allowable_moisture, 1, :status_id, NOW(), :uom
+                :po_id, :item_id, :quantity, :percentage, :rate, :value, :marka,
+                :crop_year, :allowable_moisture, 1, :status_id, NOW(), :uom
             )
         """, {
             "po_id": po_id,
             "item_id": l["item_id"],
             "quantity": l["quantity"],
+            "percentage": l.get("percentage"),
             "rate": l["rate"],
             "value": l["value"],
             "marka": l["marka"],

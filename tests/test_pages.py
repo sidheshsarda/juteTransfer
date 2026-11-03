@@ -104,7 +104,8 @@ class Recorder:
         step = kw.pop("step")
         kw["step"] = {k: getattr(step, k) for k in
                       ("co_id", "branch_id", "mr_date", "pct_rate_increase", "total_amount",
-                       "claim_amount", "net_amount", "warehouse_id", "lc_reference_no")}
+                       "claim_amount", "net_amount", "warehouse_id", "lc_reference_no",
+                       "bill_to_branch_id", "ship_to_branch_id")}
         self.saves.append(kw)
         if self.save_raises:
             raise self.save_raises
@@ -346,6 +347,26 @@ def test_a_chain_changed_in_the_database_is_rebuilt_not_edited_over(chain, monke
     assert [s.get("saved_mr_id") for s in steps] == [A_HOP, A_ROOT]
     assert steps[1]["is_final_return"] and not any(not s.get("saved_mr_id") for s in steps)
     assert f"pct_input_{A_ROOT}_1" not in at.session_state
+
+
+# --- Bill To / Ship To: the buyer's own branches ------------------------------------------------
+
+def test_bill_to_defaults_to_the_buyers_ho_ship_to_to_the_receiving_branch(chain, monkeypatch):
+    cb_map = {**CB_MAP, "EJM-HO": (2, 10)}
+    monkeypatch.setattr(chain_page, "get_company_branch_options",
+                        lambda: (list(CB_OPTIONS) + ["EJM-HO"], dict(cb_map)))
+    at = _start(A_ROOT)
+    _open_step_2(at, A_ROOT)
+    bill = at.selectbox(key=f"bill_to_{A_ROOT}_1_EJM-FACTORY")
+    ship = at.selectbox(key=f"ship_to_{A_ROOT}_1_EJM-FACTORY")
+    assert (bill.value, ship.value) == ("EJM-HO", "EJM-FACTORY")
+    assert sorted(bill.options) == ["EJM-FACTORY", "EJM-HO"]      # the buyer's branches only
+    ship.set_value("EJM-HO")
+    _run(at)
+    at.button(key=f"save_{A_ROOT}_1").click()
+    _run(at)
+    posted = chain.saves[-1]["step"]
+    assert (posted["bill_to_branch_id"], posted["ship_to_branch_id"]) == (10, 10)
 
 
 # --- P2: the godown follows the company ------------------------------------------------------
