@@ -8,7 +8,7 @@
 - Frontend: Streamlit + streamlit-aggrid
 - Backend: Python 3.12+ with SQLAlchemy (raw SQL via `text()`), mysql-connector
 - Database: MySQL — connects **directly** to the `sls` tenant DB (credentials in `.env`)
-- Auth: local demo auth in `src.jutetransfer.auth` (not connected to VoWERP JWT)
+- Auth: the user's VoWERP e-mail + password (bcrypt, `sls.user_mst`) plus the app's own access list `jt_user_access` (roles `user` / `admin`) — `access.py` (no Streamlit), `auth.py` (login form, session `user_id` / `role`), `pages/users.py` (admins manage the list). Only an admin may change or remove what is saved: `access.require_admin(updated_by)` sits inside `delete_chain_from_step`, `delete_marked_move` and `set_access`, and the pages hide those buttons from users. `.env`: `JT_ADMIN_EMAILS` (always-admin bootstrap list), `JT_LEGACY_LOGIN=1` (transition only: old shared logins work and the guard is permissive). Table: `scripts/migrate_jt_user_access.py` (dry-run by default)
 
 ## Ecosystem & Scope (READ FIRST)
 
@@ -110,7 +110,8 @@ src/jutetransfer/
 ├── models.py                         # ORM mirror of sls tables (reference only — queries use raw SQL)
 ├── database.py                       # Cached engine, execute helpers, get_transaction()
 ├── config.py                         # .env-driven DB config
-├── auth.py                           # Demo auth
+├── access.py                         # Who may log in / who is admin; require_admin guard for the ops (no Streamlit)
+├── auth.py                           # Login form + session (VoWERP e-mail/password via access.py)
 ├── schemas.py                        # Schema introspection cache (schema viewer only)
 ├── data.py                           # Fake data for demo pages (unused by real pages)
 └── __init__.py
@@ -189,7 +190,7 @@ The pages have headless tests too (`tests/test_pages.py`, `streamlit.testing.v1.
 
 - The `[DEBUG]` captions and the `debug_transfer.log` append are gone (2026-10-03); a stale gitignored `src/debug_transfer.log` may still sit on a checkout — it corresponds to no database write and can be deleted. Errors on the pages now go through `logging` (the server log, `.logs/jt.log` on the dev VM), never onto the screen.
 - Stray `pages/company_pl_dashboard.py.tmp.*` file.
-- Demo auth means `updated_by` is always `1`.
+- `updated_by` is the logged-in VoWERP `user_id` (1 for rows written before 2026-11-17 and under `JT_LEGACY_LOGIN`).
 - `docs/invoice_data_flow_step2.md`, `docs/invoice_verification_checklist.md`, `docs/step2_invoice_example.md` and the 2026-03/04 superpowers plans reference the retired `jute_mr.py`/`jute_mr_editor.py` pages — historical only.
 
 ## References

@@ -3,7 +3,7 @@
 import streamlit as st
 import pandas as pd
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-from src.jutetransfer.auth import login, logout, is_authenticated, get_username
+from src.jutetransfer.auth import login, logout, is_authenticated, get_username, is_admin
 
 from src.jutetransfer.pages import (
     schema_viewer_page,
@@ -11,6 +11,7 @@ from src.jutetransfer.pages import (
     company_pl_dashboard_page,
     warehouse_stock_page,
     po_tracker_page,
+    users_page,
 )
 
 
@@ -31,17 +32,21 @@ def display_sidebar():
         st.markdown("---")
 
         if is_authenticated():
-            st.success(f"👤 Logged in as: **{get_username()}**")
+            st.success(f"👤 Logged in as: **{get_username()}**"
+                       + (" (admin)" if is_admin() else ""))
             st.markdown("---")
 
             st.subheader("Navigation")
+            pages = ["Dashboard", "Analytics",
+                     "Transfer Chain (Vertical)",
+                     "PO Tracker",
+                     "Warehouse Stock",
+                     "Company P&L", "Schema Viewer"]
+            if is_admin():
+                pages.append("Users")
             page = st.radio(
                 "Select Page",
-                ["Dashboard", "Analytics",
-                    "Transfer Chain (Vertical)",
-                    "PO Tracker",
-                    "Warehouse Stock",
-                    "Company P&L", "Schema Viewer"],
+                pages,
                 label_visibility="collapsed"
             )
 
@@ -114,6 +119,8 @@ def main():
         company_pl_dashboard_page()
     elif page == "Schema Viewer":
         schema_viewer_page()
+    elif page == "Users":
+        users_page()
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ from typing import Tuple
 
 from sqlalchemy import text
 
+from . import access
 from .database import DatabaseConnection, delete_by_ids, named_locks, select_ids
 from .lot_helpers import (
     advised_share, apply_pct, line_price, net_rate, production_rate,
@@ -718,6 +719,7 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
     (leaf-first), ERP issue entries on its lines, an ERP sales invoice line
     drawn on its lines, a child without provenance.
     """
+    access.require_admin(updated_by)
     with DatabaseConnection.get_transaction() as conn:
         child = conn.execute(text("""
             SELECT jute_mr_id, src_jute_mr_id, transfer_mode

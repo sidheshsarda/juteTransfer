@@ -161,6 +161,7 @@ def _chain_script():
     import streamlit as st
     from src.jutetransfer.pages import new_transfer_chain as p
     st.session_state.setdefault("user_id", 1)
+    st.session_state.setdefault("role", "admin")
     p.transfer_chain_page()
     pick = st.session_state.get("_pick")
     if pick is not None:
@@ -467,6 +468,16 @@ def test_a_database_error_during_reload_shows_a_message_and_nothing_else(chain):
 
 
 # --- P9: deleting saved steps takes a confirming tick --------------------------------------------
+
+def test_a_plain_user_is_not_offered_delete_on_a_saved_step(chain):
+    at = AppTest.from_function(_chain_script, default_timeout=60)
+    at.session_state["_pick"] = A_ROOT
+    at.session_state["role"] = "user"
+    _run(at)
+    keys = [w.key for w in list(at.button) + list(at.checkbox)]
+    assert f"delete_saved_{A_ROOT}_0" not in keys
+    assert f"confirm_delete_{A_ROOT}_0" not in keys
+
 
 def test_delete_from_step_needs_the_tick_and_names_what_goes(chain):
     at = _start(A_ROOT)

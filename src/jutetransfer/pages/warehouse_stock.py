@@ -36,6 +36,7 @@ from ..queries import (
 from ..lot_ops import create_lot, delete_lot_line
 from ..lot_helpers import apply_pct, line_price, combine_takes
 from ..warehouse_stock_ops import save_marked_batch, delete_marked_move
+from ..auth import is_admin
 
 
 WAREHOUSE_FLASH_KEY = "warehouse_flash"
@@ -367,10 +368,11 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
             # A resold MR can't be deleted until its resale children are
             # (leaf-first guard) — disable rather than offer a doomed button.
             can_delete = (bool((grp["balance_kg"] >= grp["kg"]).all())
-                          and not resold)
+                          and not resold and is_admin())
             if st.button("Delete", key=f"del_mk_{mr_id}", disabled=not can_delete,
                          help="Undo this move: its seller invoice and this MR are "
-                              "deleted; the kg come back on the source lines' balance"):
+                              "deleted; the kg come back on the source lines' balance"
+                              if is_admin() else "Only a transfer admin can undo a move"):
                 try:
                     delete_marked_move(mr_id, user_id)
                     _flash(f"Move undone: MR {mr_id} and its seller invoice deleted; "

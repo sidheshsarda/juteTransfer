@@ -32,6 +32,7 @@ from ..jute_mr_chain_helpers import (
     is_root_eligible_for_new_chain,
 )
 from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
+from ..auth import is_admin
 
 FLASH_KEY = "chain_flash"
 # Every '% Rate Increase' box is a widget keyed 'pct_input_<root mr>_<step>'.
@@ -1204,7 +1205,9 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
         _render_step_line_items(step_index, line_items, all_steps, is_saved=is_saved, base_step_index=base_step_index)
 
         # Action buttons
-        if is_saved:
+        if is_saved and not is_admin():
+            st.caption("Saved. Only a transfer admin can change or delete a saved step.")
+        elif is_saved:
             # Saved steps: "Delete from here" deletes this step and every
             # later one -- MRs, invoices and transfer POs, on production, so
             # it takes a confirming tick first (one mis-tap on a phone must

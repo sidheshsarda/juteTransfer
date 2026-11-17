@@ -12,7 +12,7 @@ from typing import Optional
 
 from sqlalchemy import text
 
-from . import po_ops
+from . import access, po_ops
 from .database import DatabaseConnection, delete_by_ids, named_locks, select_ids
 from .jute_mr_chain_helpers import (
     _calculate_line_item_amount, _reconstruct_chain, hop_rate,
@@ -2150,6 +2150,7 @@ def delete_chain_from_step(root_mr_id: int, from_mr_id: int, updated_by: int) ->
     Returns what was removed: {'deleted_mr_ids': [...], 'deleted_pos':
     [printed PO numbers], 'reverted': bool} (all empty/False on a no-op).
     """
+    access.require_admin(updated_by)
     summary = {"deleted_mr_ids": [], "deleted_pos": [], "reverted": False}
     with DatabaseConnection.get_transaction() as conn:
         # Lock the root first: serialises this against any concurrent save
