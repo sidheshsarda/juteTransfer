@@ -56,6 +56,33 @@ def mr_date_problem(mr_date, latest_date=None, latest_no=None, today=None):
     return None
 
 
+def edit_date_problem(new_date, old_date, lower_date=None, higher_date=None, today=None):
+    """Why a SAVED MR may not be re-dated to `new_date`: (message, out_of_order).
+
+    (None, False) when it may. out_of_order=True marks the one refusal an
+    admin may overrule: the date leaves the window set by the neighbouring MR
+    numbers of the branch (`lower_date` = latest date among lower numbers,
+    `higher_date` = earliest among higher ones). The other two are final: a
+    date in another month is another challan / number series, and a date
+    after today would block the branch.
+    """
+    if (new_date.year, new_date.month) != (old_date.year, old_date.month):
+        return (f"The date can only move within {old_date:%B %Y}: the challan number carries "
+                "the month and every number series the year. For another month, delete the "
+                "step and save it again.", False)
+    if today is not None and new_date > today:
+        return (f"The date {new_date:%d-%m-%Y} is after today.", False)
+    if lower_date is not None and new_date < lower_date:
+        return (f"The date {new_date:%d-%m-%Y} is before an earlier MR number of this branch "
+                f"({lower_date:%d-%m-%Y}). To keep the date order, use {lower_date:%d-%m-%Y} "
+                "or later.", True)
+    if higher_date is not None and new_date > higher_date:
+        return (f"The date {new_date:%d-%m-%Y} is after a later MR number of this branch "
+                f"({higher_date:%d-%m-%Y}). To keep the date order, use {higher_date:%d-%m-%Y} "
+                "or earlier.", True)
+    return None, False
+
+
 def _cascade_rate(original_rate: float, steps: list, up_to_index: int) -> float:
     """Round-then-cascade: round at kg level (2 decimals) at each step boundary.
 

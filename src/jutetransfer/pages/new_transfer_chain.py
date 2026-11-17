@@ -33,6 +33,7 @@ from ..jute_mr_chain_helpers import (
 )
 from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep, MrDateOrderError
 from ..auth import is_admin
+from ..edit_ops import edit_chain_step
 
 FLASH_KEY = "chain_flash"
 # Every '% Rate Increase' box is a widget keyed 'pct_input_<root mr>_<step>'.
@@ -113,7 +114,8 @@ def _chain_changed(steps, chain_data, is_finalized: bool, mr_id: int) -> bool:
 
 
 STEP_WIDGETS = ("company", "date", "transport", "lc_ref", "lc_date", "po_lc", "od_lc",
-                "pct_input", "pct", "confirm_delete", "dateovr")
+                "pct_input", "pct", "confirm_delete", "dateovr",
+                "editdate", "editwh", "editwhy", "editooo")
 
 
 def _step_widget_keys(mr_id: int, step_index: int) -> list:
@@ -1214,6 +1216,8 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
             # not be enough). The tick is a plain widget: unticked on the
             # next visit to the card.
             saved_mr_id = step.get("saved_mr_id")
+            if saved_mr_id:
+                _render_edit_box(step_index, step, mr_id, filter_key, current_date)
             confirm_key = f"confirm_delete_{mr_id}_{step_index}"
             confirmed = st.checkbox(
                 _delete_confirm_label(step_index, step, all_steps),
@@ -1405,6 +1409,64 @@ def _render_step_line_items(step_index, line_items, all_steps, is_saved=False, b
     st.markdown("**Line Items**")
     df = pd.DataFrame(rows)
     st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def _render_edit_box(step_index, step, mr_id, filter_key, current_date):
+    """Edit mode for a saved step (admins): date and godown changed in place,
+    every number kept (edit_ops.edit_chain_step). Widgets are seeded once from
+    the saved step and keyed, never given value=."""
+    suffix = f"{mr_id}_{step_index}"
+    is_return = bool(step.get("is_final_return"))
+    with st.expander("Edit this step (admin)"):
+        st.caption("Changes the saved step in place: MR, invoice and PO numbers stay the same. "
+                   "The date can move within its month only.")
+        date_key = f"editdate_{suffix}"
+        if date_key not in st.session_state:
+            st.session_state[date_key] = current_date
+        new_date = st.date_input("MR date", key=date_key)
+
+        new_wh, current_wh = None, step.get("warehouse_id")
+        if not is_return:
+            _, co_branch_mapping = get_company_branch_options()
+            branch_id = co_branch_mapping.get(step.get("company", ""), (None, None))[1]
+            warehouses = get_warehouses_by_branch(branch_id) if branch_id else {}
+            if warehouses:
+                wh_key = f"editwh_{suffix}"
+                wh_ids = list(warehouses)
+                if wh_key not in st.session_state and current_wh in wh_ids:
+                    st.session_state[wh_key] = current_wh
+                new_wh = st.selectbox("Godown", options=wh_ids, key=wh_key,
+                                      format_func=lambda wid: warehouses.get(wid, str(wid)))
+        reason = st.text_input("Reason (required, kept in the change log)", key=f"editwhy_{suffix}")
+        out_of_order = st.checkbox("Save even if the date is out of the branch's MR date order",
+                                   key=f"editooo_{suffix}")
+        date_changed = new_date != current_date
+        wh_changed = new_wh is not None and new_wh != current_wh
+        if st.button("Save changes", key=f"editsave_{suffix}",
+                     disabled=not (date_changed or wh_changed)):
+            try:
+                changed = edit_chain_step(
+                    mr_id, int(step["saved_mr_id"]), reason=reason,
+                    updated_by=st.session_state.get("user_id", 1),
+                    new_date=new_date if date_changed else None,
+                    new_warehouse_id=int(new_wh) if wh_changed else None,
+                    allow_out_of_order=out_of_order,
+                )
+            except Exception as e:
+                st.error(f"Step {step_index + 1} was not changed: {e}")
+                return
+            parts = []
+            if "mr_date" in changed:
+                parts.append(f"date {new_date:%d-%m-%Y}")
+            if "warehouse_id" in changed:
+                parts.append("godown")
+            if "tds_amount" in changed:
+                parts.append(f"TDS {changed['tds_amount'][0]:,.2f} to {changed['tds_amount'][1]:,.2f}")
+            _flash("success", f"Step {step_index + 1} changed: " + ", ".join(parts or ["nothing"])
+                   + ". Numbers unchanged.")
+            _clear_tracker_cache()
+            _drop_chain_state(filter_key, mr_id)
+            st.rerun()
 
 
 def _save_step(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key):

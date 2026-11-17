@@ -64,6 +64,13 @@ Mutual exclusion is enforced in code: a line feeding a live chain can't be mark-
 
 A new MR number may not be dated before the latest MR already numbered at that **branch in that financial year** (the same day is fine), nor after today. "Numbered" = `branch_mr_no` set and status not Rejected / Cancelled / Drafted / Returned (4, 6, 21, 48) — the ERP's own approvals count. Checked by `transfer.enforce_mr_date` inside the save's transaction, under the save lock, just before the number is taken: hop save and finalize (`save_transfer_step`) and marked moves at the target branch (`save_marked_batch`). The pure rule is `jute_mr_chain_helpers.mr_date_problem`. Existing out-of-order MRs are left alone (only new saves are checked). An **admin** may save an out-of-order date with a reason (`date_override_reason`; "Date override (admin)" box on both pages): the exception is written to `jt_change_log` (`audit.py`, `scripts/migrate_jt_change_log.py`) in the same transaction, and is refused when it cannot be logged. The ERP itself has no such check at MR approval, so a mill branch can still go out of order from the ERP side.
 
+### Edit mode (owner ruling 2026-11-17) — `edit_ops.py`
+
+A saved step or marked move is corrected **in place**: ids and every number (MR, gate entry, bill pass, invoice, challan, PO) stay. Before this a correction meant delete + save again, which hands out new numbers at the top of each series. `edit_chain_step(root, step_mr_id, …)` (step_mr_id = root → the finalized mill MR) and `edit_marked_move(child_mr_id, …)`; admins only, reason required, every edit logged to `jt_change_log` (old and new values) in the same transaction. UI: "Edit this step (admin)" on a saved step card, "Edit MR n (admin)" on the Marked Stock tab.
+- **Editable today — nothing that changes money:** the **MR date** (MR date + bill pass date, gate entry date too on a hop / marked child but never on the mill MR; the invoice booked for that step — `sales_invoice_jute.mr_id` = the previous hop, i.e. the seller; the step's Forwarding / Final PO date; and the MR's 194Q TDS when the new date moves it in the party's sequence — only TDS, roundoff and net are rewritten, from the stored total and claim) and the **godown** on the MR's lines (hops and marked children; the mill's godown belongs to the ERP; refused once the ERP has issued from the lines).
+- **Date limits:** same calendar month as the old date (the challan number carries the month, every series the year — another month is another number: delete and save again), not after today, and inside the window set by the neighbouring MR numbers of the branch (`jute_mr_chain_helpers.edit_date_problem`) unless the admin ticks "out of order".
+- **Not built yet:** editing the % / rates (needs the cascade re-run through later hops, invoices, POs, the finalized root and draft issue values; the hop % is not stored, only back-calculated from totals), LC fields, and a change of company (number must change: the freed-number slot, step 4).
+
 ### Transfer POs (2026-10-01 — spec `docs/superpowers/specs/2026-10-01-transfer-po-design.md`)
 
 Every chain transfer also writes ERP purchase orders (`jute_po` + `jute_po_li` + one `jute_po_status_log` row), in the same transaction as the step:
@@ -116,6 +123,7 @@ src/jutetransfer/
 ├── config.py                         # .env-driven DB config
 ├── access.py                         # Who may log in / who is admin; require_admin guard for the ops (no Streamlit)
 ├── audit.py                          # jt_change_log: admin exceptions (date overrides), caller's transaction
+├── edit_ops.py                       # Edit mode: saved step / marked move changed in place (date, godown), logged
 ├── auth.py                           # Login form + session (VoWERP e-mail/password via access.py)
 ├── schemas.py                        # Schema introspection cache (schema viewer only)
 ├── data.py                           # Fake data for demo pages (unused by real pages)

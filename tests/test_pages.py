@@ -500,6 +500,39 @@ def test_a_plain_user_gets_no_override_box(chain):
     assert chain.saves[-1]["date_override_reason"] is None
 
 
+# --- Edit mode: a saved step is changed in place, by an admin, with a reason ----------------------
+
+def test_an_admin_edits_a_saved_steps_date_in_place(chain, monkeypatch):
+    calls = []
+
+    def edit(root, step_mr, **kw):
+        calls.append((root, step_mr, kw))
+        return {"mr_date": [None, kw["new_date"]]}
+    monkeypatch.setattr(chain_page, "edit_chain_step", edit)
+    at = _start(A_ROOT)
+    assert at.button(key=f"editsave_{A_ROOT}_0").disabled             # nothing changed yet
+    old = at.date_input(key=f"editdate_{A_ROOT}_0").value
+    new = old.replace(day=2 if old.day != 2 else 3)
+    at.date_input(key=f"editdate_{A_ROOT}_0").set_value(new)
+    at.text_input(key=f"editwhy_{A_ROOT}_0").set_value("keyed on the wrong day")
+    _run(at)
+    at.button(key=f"editsave_{A_ROOT}_0").click()
+    _run(at)
+    ((root, step_mr, kw),) = calls
+    assert (root, step_mr) == (A_ROOT, A_HOP)
+    assert kw["new_date"] == new and kw["new_warehouse_id"] is None
+    assert kw["reason"] == "keyed on the wrong day" and kw["allow_out_of_order"] is False
+    assert not chain.saves and not chain.deletes
+
+
+def test_a_plain_user_gets_no_edit_box(chain):
+    at = AppTest.from_function(_chain_script, default_timeout=60)
+    at.session_state["_pick"] = A_ROOT
+    at.session_state["role"] = "user"
+    _run(at)
+    assert f"editsave_{A_ROOT}_0" not in [w.key for w in at.button]
+
+
 # --- P9: deleting saved steps takes a confirming tick --------------------------------------------
 
 def test_a_plain_user_is_not_offered_delete_on_a_saved_step(chain):
