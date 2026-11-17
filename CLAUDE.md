@@ -60,6 +60,10 @@ Mutual exclusion is enforced in code: a line feeding a live chain can't be mark-
 - Deletion from a middle step cascades downstream (MR + line items + both linked invoices per hop). The whole cascade (and un-finalize) runs in ONE transaction with the root row locked; a finalized chain is always reverted, also when deleting from step 1. Un-finalize puts back the root's party / party branch / MR date (exactly from the Final PO's marker, else derived by name from step 1).
 - `save_transfer_step` locks the root row first and refuses a second step 1, any step after finalize, and a step that does not continue the chain's newest hop (stale tab / double save). Posted hop rates use exact Decimal (`jute_mr_chain_helpers.hop_rate`) = the screen's `_cascade_rate`. Finalize / un-finalize write the root's money exactly as the ERP does (`transfer._erp_recompute_money` mirrors vowerp3be `recompute_mr_money`, incl. 194Q TDS; TDS 0 on un-finalize). Deletes go by primary key after a plain read (`database.select_ids` / `delete_by_ids`) — never a DELETE filtered on an unindexed column (whole-table locks).
 
+### MR date order (owner rule 2026-11-17)
+
+A new MR number may not be dated before the latest MR already numbered at that **branch in that financial year** (the same day is fine), nor after today. "Numbered" = `branch_mr_no` set and status not Rejected / Cancelled / Drafted / Returned (4, 6, 21, 48) — the ERP's own approvals count. Checked by `transfer.enforce_mr_date` inside the save's transaction, under the save lock, just before the number is taken: hop save and finalize (`save_transfer_step`) and marked moves at the target branch (`save_marked_batch`). The pure rule is `jute_mr_chain_helpers.mr_date_problem`. Existing out-of-order MRs are left alone (only new saves are checked). An **admin** may save an out-of-order date with a reason (`date_override_reason`; "Date override (admin)" box on both pages): the exception is written to `jt_change_log` (`audit.py`, `scripts/migrate_jt_change_log.py`) in the same transaction, and is refused when it cannot be logged. The ERP itself has no such check at MR approval, so a mill branch can still go out of order from the ERP side.
+
 ### Transfer POs (2026-10-01 — spec `docs/superpowers/specs/2026-10-01-transfer-po-design.md`)
 
 Every chain transfer also writes ERP purchase orders (`jute_po` + `jute_po_li` + one `jute_po_status_log` row), in the same transaction as the step:
@@ -111,6 +115,7 @@ src/jutetransfer/
 ├── database.py                       # Cached engine, execute helpers, get_transaction()
 ├── config.py                         # .env-driven DB config
 ├── access.py                         # Who may log in / who is admin; require_admin guard for the ops (no Streamlit)
+├── audit.py                          # jt_change_log: admin exceptions (date overrides), caller's transaction
 ├── auth.py                           # Login form + session (VoWERP e-mail/password via access.py)
 ├── schemas.py                        # Schema introspection cache (schema viewer only)
 ├── data.py                           # Fake data for demo pages (unused by real pages)

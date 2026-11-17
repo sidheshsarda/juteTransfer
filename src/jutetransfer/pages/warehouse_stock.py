@@ -37,6 +37,7 @@ from ..lot_ops import create_lot, delete_lot_line
 from ..lot_helpers import apply_pct, line_price, combine_takes
 from ..warehouse_stock_ops import save_marked_batch, delete_marked_move
 from ..auth import is_admin
+from ..transfer import MrDateOrderError
 
 
 WAREHOUSE_FLASH_KEY = "warehouse_flash"
@@ -273,6 +274,15 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
         "takes the moved kg off their balance."
     )
     can_save = bool(tgt) and wh_id is not None
+    if is_admin():
+        # MR date order rule (transfer.enforce_mr_date) at the target branch.
+        with st.expander("Date override (admin)"):
+            st.text_input(
+                "Reason for an MR date before the target branch's latest MR",
+                key="xfer_dateovr",
+                help="Leave empty to keep the date rule. With a reason, the move is saved "
+                     "even if its date is out of order, and the reason is logged.",
+            )
     if st.button("Transfer selected lots", type="primary",
                  disabled=not can_save, key="btn_batch_move"):
         try:
@@ -280,6 +290,8 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
             created = save_marked_batch(
                 li_ids, float(pct), int(tgt_co), int(tgt_br), int(wh_id),
                 move_date, user_id,
+                date_override_reason=(st.session_state.get("xfer_dateovr") or None
+                                      if is_admin() else None),
             )
             _flash(
                 "Transferred. " + "; ".join(
@@ -288,7 +300,12 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
                     for c in created
                 )
             )
+            st.session_state.pop("xfer_dateovr", None)   # a reason is for one save only
             st.rerun()
+        except MrDateOrderError as e:
+            st.error(f"{e} " + ("To save it anyway, give a reason under 'Date override (admin)'."
+                                if is_admin() else
+                                "Only a transfer admin can save an out-of-order date."))
         except Exception as e:
             st.error(str(e))
 

@@ -52,6 +52,14 @@ chain step, un-finalize, or undo a marked move.
 
 7. **Report back** to the owner: commit deployed, test result, and who is on the access list.
 
+## Also in this release: MR date order rule
+
+No setup is needed. A hop, a finalize or a marked move is now refused when its MR date is before the latest
+MR already numbered at that branch in the financial year, or after today. An admin can save it anyway by
+typing a reason under "Date override (admin)"; that is recorded in the table `jt_change_log`. Check the
+table exists with the dry run `uv run python -m scripts.migrate_jt_change_log` only if the owner asks; do
+not `--apply` without the owner's OK.
+
 ## If something goes wrong
 
 - **Nobody can log in:** check `JT_ADMIN_EMAILS` in `.env` and that the app was restarted.

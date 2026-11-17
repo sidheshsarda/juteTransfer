@@ -12,11 +12,11 @@ from typing import Optional
 
 from sqlalchemy import text
 
-from . import access, po_ops
+from . import access, audit, po_ops
 from .database import DatabaseConnection, delete_by_ids, named_locks, select_ids
 from .jute_mr_chain_helpers import (
     _calculate_line_item_amount, _reconstruct_chain, hop_rate,
-    is_root_eligible_for_new_chain, step_multiplier,
+    is_root_eligible_for_new_chain, mr_date_problem, step_multiplier,
 )
 from .lot_helpers import production_rate
 from .queries import get_source_mr_full, _get_financial_year_bounds
@@ -668,6 +668,58 @@ def _get_next_mr_number_in_txn(conn, branch_id: int, mr_date: date) -> int:
          "fy_end": fy_end.strftime("%Y-%m-%d")},
     )
     return int(result.scalar() or 0) + 1
+
+
+# MR date order (owner rule 2026-11-17). MRs that hold a number in a branch's
+# series: any with branch_mr_no, the ERP's own approvals included, except
+# Rejected (4), Cancelled (6), Drafted (21) and Returned (48).
+MR_DATE_EXCLUDED_STATUSES = (4, 6, 21, 48)
+
+
+class MrDateOrderError(ValueError):
+    """The MR date breaks the date-order rule (and was not overridden)."""
+
+
+def latest_mr_date(conn, branch_id: int, mr_date: date):
+    """(date, branch_mr_no) of the newest numbered MR of the branch in
+    mr_date's financial year, or (None, None)."""
+    fy_start, fy_end = _get_financial_year_bounds(mr_date)
+    row = conn.execute(
+        text(f"""SELECT jute_mr_date, branch_mr_no
+                FROM jute_mr
+                WHERE branch_id = :bid
+                AND branch_mr_no IS NOT NULL
+                AND jute_mr_date BETWEEN :fy_start AND :fy_end
+                AND COALESCE(status_id, 0) NOT IN ({", ".join(map(str, MR_DATE_EXCLUDED_STATUSES))})
+                ORDER BY jute_mr_date DESC, branch_mr_no DESC
+                LIMIT 1"""),
+        {"bid": branch_id, "fy_start": fy_start.strftime("%Y-%m-%d"),
+         "fy_end": fy_end.strftime("%Y-%m-%d")},
+    ).fetchone()
+    if not row or row[0] is None:
+        return None, None
+    latest = row[0].date() if isinstance(row[0], datetime) else row[0]
+    return latest, row[1]
+
+
+def enforce_mr_date(conn, branch_id: int, mr_date: date, updated_by: int,
+                    override_reason: Optional[str] = None,
+                    ref_mr_id: Optional[int] = None) -> None:
+    """Refuse an MR date that breaks the date-order rule, inside the save's
+    transaction and under its lock, just before the number is taken. With
+    `override_reason` (the caller has already checked the user is an admin)
+    the save goes through and the exception is written to the change log."""
+    mr_date = mr_date.date() if isinstance(mr_date, datetime) else mr_date
+    latest, latest_no = latest_mr_date(conn, branch_id, mr_date)
+    problem = mr_date_problem(mr_date, latest, latest_no, today=date.today())
+    if not problem:
+        return
+    reason = (override_reason or "").strip()
+    if not reason:
+        raise MrDateOrderError(problem)
+    audit.log(conn, audit.ACTION_DATE_OVERRIDE, jute_mr_id=ref_mr_id, branch_id=branch_id,
+              detail={"mr_date": mr_date, "latest_mr_date": latest, "latest_mr_no": latest_no},
+              reason=reason, user_id=updated_by)
 
 
 def _get_next_bill_pass_no_in_txn(conn, branch_id: int, mr_date: date = None) -> int:
@@ -1730,8 +1782,13 @@ def save_transfer_step(
     is_final: bool = False,
     original_source_mr_id: Optional[int] = None,
     use_new_rounding: bool = False,
+    date_override_reason: Optional[str] = None,
 ) -> dict:
     """Save a single transfer step: create MR + invoice.
+
+    The MR date must not be before the latest MR already numbered at the
+    step's branch in that financial year, nor after today (enforce_mr_date);
+    an admin passes `date_override_reason` to save anyway, which is logged.
 
     Args:
         source_mr_id: MR ID for fetching rate base (prev step's MR, or root for step 0)
@@ -1762,6 +1819,8 @@ def save_transfer_step(
     mr_id = None
     invoice_id = None
     po = None
+    if (date_override_reason or "").strip():
+        access.require_admin(updated_by)
     # Exact Decimal multiplier (1 + pct/100) when the step carries the % the
     # user typed; the float rate_multiplier otherwise. Posting then uses the
     # same arithmetic as the screen (see jute_mr_chain_helpers.hop_rate).
@@ -1870,6 +1929,9 @@ def save_transfer_step(
                     f"The transfer chain of MR {root_mr_id} has changed since this page "
                     "was loaded (saved from another session?); refresh the page"
                 )
+
+        enforce_mr_date(conn, step.branch_id, step.mr_date, updated_by,
+                        date_override_reason, ref_mr_id=root_mr_id)
 
         # Assign MR number inside transaction
         step.mr_no = _get_next_mr_number_in_txn(conn, step.branch_id, step.mr_date)

@@ -166,7 +166,7 @@ def test_repair_counts_tds_in_the_order_the_lorries_were_finalized(scenario, po_
               transfer_mode=0)
     chain = Chain(sc)
     chain.save("B", mr_date=date(2026, 9, 1))
-    chain.save("A", pct=0.5, mr_date=date(2026, 9, 3))
+    chain.save("A", pct=0.5, mr_date=date(2026, 9, 3), date_override="finalized late")
     # finalize itself now counts only the MRs before this one (ERP rule, 2026-10-03)
     assert db.row("jute_mr", jute_mr_id=sc.root)["tds_amount"] == 385.75
     # what the old finalize left behind
@@ -602,7 +602,8 @@ def test_a_hop_mr_carries_the_tds_the_erp_would_derive(scenario, po_on):
     assert money(db, hop)["tds_amount"] == 1378.88
 
     earlier = Chain(sc, root=sc.add_root(ge_no=9, ge_date=date(2026, 7, 20)))
-    hop2 = earlier.save("B", mr_date=date(2026, 7, 25))["mr_id"]      # before the Rs 60 lakh
+    hop2 = earlier.save("B", mr_date=date(2026, 7, 25),               # before the Rs 60 lakh
+                       date_override="back-dated lorry")["mr_id"]
     assert money(db, hop2)["tds_amount"] == 0.0
 
 

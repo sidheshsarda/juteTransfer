@@ -35,6 +35,27 @@ def is_root_eligible_for_new_chain(status_id) -> bool:
 # Shared rounding helpers (used by live display, chain recalc, and posting)
 # ---------------------------------------------------------------------------
 
+def mr_date_problem(mr_date, latest_date=None, latest_no=None, today=None):
+    """Why `mr_date` may not be used for a new MR number, or None when it may.
+
+    Owner rule 2026-11-17: within one branch and financial year the MR number
+    order follows the MR date order, so a new MR may not be dated before the
+    latest MR already numbered there (the same day is fine). A date after
+    today is refused too: one future-dated MR would freeze the branch.
+    `latest_date` / `latest_no`: the newest numbered MR of that branch in
+    mr_date's financial year (None when there is none yet).
+    """
+    if today is not None and mr_date > today:
+        return (f"The date {mr_date:%d-%m-%Y} is after today. An MR dated in the future "
+                "would block every MR of this branch until that day.")
+    if latest_date is not None and mr_date < latest_date:
+        no = f" (MR no. {latest_no})" if latest_no else ""
+        return (f"The date {mr_date:%d-%m-%Y} is before the latest MR already made at this "
+                f"branch, {latest_date:%d-%m-%Y}{no}. The earliest date allowed is "
+                f"{latest_date:%d-%m-%Y}.")
+    return None
+
+
 def _cascade_rate(original_rate: float, steps: list, up_to_index: int) -> float:
     """Round-then-cascade: round at kg level (2 decimals) at each step boundary.
 

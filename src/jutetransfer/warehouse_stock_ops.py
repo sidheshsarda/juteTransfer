@@ -49,6 +49,7 @@ from .transfer import (
     CHAIN_SAVE_LOCK,
     CHAIN_SAVE_LOCK_TIMEOUT,
     RAW_JUTE_INVOICE_TYPE,
+    enforce_mr_date,
     _delete_invoice,
     _ensure_company_as_party,
     _ensure_item,
@@ -365,6 +366,7 @@ def save_marked_batch(
     warehouse_id: int,
     mr_date: date,
     updated_by: int,
+    date_override_reason: str = None,
 ) -> list:
     """Move N whole lots into a marked godown in one transaction.
 
@@ -393,12 +395,17 @@ def save_marked_batch(
     if not lot_li_ids:
         raise ValueError("no lots selected")
     ids = sorted({int(x) for x in lot_li_ids})
+    if (date_override_reason or "").strip():
+        access.require_admin(updated_by)
 
     # The app's own saves one at a time (see transfer.CHAIN_SAVE_LOCK): the
     # child MR / gate-entry / invoice numbers below are MAX+1 reads, and the
     # lock is taken BEFORE the transaction so those reads are fresh.
     with named_locks({CHAIN_SAVE_LOCK: CHAIN_SAVE_LOCK_TIMEOUT}), \
             DatabaseConnection.get_transaction() as conn:
+        # MR date order at the target branch (see transfer.enforce_mr_date):
+        # every child of this batch is numbered there on mr_date.
+        enforce_mr_date(conn, target_branch_id, mr_date, updated_by, date_override_reason)
         rows = []
         for li_id in ids:  # ascending lock order
             row = conn.execute(text("""

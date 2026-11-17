@@ -31,7 +31,7 @@ from ..jute_mr_chain_helpers import (
     _stored_amount,
     is_root_eligible_for_new_chain,
 )
-from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
+from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep, MrDateOrderError
 from ..auth import is_admin
 
 FLASH_KEY = "chain_flash"
@@ -113,7 +113,7 @@ def _chain_changed(steps, chain_data, is_finalized: bool, mr_id: int) -> bool:
 
 
 STEP_WIDGETS = ("company", "date", "transport", "lc_ref", "lc_date", "po_lc", "od_lc",
-                "pct_input", "pct", "confirm_delete")
+                "pct_input", "pct", "confirm_delete", "dateovr")
 
 
 def _step_widget_keys(mr_id: int, step_index: int) -> list:
@@ -1247,6 +1247,16 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
 
         elif step.get("company"):
             # Unsaved steps with company set: save, clear, or remove
+            if is_admin():
+                # MR date order rule (transfer.enforce_mr_date): an admin may
+                # save an out-of-order date by giving a reason, which is logged.
+                with st.expander("Date override (admin)"):
+                    st.text_input(
+                        "Reason for an MR date before the branch's latest MR",
+                        key=f"dateovr_{mr_id}_{step_index}",
+                        help="Leave empty to keep the date rule. With a reason, the step is "
+                             "saved even if its date is out of order, and the reason is logged.",
+                    )
             col_save, col_clear, col_delete = st.columns(3)
 
             with col_save:
@@ -1516,6 +1526,8 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             is_final=is_final,
             original_source_mr_id=mr_id,
             use_new_rounding=True,
+            date_override_reason=(st.session_state.get(f"dateovr_{mr_id}_{step_index}") or None
+                                  if is_admin() else None),
         )
 
         # Clear cache to force reload on next render
@@ -1539,6 +1551,10 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             _flash("success", f"{msg}.")
         st.rerun()
 
+    except MrDateOrderError as e:
+        st.error(f"Step {step_index + 1} was not saved: {e} "
+                 + ("To save it anyway, give a reason under 'Date override (admin)'."
+                    if is_admin() else "Only a transfer admin can save an out-of-order date."))
     except Exception as e:
         # The whole step is one transaction: a failure writes nothing. The
         # traceback goes to the server log (.logs/jt.log), not to the phone.
