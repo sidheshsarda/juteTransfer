@@ -132,8 +132,7 @@ from src.jutetransfer.transfer import (
 DEFAULT_LOG_DIR = Path(__file__).resolve().parents[2] / ".logs"
 UPDATED_BY = 1  # same demo user id the app writes
 REPAIRS = ("finalized-net", "unfinalized-party", "godowns", "marked-stock", "invoice-links",
-           "hop-tds", "po-lorry-quantity")
-           "hop-tds", "missing-rates")
+           "hop-tds", "po-lorry-quantity", "missing-rates")
 
 # Chain roots, driven from the hop rows: jute_mr.src_jute_mr_id has no index.
 _CHAIN_ROOTS_SQL = """
