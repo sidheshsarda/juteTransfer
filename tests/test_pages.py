@@ -500,6 +500,18 @@ def test_a_plain_user_gets_no_override_box(chain):
     assert chain.saves[-1]["date_override_reason"] is None
 
 
+# --- A new step starts on the previous transfer's date, not on today -------------------------------
+
+def test_a_new_step_opens_on_the_previous_transfers_date(chain):
+    from src.jutetransfer.jute_mr_chain_helpers import as_date
+    at = _start(A_ROOT)
+    previous = as_date(_steps(at, A_ROOT)[0]["mr_date"])
+    assert previous is not None and previous != date.today()
+    assert as_date(_steps(at, A_ROOT)[1]["mr_date"]) == previous
+    _open_step_2(at, A_ROOT)
+    assert at.date_input(key=f"date_{A_ROOT}_1").value == previous
+
+
 # --- Edit mode: a saved step is changed in place, by an admin, with a reason ----------------------
 
 def test_an_admin_edits_a_saved_steps_date_in_place(chain, monkeypatch):

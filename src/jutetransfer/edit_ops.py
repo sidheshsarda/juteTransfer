@@ -20,6 +20,8 @@ Limits, each refused in words:
   * not after today;
   * between the dates of the neighbouring MR numbers of the branch (the date
     order rule), unless the admin ticks "out of order";
+  * not before where the lorry came from (the previous transfer, or the gate
+    entry for the first one) and not after where it went next;
   * a godown of the MR's own branch (a marked child: a MARKED godown), and
     not once the ERP has issued from those lines.
 
@@ -34,7 +36,7 @@ from sqlalchemy import text
 
 from . import access, audit, po_ops
 from .database import DatabaseConnection, named_locks
-from .jute_mr_chain_helpers import _reconstruct_chain, edit_date_problem
+from .jute_mr_chain_helpers import _reconstruct_chain, edit_date_problem, received_date_problem
 from .queries import _get_financial_year_bounds
 from .transfer import (
     CHAIN_SAVE_LOCK, CHAIN_SAVE_LOCK_TIMEOUT, HOP_TDS_AMOUNT, MR_DATE_EXCLUDED_STATUSES,
@@ -50,6 +52,8 @@ KIND_HOP, KIND_FINAL, KIND_MARKED = "hop", "final", "marked"
 def _as_date(value) -> Optional[date]:
     if isinstance(value, datetime):
         return value.date()
+    if isinstance(value, str):          # an aggregate (MIN / MAX) can come back as text
+        return date.fromisoformat(value[:10])
     return value
 
 
@@ -70,6 +74,28 @@ def _neighbour_dates(conn, branch_id: int, mr_no: int, ref_date: date, mr_id: in
         f"SELECT jute_mr_date {base} AND branch_mr_no > :no ORDER BY jute_mr_date ASC LIMIT 1"),
         params).fetchone()
     return (_as_date(lo[0]) if lo else None, _as_date(hi[0]) if hi else None)
+
+
+def _mr_dates(conn, mr_id: int) -> tuple:
+    row = conn.execute(text(
+        "SELECT jute_mr_date, jute_gate_entry_date FROM jute_mr WHERE jute_mr_id = :id"),
+        {"id": mr_id}).fetchone()
+    return (_as_date(row[0]), _as_date(row[1])) if row else (None, None)
+
+
+def _check_chain_dates(new_date: Optional[date], came_from, went_to) -> None:
+    """A step stays between the date of where the lorry came from and the
+    date of where it went next (owner rule 2026-11-17)."""
+    if new_date is None:
+        return
+    problem = received_date_problem(new_date, came_from, "where the lorry came from")
+    if problem:
+        raise ValueError(problem)
+    if went_to is not None and new_date > went_to:
+        raise ValueError(
+            f"The date {new_date:%d-%m-%Y} is after the next transfer of this lorry "
+            f"({went_to:%d-%m-%Y}). Use {went_to:%d-%m-%Y} or earlier, or re-date the next "
+            "transfer first.")
 
 
 def _edit_mr(conn, mr_id: int, kind: str, invoice_ids: list, po_ids: list,
@@ -200,6 +226,7 @@ def edit_chain_step(root_mr_id: int, step_mr_id: int, *, reason: str, updated_by
             kind = KIND_FINAL
             invoice_ids = _invoice_ids_for_mr(conn, ids[-1])        # booked by the last seller
             po_ids = po_ops.find_final_po_ids(conn, root_mr_id)
+            came_from, went_to = _mr_dates(conn, ids[-1])[0], None
         else:
             if int(step_mr_id) not in ids:
                 raise ValueError("That step is no longer part of this chain; refresh the page")
@@ -207,8 +234,17 @@ def edit_chain_step(root_mr_id: int, step_mr_id: int, *, reason: str, updated_by
             at = ids.index(int(step_mr_id))
             invoice_ids = _invoice_ids_for_mr(conn, ids[at - 1]) if at > 0 else []
             po_ids = po_ops.find_forward_po_ids(conn, int(step_mr_id))
+            # from: the previous hop, or the lorry's gate entry for the first
+            came_from = (_mr_dates(conn, ids[at - 1])[0] if at > 0
+                         else _mr_dates(conn, root_mr_id)[1])
+            # to: the next hop, or the finalized mill MR after the last one
+            if at + 1 < len(ids):
+                went_to = _mr_dates(conn, ids[at + 1])[0]
+            else:
+                went_to = _mr_dates(conn, root_mr_id)[0] if root[1] is not None else None
         if len(invoice_ids) > 1:
             raise ValueError("This step has more than one invoice; it cannot be edited here")
+        _check_chain_dates(new_date, came_from, went_to)
 
         changed = _edit_mr(conn, int(step_mr_id), kind, invoice_ids, po_ids,
                            new_date, new_warehouse_id, allow_out_of_order, updated_by)
@@ -234,6 +270,10 @@ def edit_marked_move(child_mr_id: int, *, reason: str, updated_by: int,
         invoice_ids = _invoice_ids_for_mr(conn, child_mr_id)
         if len(invoice_ids) > 1:
             raise ValueError("This move has more than one invoice; it cannot be edited here")
+        onward = conn.execute(text(
+            "SELECT MIN(jute_mr_date) FROM jute_mr WHERE src_jute_mr_id = :id AND transfer_mode = 1"),
+            {"id": child_mr_id}).scalar()
+        _check_chain_dates(new_date, _mr_dates(conn, int(child[0]))[0], _as_date(onward))
         changed = _edit_mr(conn, int(child_mr_id), KIND_MARKED, invoice_ids, [],
                            new_date, new_warehouse_id, allow_out_of_order, updated_by)
         if changed:

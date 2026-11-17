@@ -12,11 +12,11 @@ from typing import Optional
 
 from sqlalchemy import text
 
-from . import access, audit, po_ops
+from . import access, audit, freed, po_ops
 from .database import DatabaseConnection, delete_by_ids, named_locks, select_ids
 from .jute_mr_chain_helpers import (
     _calculate_line_item_amount, _reconstruct_chain, hop_rate,
-    is_root_eligible_for_new_chain, mr_date_problem, step_multiplier,
+    is_root_eligible_for_new_chain, mr_date_problem, received_date_problem, step_multiplier,
 )
 from .lot_helpers import production_rate
 from .queries import get_source_mr_full, _get_financial_year_bounds
@@ -639,7 +639,11 @@ def _get_next_gate_entry_no(conn, branch_id: int, mr_date: date = None) -> int:
     FY window is derived from mr_date (the date being stamped on the row),
     so back-dated or forward-dated entries are numbered within their own FY.
     mr_date=None keeps today's behavior (matches _get_financial_year_bounds).
+    A freed number whose date fits is handed out first (freed.take).
     """
+    slot = freed.take(conn, "gate", branch_id, mr_date) if mr_date else None
+    if slot:
+        return slot
     fy_start, fy_end = _get_financial_year_bounds(mr_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(jute_gate_entry_no), 0) AS max_no
@@ -657,7 +661,11 @@ def _get_next_mr_number_in_txn(conn, branch_id: int, mr_date: date) -> int:
 
     FY window is derived from mr_date (the date of the MR being inserted), so
     back-dated or forward-dated entries are numbered within their own FY.
+    A freed number whose date fits is handed out first (freed.take).
     """
+    slot = freed.take(conn, "mr", branch_id, mr_date)
+    if slot:
+        return slot
     fy_start, fy_end = _get_financial_year_bounds(mr_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(branch_mr_no), 0) AS max_no
@@ -674,6 +682,18 @@ def _get_next_mr_number_in_txn(conn, branch_id: int, mr_date: date) -> int:
 # series: any with branch_mr_no, the ERP's own approvals included, except
 # Rejected (4), Cancelled (6), Drafted (21) and Returned (48).
 MR_DATE_EXCLUDED_STATUSES = (4, 6, 21, 48)
+
+
+class ChainDateError(ValueError):
+    """The MR date is before the date of where the lorry came from."""
+
+
+def came_from_date(source_mr: dict, is_first_step: bool):
+    """The date a step may not go before: the previous transfer's MR date, or
+    for the first transfer the lorry's gate entry date."""
+    if is_first_step:
+        return source_mr.get("jute_gate_entry_date") or source_mr.get("jute_mr_date")
+    return source_mr.get("jute_mr_date") or source_mr.get("jute_gate_entry_date")
 
 
 class MrDateOrderError(ValueError):
@@ -711,6 +731,10 @@ def enforce_mr_date(conn, branch_id: int, mr_date: date, updated_by: int,
     the save goes through and the exception is written to the change log."""
     mr_date = mr_date.date() if isinstance(mr_date, datetime) else mr_date
     latest, latest_no = latest_mr_date(conn, branch_id, mr_date)
+    if mr_date <= date.today() and freed.take(conn, "mr", branch_id, mr_date, peek=True):
+        # A freed MR number is waiting whose neighbours' dates enclose this
+        # date: the save takes that number, so the order is kept.
+        return
     problem = mr_date_problem(mr_date, latest, latest_no, today=date.today())
     if not problem:
         return
@@ -728,7 +752,11 @@ def _get_next_bill_pass_no_in_txn(conn, branch_id: int, mr_date: date = None) ->
     Bill pass numbers are sequential per branch within a financial year
     (April 1 to March 31). FY window is derived from mr_date (the date being
     stamped on the row); mr_date=None keeps today's behavior.
+    A freed number whose date fits is handed out first (freed.take).
     """
+    slot = freed.take(conn, "billpass", branch_id, mr_date) if mr_date else None
+    if slot:
+        return slot
     fy_start, fy_end = _get_financial_year_bounds(mr_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(bill_pass_no), 0) AS max_no
@@ -811,7 +839,10 @@ def _create_mr(conn, source_mr: dict, step: TransferStep,
             :invoice_no, :invoice_date, :invoice_amount
         )
     """, {
-        "gate_entry_no": _get_next_gate_entry_no(conn, step.branch_id, step.mr_date),
+        # taken once, by save_transfer_step (a second call would use up a
+        # freed number and then hand out the next one)
+        "gate_entry_no": (step.gate_entry_no
+                          or _get_next_gate_entry_no(conn, step.branch_id, step.mr_date)),
         "branch_mr_no": step.mr_no,
         "gate_entry_date": step.mr_date,
         "mr_date": step.mr_date,
@@ -1027,7 +1058,11 @@ def _get_next_invoice_no(conn, branch_id: int, invoice_date: date) -> int:
 
     FY window is derived from invoice_date so back-dated / forward-dated
     invoices are numbered within their own FY (matches _get_next_mr_number_in_txn).
+    A freed number whose date fits is handed out first (freed.take).
     """
+    slot = freed.take(conn, "invoice", branch_id, invoice_date)
+    if slot:
+        return slot
     fy_start, fy_end = _get_financial_year_bounds(invoice_date)
     result = conn.execute(
         text("""SELECT COALESCE(MAX(invoice_no), 0) AS max_no
@@ -1461,8 +1496,10 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
                          use_new_rounding: bool = False,
                          challan_no: Optional[str] = None,
                          challan_date: Optional[date] = None,
-                         seller_invoice: Optional[dict] = None) -> None:
-    """Update the original MR with final rate/party and assign branch_mr_no.
+                         seller_invoice: Optional[dict] = None,
+                         mr_no: Optional[int] = None) -> None:
+    """Update the original MR with final rate/party and assign branch_mr_no
+    (`mr_no` when the caller has already taken the number).
 
     Args:
         rate_source_line_items: When provided, use these line items' rates as the
@@ -1485,7 +1522,7 @@ def _update_original_mr(conn, jute_mr_id: int, rate_multiplier: float,
     _ensure_party_types(conn, final_party_id, updated_by)
 
     # Assign branch_mr_no and bill_pass_no
-    new_mr_no = _get_next_mr_number_in_txn(conn, branch_id, mr_date)
+    new_mr_no = mr_no or _get_next_mr_number_in_txn(conn, branch_id, mr_date)
     new_bill_pass_no = _get_next_bill_pass_no_in_txn(conn, branch_id, mr_date)
 
     # Update each line item with its computed absolute rate.
@@ -1686,6 +1723,9 @@ def revert_original_mr(conn, jute_mr_id: int, step1_source_mr: dict, updated_by:
     """
     # What finalize overwrote on the header, read before its Final PO goes.
     original = _original_header(conn, jute_mr_id, step1_source_mr)
+    # The mill's MR / bill pass numbers are about to be cleared: a finalize
+    # again on a date that fits takes them back.
+    _free_mr_numbers(conn, jute_mr_id, updated_by, series=("mr", "billpass"))
 
     # The Final PO written at finalize goes first: if it cannot be removed
     # (an ERP user booked another MR against it) nothing else is touched.
@@ -1852,6 +1892,14 @@ def save_transfer_step(
         if not source_mr:
             raise ValueError(f"Source MR {source_mr_id} not found")
 
+        # A lorry is never received before it left where it came from.
+        problem = received_date_problem(
+            step.mr_date.date() if isinstance(step.mr_date, datetime) else step.mr_date,
+            came_from_date(source_mr, is_first_step),
+            "the gate entry" if is_first_step else "the previous transfer")
+        if problem:
+            raise ChainDateError(problem)
+
         # The endpoints the page sends, checked against the rows: the seller
         # of this step IS the source MR's company and branch (the invoice is
         # booked at that branch and the hop records it as received-from), a
@@ -1935,7 +1983,8 @@ def save_transfer_step(
 
         # Assign MR number inside transaction
         step.mr_no = _get_next_mr_number_in_txn(conn, step.branch_id, step.mr_date)
-        step.gate_entry_no = _get_next_gate_entry_no(conn, step.branch_id, step.mr_date)
+        if not is_final:    # the mill's MR keeps the lorry's own gate entry number
+            step.gate_entry_no = _get_next_gate_entry_no(conn, step.branch_id, step.mr_date)
 
         if is_first_step:
             # Step[0]: first receiver gets MR from original supplier
@@ -2039,6 +2088,7 @@ def save_transfer_step(
                     challan_no=inv_challan_no,
                     challan_date=step.challan_date or inv_challan_date,
                     seller_invoice=seller_invoice,
+                    mr_no=step.mr_no,
                 )
                 # The origin's final PO on the last forwarding company, from
                 # the root's lines as just re-priced. The root MR itself keeps
@@ -2083,10 +2133,30 @@ def _invoice_ids_for_mr(conn, mr_id: int) -> list:
     return [r[0] for r in rows]
 
 
+def _free_mr_numbers(conn, mr_id: int, updated_by: Optional[int] = None,
+                     series: tuple = ("mr", "gate", "billpass")) -> None:
+    """Remember the numbers an MR holds, just before it is deleted or
+    un-finalized, so a later save whose date fits takes them back (freed.py)."""
+    row = conn.execute(text(
+        "SELECT branch_id, branch_mr_no, jute_mr_date, jute_gate_entry_no, jute_gate_entry_date, "
+        "bill_pass_no, bill_pass_date FROM jute_mr WHERE jute_mr_id = :id"), {"id": mr_id}).fetchone()
+    if not row:
+        return
+    held = {"mr": (row[1], row[2]), "gate": (row[3], row[4]), "billpass": (row[5], row[6])}
+    for name in series:
+        freed.record(conn, name, row[0], held[name][0], held[name][1], mr_id, updated_by)
+
+
 def _delete_invoice(conn, invoice_id: int) -> None:
     """Hard-delete one chain invoice from all four of its tables (the claim
     breakdown in sales_invoice_jute_dtl has no FK and used to be left behind),
-    each by primary key -- see database.delete_by_ids."""
+    each by primary key -- see database.delete_by_ids. Its number is
+    remembered as freed (freed.py)."""
+    inv = conn.execute(text(
+        "SELECT branch_id, invoice_no, invoice_date FROM sales_invoice WHERE invoice_id = :id"),
+        {"id": invoice_id}).fetchone()
+    if inv:
+        freed.record(conn, "invoice", inv[0], inv[1], inv[2], invoice_id)
     dtl_ids = select_ids(conn, """
         SELECT invoice_line_item_id FROM sales_invoice_dtl WHERE invoice_id = :id
     """, {"id": invoice_id})
@@ -2168,6 +2238,7 @@ def _delete_transfer_step_in_txn(conn, jute_mr_id: int, updated_by: int) -> Opti
     # jute_mr_id index, where ERP gate entries insert new lines)
     delete_by_ids(conn, "jute_mr_li", "jute_mr_li_id", select_ids(
         conn, "SELECT jute_mr_li_id FROM jute_mr_li WHERE jute_mr_id = :id", {"id": jute_mr_id}))
+    _free_mr_numbers(conn, jute_mr_id, updated_by)
     conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"), {"id": jute_mr_id})
     return deleted_po
 

@@ -72,7 +72,8 @@ def test_a_new_financial_year_starts_its_own_series(scenario, po_on):
     sc, db = scenario, scenario.db
     db.insert("jute_mr", branch_id=sc.b_branch, status_id=3, branch_mr_no=900,
               jute_mr_date=date(2026, 3, 30), transfer_mode=0)         # last year's series
-    assert Chain(sc).save("B", mr_date=date(2026, 4, 2))["mr_id"]
+    early = Chain(sc, root=sc.add_root(ge_no=9, ge_date=date(2026, 4, 1)))
+    assert early.save("B", mr_date=date(2026, 4, 2))["mr_id"]
 
 
 def test_a_future_date_is_refused(scenario, po_on):

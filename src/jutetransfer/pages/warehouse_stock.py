@@ -35,6 +35,7 @@ from ..queries import (
 )
 from ..lot_ops import create_lot, delete_lot_line
 from ..lot_helpers import apply_pct, line_price, combine_takes
+from ..jute_mr_chain_helpers import as_date
 from ..warehouse_stock_ops import save_marked_batch, delete_marked_move
 from ..auth import is_admin
 from ..transfer import MrDateOrderError
@@ -246,7 +247,15 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
             st.selectbox("Marked godown", options=["(select company)"],
                          key="xfer_wh")
     with t3:
-        move_date = st.date_input("Date", value=date.today(), key="xfer_dt")
+        # Starts at the latest MR date of the lots picked (stock cannot move
+        # on before it was received), re-seeded when the pick changes; the
+        # user can still change it. Keyed, no value=.
+        picked = tuple(sorted(int(x) for x in sel["jute_mr_li_id"]))
+        if st.session_state.get("xfer_dt_for") != picked or "xfer_dt" not in st.session_state:
+            received = [d for d in (as_date(v) for v in sel["mr_date"]) if d is not None]
+            st.session_state["xfer_dt"] = max(received) if received else date.today()
+            st.session_state["xfer_dt_for"] = picked
+        move_date = st.date_input("Date", key="xfer_dt")
     with t4:
         if "xfer_pct" not in st.session_state:
             st.session_state["xfer_pct"] = 0.0

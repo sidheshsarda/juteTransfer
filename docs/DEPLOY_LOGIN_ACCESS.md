@@ -60,6 +60,14 @@ typing a reason under "Date override (admin)"; that is recorded in the table `jt
 table exists with the dry run `uv run python -m scripts.migrate_jt_change_log` only if the owner asks; do
 not `--apply` without the owner's OK.
 
+## Also in this release: edit mode and freed numbers
+
+- Admins can change the date (within its month) and godown of a saved step or marked move in place; numbers
+  stay the same. No setup.
+- A number freed by a delete is remembered in the table `jt_freed_no` and re-used by the next save whose date
+  fits. The app works as before if the table is missing. Create it only with the owner's OK:
+  `uv run python -m scripts.migrate_jt_freed_no` (dry run), then `--apply`.
+
 ## If something goes wrong
 
 - **Nobody can log in:** check `JT_ADMIN_EMAILS` in `.env` and that the app was restarted.

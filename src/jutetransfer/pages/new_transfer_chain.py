@@ -30,8 +30,10 @@ from ..jute_mr_chain_helpers import (
     _calculate_line_item_amount,
     _stored_amount,
     is_root_eligible_for_new_chain,
+    default_step_date,
 )
-from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep, MrDateOrderError
+from ..transfer import (save_transfer_step, delete_chain_from_step, TransferStep,
+                        MrDateOrderError, ChainDateError)
 from ..auth import is_admin
 from ..edit_ops import edit_chain_step
 
@@ -132,15 +134,14 @@ def _lorry_widget_keys(mr_id: int) -> list:
     return [k for k in st.session_state if isinstance(k, str) and k.startswith(prefixes)]
 
 
-def _source_mr_date(source_row):
-    """The selected MR's date (the default date of a new step); today when
-    the row has none."""
-    raw = None
-    if source_row is not None and "MR DATE" in getattr(source_row, "index", []):
-        raw = source_row.get("MR DATE")
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return date.today()
-    return raw
+def _new_step_date(earlier_steps, source_row):
+    """The date a new step starts with (the user can still change it): the
+    previous transfer's date, else the lorry's gate entry date -- never
+    simply today (owner rule 2026-11-17)."""
+    gate = None
+    if source_row is not None and "Jute Gate Entry Date" in getattr(source_row, "index", []):
+        gate = source_row.get("Jute Gate Entry Date")
+    return default_step_date(earlier_steps, gate)
 
 
 def _mr_label(step: dict) -> str:
@@ -819,7 +820,7 @@ def _render_chain_editor(filter_key):
         # (the synthetic return-to-origin step is the terminal state).
         if not is_finalized:
             new_step = _empty_transfer_step()
-            new_step["mr_date"] = raw_mr_date
+            new_step["mr_date"] = _new_step_date(transfers[mr_id], row)
             transfers[mr_id].append(new_step)
 
     steps = transfers[mr_id]
@@ -1271,7 +1272,8 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 if st.button("Clear", key=f"clear_{mr_id}_{step_index}",
                              help="Empty this step: company, date, godown, LC fields and %"):
                     all_steps[step_index] = _empty_transfer_step()
-                    all_steps[step_index]["mr_date"] = _source_mr_date(source_row)
+                    all_steps[step_index]["mr_date"] = _new_step_date(all_steps[:step_index],
+                                                                      source_row)
                     for k in _step_widget_keys(mr_id, step_index):
                         st.session_state.pop(k, None)
                     st.rerun()
@@ -1289,7 +1291,7 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                     if not any(not s.get("saved_mr_id") for s in all_steps):
                         # Never leave the chain without a step to type into.
                         blank = _empty_transfer_step()
-                        blank["mr_date"] = _source_mr_date(source_row)
+                        blank["mr_date"] = _new_step_date(all_steps, source_row)
                         all_steps.append(blank)
                     st.rerun()
 
@@ -1613,6 +1615,8 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             _flash("success", f"{msg}.")
         st.rerun()
 
+    except ChainDateError as e:
+        st.error(f"Step {step_index + 1} was not saved: {e}")
     except MrDateOrderError as e:
         st.error(f"Step {step_index + 1} was not saved: {e} "
                  + ("To save it anyway, give a reason under 'Date override (admin)'."

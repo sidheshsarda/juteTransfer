@@ -41,6 +41,7 @@ from sqlalchemy import text
 
 from . import access
 from .database import DatabaseConnection, delete_by_ids, named_locks, select_ids
+from .jute_mr_chain_helpers import received_date_problem
 from .lot_helpers import (
     advised_share, apply_pct, line_price, net_rate, production_rate,
     restore_amounts, round_kg, sold_share,
@@ -49,12 +50,14 @@ from .transfer import (
     CHAIN_SAVE_LOCK,
     CHAIN_SAVE_LOCK_TIMEOUT,
     RAW_JUTE_INVOICE_TYPE,
+    ChainDateError,
     enforce_mr_date,
     _delete_invoice,
     _ensure_company_as_party,
     _ensure_item,
     _erp_money,
     _format_document_no,
+    _free_mr_numbers,
     _get_next_challan_no,
     _get_next_gate_entry_no,
     _get_next_invoice_no,
@@ -418,6 +421,7 @@ def save_marked_batch(
                        li.active, li.status,
                        li.jute_mr_id, mr.branch_id AS src_branch_id,
                        mr.transfer_mode, mr.status_id, mr.src_jute_mr_id,
+                       mr.jute_mr_date AS src_mr_date,
                        bm.co_id AS src_co_id
                 FROM jute_mr_li li
                 JOIN jute_mr mr ON mr.jute_mr_id = li.jute_mr_id
@@ -435,6 +439,11 @@ def save_marked_batch(
                 )
             if int(r["status_id"] or 0) != 3:
                 raise ValueError("Can only mark-move Approved (status 3) MRs")
+            # Stock never moves on before the day it was received.
+            problem = received_date_problem(mr_date, r["src_mr_date"],
+                                            f"the date of source MR {r['jute_mr_id']}")
+            if problem:
+                raise ChainDateError(problem)
             # Mode-0 rows with src_jute_mr_id set are chain hops -- blocked.
             # Mode-1 rows legitimately carry their direct parent there and may
             # be resold onward (each hop books its own seller invoice).
@@ -812,6 +821,7 @@ def delete_marked_move(child_mr_id: int, updated_by: int) -> None:
         delete_by_ids(conn, "jute_mr_li", "jute_mr_li_id", select_ids(
             conn, "SELECT jute_mr_li_id FROM jute_mr_li WHERE jute_mr_id = :id",
             {"id": child_mr_id}))
+        _free_mr_numbers(conn, child_mr_id, updated_by)
         conn.execute(text("DELETE FROM jute_mr WHERE jute_mr_id = :id"),
                      {"id": child_mr_id})
 
