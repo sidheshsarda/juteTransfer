@@ -8,7 +8,7 @@
 - Frontend: Streamlit + streamlit-aggrid
 - Backend: Python 3.12+ with SQLAlchemy (raw SQL via `text()`), mysql-connector
 - Database: MySQL — connects **directly** to the `sls` tenant DB (credentials in `.env`)
-- Auth: local demo auth in `src.jutetransfer.auth` (not connected to VoWERP JWT)
+- Auth: the user's VoWERP e-mail + password (bcrypt, `sls.user_mst`) plus the app's own access list `jt_user_access` (roles `user` / `admin`) — `access.py` (no Streamlit), `auth.py` (login form, session `user_id` / `role`), `pages/users.py` (admins manage the list). Only an admin may change or remove what is saved: `access.require_admin(updated_by)` sits inside `delete_chain_from_step`, `delete_marked_move` and `set_access`, and the pages hide those buttons from users. `.env`: `JT_ADMIN_EMAILS` (always-admin bootstrap list), `JT_LEGACY_LOGIN=1` (transition only: old shared logins work and the guard is permissive). Table: `scripts/migrate_jt_user_access.py` (dry-run by default)
 
 ## Ecosystem & Scope (READ FIRST)
 
@@ -60,6 +60,25 @@ Mutual exclusion is enforced in code: a line feeding a live chain can't be mark-
 - Deletion from a middle step cascades downstream (MR + line items + both linked invoices per hop). The whole cascade (and un-finalize) runs in ONE transaction with the root row locked; a finalized chain is always reverted, also when deleting from step 1. Un-finalize puts back the root's party / party branch / MR date (exactly from the Final PO's marker, else derived by name from step 1).
 - `save_transfer_step` locks the root row first and refuses a second step 1, any step after finalize, and a step that does not continue the chain's newest hop (stale tab / double save). Posted hop rates use exact Decimal (`jute_mr_chain_helpers.hop_rate`) = the screen's `_cascade_rate`. Finalize / un-finalize write the root's money exactly as the ERP does (`transfer._erp_recompute_money` mirrors vowerp3be `recompute_mr_money`, incl. 194Q TDS; TDS 0 on un-finalize). Deletes go by primary key after a plain read (`database.select_ids` / `delete_by_ids`) — never a DELETE filtered on an unindexed column (whole-table locks).
 
+### MR date order (owner rule 2026-11-17)
+
+A new MR number may not be dated before the latest MR already numbered at that **branch in that financial year** (the same day is fine), nor after today. "Numbered" = `branch_mr_no` set and status not Rejected / Cancelled / Drafted / Returned (4, 6, 21, 48) — the ERP's own approvals count. Checked by `transfer.enforce_mr_date` inside the save's transaction, under the save lock, just before the number is taken: hop save and finalize (`save_transfer_step`) and marked moves at the target branch (`save_marked_batch`). The pure rule is `jute_mr_chain_helpers.mr_date_problem`. Existing out-of-order MRs are left alone (only new saves are checked). An **admin** may save an out-of-order date with a reason (`date_override_reason`; "Date override (admin)" box on both pages): the exception is written to `jt_change_log` (`audit.py`, `scripts/migrate_jt_change_log.py`) in the same transaction, and is refused when it cannot be logged. The ERP itself has no such check at MR approval, so a mill branch can still go out of order from the ERP side.
+
+### Chain date rule and default date (owner rules 2026-11-17)
+
+An MR is never dated before where the lorry came from: the first transfer not before the root's **gate entry date**, every later transfer (and the return to the mill) not before the **previous transfer's MR date**; a marked move not before its source MR's date. The same day is fine. `jute_mr_chain_helpers.received_date_problem`, raised as `transfer.ChainDateError` in `save_transfer_step` and `save_marked_batch` — no override. Edit mode keeps a re-dated step between where it came from and where it went next. A **new step's date box starts on that date** (previous transfer, else gate entry — `default_step_date`; it used to be today) and the marked-move date on the latest MR date of the lots picked; the user can still change it.
+
+### Edit mode (owner ruling 2026-11-17) — `edit_ops.py`
+
+A saved step or marked move is corrected **in place**: ids and every number (MR, gate entry, bill pass, invoice, challan, PO) stay. Before this a correction meant delete + save again, which hands out new numbers at the top of each series. `edit_chain_step(root, step_mr_id, …)` (step_mr_id = root → the finalized mill MR) and `edit_marked_move(child_mr_id, …)`; admins only, reason required, every edit logged to `jt_change_log` (old and new values) in the same transaction. UI: "Edit this step (admin)" on a saved step card, "Edit MR n (admin)" on the Marked Stock tab.
+- **Editable today — nothing that changes money:** the **MR date** (MR date + bill pass date, gate entry date too on a hop / marked child but never on the mill MR; the invoice booked for that step — `sales_invoice_jute.mr_id` = the previous hop, i.e. the seller; the step's Forwarding / Final PO date; and the MR's 194Q TDS when the new date moves it in the party's sequence — only TDS, roundoff and net are rewritten, from the stored total and claim) and the **godown** on the MR's lines (hops and marked children; the mill's godown belongs to the ERP; refused once the ERP has issued from the lines).
+- **Date limits:** same calendar month as the old date (the challan number carries the month, every series the year — another month is another number: delete and save again), not after today, and inside the window set by the neighbouring MR numbers of the branch (`jute_mr_chain_helpers.edit_date_problem`) unless the admin ticks "out of order".
+- **Not built yet:** editing the % / rates (needs the cascade re-run through later hops, invoices, POs, the finalized root and draft issue values; the hop % is not stored, only back-calculated from totals), LC fields, and a change of company (number must change: the freed-number slot, step 4).
+
+### Freed-number slots (owner ruling 2026-11-17) — `freed.py`
+
+Every number is MAX+1 of its series, so a number freed in the middle (a hop deleted because the lorry belonged at another company, a chain un-finalized) used to stay a gap while the re-save took a new top number. Now a delete remembers what it frees in `jt_freed_no` (`_free_mr_numbers` before a hop / marked child is deleted and before un-finalize clears the mill's numbers; `_delete_invoice` for the invoice number), and the numbering helpers (`_get_next_mr_number_in_txn`, `_get_next_gate_entry_no`, `_get_next_bill_pass_no_in_txn`, `_get_next_invoice_no`) hand a freed number out first **when the new document's date fits**: the number is still unused, below the series' top, and the date lies between the latest date among lower numbers and the earliest among higher ones — so re-use never breaks the date order. A number freed at the top of a series gets no slot (MAX+1 reuses it). `enforce_mr_date` lets a date through when such an MR slot is waiting. Series = branch + FY: `mr`, `gate`, `billpass`, `invoice`; PO and challan numbers are not covered. Each helper must be called once per document (a second call would burn the slot): the final step numbers the mill MR once and passes it to `_update_original_mr(mr_no=…)`. Without the table (`scripts/migrate_jt_freed_no.py`, dry-run by default) the app numbers exactly as before.
+
 ### Transfer POs (2026-10-01 — spec `docs/superpowers/specs/2026-10-01-transfer-po-design.md`)
 
 Every chain transfer also writes ERP purchase orders (`jute_po` + `jute_po_li` + one `jute_po_status_log` row), in the same transaction as the step:
@@ -110,7 +129,11 @@ src/jutetransfer/
 ├── models.py                         # ORM mirror of sls tables (reference only — queries use raw SQL)
 ├── database.py                       # Cached engine, execute helpers, get_transaction()
 ├── config.py                         # .env-driven DB config
-├── auth.py                           # Demo auth
+├── access.py                         # Who may log in / who is admin; require_admin guard for the ops (no Streamlit)
+├── audit.py                          # jt_change_log: admin exceptions (date overrides), caller's transaction
+├── freed.py                          # jt_freed_no: numbers freed by a delete, re-used when the date fits
+├── edit_ops.py                       # Edit mode: saved step / marked move changed in place (date, godown), logged
+├── auth.py                           # Login form + session (VoWERP e-mail/password via access.py)
 ├── schemas.py                        # Schema introspection cache (schema viewer only)
 ├── data.py                           # Fake data for demo pages (unused by real pages)
 └── __init__.py
@@ -189,7 +212,7 @@ The pages have headless tests too (`tests/test_pages.py`, `streamlit.testing.v1.
 
 - The `[DEBUG]` captions and the `debug_transfer.log` append are gone (2026-10-03); a stale gitignored `src/debug_transfer.log` may still sit on a checkout — it corresponds to no database write and can be deleted. Errors on the pages now go through `logging` (the server log, `.logs/jt.log` on the dev VM), never onto the screen.
 - Stray `pages/company_pl_dashboard.py.tmp.*` file.
-- Demo auth means `updated_by` is always `1`.
+- `updated_by` is the logged-in VoWERP `user_id` (1 for rows written before 2026-11-17 and under `JT_LEGACY_LOGIN`).
 - `docs/invoice_data_flow_step2.md`, `docs/invoice_verification_checklist.md`, `docs/step2_invoice_example.md` and the 2026-03/04 superpowers plans reference the retired `jute_mr.py`/`jute_mr_editor.py` pages — historical only.
 
 ## References

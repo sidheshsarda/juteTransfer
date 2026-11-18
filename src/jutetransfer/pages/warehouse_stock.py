@@ -35,7 +35,11 @@ from ..queries import (
 )
 from ..lot_ops import create_lot, delete_lot_line
 from ..lot_helpers import apply_pct, line_price, combine_takes
+from ..jute_mr_chain_helpers import as_date
 from ..warehouse_stock_ops import save_marked_batch, delete_marked_move
+from ..auth import is_admin
+from ..transfer import MrDateOrderError
+from ..edit_ops import edit_marked_move
 
 
 WAREHOUSE_FLASH_KEY = "warehouse_flash"
@@ -243,7 +247,15 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
             st.selectbox("Marked godown", options=["(select company)"],
                          key="xfer_wh")
     with t3:
-        move_date = st.date_input("Date", value=date.today(), key="xfer_dt")
+        # Starts at the latest MR date of the lots picked (stock cannot move
+        # on before it was received), re-seeded when the pick changes; the
+        # user can still change it. Keyed, no value=.
+        picked = tuple(sorted(int(x) for x in sel["jute_mr_li_id"]))
+        if st.session_state.get("xfer_dt_for") != picked or "xfer_dt" not in st.session_state:
+            received = [d for d in (as_date(v) for v in sel["mr_date"]) if d is not None]
+            st.session_state["xfer_dt"] = max(received) if received else date.today()
+            st.session_state["xfer_dt_for"] = picked
+        move_date = st.date_input("Date", key="xfer_dt")
     with t4:
         if "xfer_pct" not in st.session_state:
             st.session_state["xfer_pct"] = 0.0
@@ -272,6 +284,15 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
         "takes the moved kg off their balance."
     )
     can_save = bool(tgt) and wh_id is not None
+    if is_admin():
+        # MR date order rule (transfer.enforce_mr_date) at the target branch.
+        with st.expander("Date override (admin)"):
+            st.text_input(
+                "Reason for an MR date before the target branch's latest MR",
+                key="xfer_dateovr",
+                help="Leave empty to keep the date rule. With a reason, the move is saved "
+                     "even if its date is out of order, and the reason is logged.",
+            )
     if st.button("Transfer selected lots", type="primary",
                  disabled=not can_save, key="btn_batch_move"):
         try:
@@ -279,6 +300,8 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
             created = save_marked_batch(
                 li_ids, float(pct), int(tgt_co), int(tgt_br), int(wh_id),
                 move_date, user_id,
+                date_override_reason=(st.session_state.get("xfer_dateovr") or None
+                                      if is_admin() else None),
             )
             _flash(
                 "Transferred. " + "; ".join(
@@ -287,7 +310,12 @@ def _render_transfer_tab(co_id: int, branch_id: int, year: int, month: int,
                     for c in created
                 )
             )
+            st.session_state.pop("xfer_dateovr", None)   # a reason is for one save only
             st.rerun()
+        except MrDateOrderError as e:
+            st.error(f"{e} " + ("To save it anyway, give a reason under 'Date override (admin)'."
+                                if is_admin() else
+                                "Only a transfer admin can save an out-of-order date."))
         except Exception as e:
             st.error(str(e))
 
@@ -367,10 +395,11 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
             # A resold MR can't be deleted until its resale children are
             # (leaf-first guard) — disable rather than offer a doomed button.
             can_delete = (bool((grp["balance_kg"] >= grp["kg"]).all())
-                          and not resold)
+                          and not resold and is_admin())
             if st.button("Delete", key=f"del_mk_{mr_id}", disabled=not can_delete,
                          help="Undo this move: its seller invoice and this MR are "
-                              "deleted; the kg come back on the source lines' balance"):
+                              "deleted; the kg come back on the source lines' balance"
+                              if is_admin() else "Only a transfer admin can undo a move"):
                 try:
                     delete_marked_move(mr_id, user_id)
                     _flash(f"Move undone: MR {mr_id} and its seller invoice deleted; "
@@ -378,6 +407,47 @@ def _render_marked_tab(co_id: int, branch_id: int, year: int, month: int,
                     st.rerun()
                 except Exception as e:
                     st.error(str(e))
+        if is_admin():
+            _render_marked_edit_box(mr_id, grp["mr_date"].iloc[0], marked_wh, user_id)
+
+
+def _render_marked_edit_box(mr_id: int, mr_date, marked_wh: dict, user_id: int) -> None:
+    """Edit mode for a marked move (admins): date and godown changed in
+    place, MR and invoice numbers kept (edit_ops.edit_marked_move)."""
+    current = pd.to_datetime(mr_date).date()
+    with st.expander(f"Edit MR {mr_id} (admin)"):
+        st.caption("Changes the saved move in place: MR and invoice numbers stay the same. "
+                   "The date can move within its month only.")
+        date_key = f"mkedit_dt_{mr_id}"
+        if date_key not in st.session_state:
+            st.session_state[date_key] = current
+        new_date = st.date_input("MR date", key=date_key)
+        new_wh = st.selectbox(
+            "Marked godown", options=[None] + list(marked_wh), key=f"mkedit_wh_{mr_id}",
+            format_func=lambda wid: "(no change)" if wid is None else marked_wh.get(wid, str(wid)))
+        reason = st.text_input("Reason (required, kept in the change log)",
+                               key=f"mkedit_why_{mr_id}")
+        out_of_order = st.checkbox("Save even if the date is out of the branch's MR date order",
+                                   key=f"mkedit_ooo_{mr_id}")
+        date_changed = new_date != current
+        if st.button("Save changes", key=f"mkedit_save_{mr_id}",
+                     disabled=not (date_changed or new_wh is not None)):
+            try:
+                changed = edit_marked_move(
+                    mr_id, reason=reason, updated_by=user_id,
+                    new_date=new_date if date_changed else None,
+                    new_warehouse_id=int(new_wh) if new_wh is not None else None,
+                    allow_out_of_order=out_of_order)
+            except Exception as e:
+                st.error(f"MR {mr_id} was not changed: {e}")
+                return
+            for k in ("dt", "wh", "why", "ooo"):
+                st.session_state.pop(f"mkedit_{k}_{mr_id}", None)
+            _flash(f"MR {mr_id} changed: " + (", ".join(
+                {"mr_date": "date", "warehouse_id": "godown"}[k]
+                for k in changed if k in ("mr_date", "warehouse_id")) or "nothing")
+                + ". Numbers unchanged.")
+            st.rerun()
 
 
 def warehouse_stock_page() -> None:

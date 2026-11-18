@@ -166,7 +166,7 @@ def test_repair_counts_tds_in_the_order_the_lorries_were_finalized(scenario, po_
               transfer_mode=0)
     chain = Chain(sc)
     chain.save("B", mr_date=date(2026, 9, 1))
-    chain.save("A", pct=0.5, mr_date=date(2026, 9, 3))
+    chain.save("A", pct=0.5, mr_date=date(2026, 9, 3), date_override="finalized late")
     # finalize itself now counts only the MRs before this one (ERP rule, 2026-10-03)
     assert db.row("jute_mr", jute_mr_id=sc.root)["tds_amount"] == 385.75
     # what the old finalize left behind
@@ -184,6 +184,19 @@ def test_repair_counts_tds_in_the_order_the_lorries_were_finalized(scenario, po_
     root = db.row("jute_mr", jute_mr_id=sc.root)
     assert {k: root[k] for k in plan[0]["new"]} == plan[0]["new"]
     assert in_txn(repair.plan_finalized_net) == []
+
+
+def test_a_lorry_without_rates_cannot_start_a_chain(scenario, po_on):
+    """Handed over before the ERP had its rates (Empire GE 69 / 73 / 77 on
+    2026-10-04): a step 1 would cascade 0 into hop, invoice and POs."""
+    sc, db = scenario, scenario.db
+    db.update("jute_mr_li", {"jute_mr_li_id": sc.root_lines[1]}, rate=None, total_price=0)
+    before = db.snapshot()
+    with pytest.raises(ValueError, match="1 line\\(s\\) without a rate"):
+        Chain(sc).save("B", mr_date=date(2026, 9, 1))
+    assert db.diff(before, db.snapshot()) == []
+    db.update("jute_mr_li", {"jute_mr_li_id": sc.root_lines[1]}, rate=12650.0)
+    assert Chain(sc).save("B", mr_date=date(2026, 9, 1))["mr_id"]
 
 
 # --- a transfer PO is deleted only when it is the one asked for ------------------------------
@@ -589,7 +602,8 @@ def test_a_hop_mr_carries_the_tds_the_erp_would_derive(scenario, po_on):
     assert money(db, hop)["tds_amount"] == 1378.88
 
     earlier = Chain(sc, root=sc.add_root(ge_no=9, ge_date=date(2026, 7, 20)))
-    hop2 = earlier.save("B", mr_date=date(2026, 7, 25))["mr_id"]      # before the Rs 60 lakh
+    hop2 = earlier.save("B", mr_date=date(2026, 7, 25),               # before the Rs 60 lakh
+                       date_override="back-dated lorry")["mr_id"]
     assert money(db, hop2)["tds_amount"] == 0.0
 
 

@@ -5,6 +5,7 @@ from .new_transfer_chain import transfer_chain_page
 from .company_pl_dashboard import company_pl_dashboard_page
 from .warehouse_stock import warehouse_stock_page
 from .po_tracker import po_tracker_page
+from .users import users_page
 
 __all__ = [
     'schema_viewer_page',
@@ -12,4 +13,5 @@ __all__ = [
     'company_pl_dashboard_page',
     'warehouse_stock_page',
     'po_tracker_page',
+    'users_page',
 ]

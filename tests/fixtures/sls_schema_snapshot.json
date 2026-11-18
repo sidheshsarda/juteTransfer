@@ -3244,6 +3244,204 @@
     "key": "",
     "extra": ""
    }
+  ],
+  "jt_change_log": [
+   {
+    "column": "log_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "action",
+    "type": "varchar(40)",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "jute_mr_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "branch_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "detail",
+    "type": "text",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "reason",
+    "type": "varchar(500)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "user_id",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "created_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jt_user_access": [
+   {
+    "column": "user_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": ""
+   },
+   {
+    "column": "role",
+    "type": "varchar(10)",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "active",
+    "type": "tinyint(1)",
+    "nullable": false,
+    "default": "1",
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "updated_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
+  ],
+  "jt_freed_no": [
+   {
+    "column": "freed_id",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "PRI",
+    "extra": "auto_increment"
+   },
+   {
+    "column": "series",
+    "type": "varchar(10)",
+    "nullable": false,
+    "default": null,
+    "key": "MUL",
+    "extra": ""
+   },
+   {
+    "column": "branch_id",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "fy_start_year",
+    "type": "int",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "doc_no",
+    "type": "bigint",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "doc_date",
+    "type": "date",
+    "nullable": false,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "freed_from_id",
+    "type": "bigint",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "freed_by",
+    "type": "int",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "freed_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "closed_date_time",
+    "type": "datetime",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   },
+   {
+    "column": "closed_note",
+    "type": "varchar(40)",
+    "nullable": true,
+    "default": null,
+    "key": "",
+    "extra": ""
+   }
   ]
  }
 }

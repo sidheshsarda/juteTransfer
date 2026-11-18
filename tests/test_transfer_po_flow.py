@@ -61,7 +61,7 @@ class Chain:
         self.steps = []                 # saved steps: {"to", "pct", "mr_id", "final"}
 
     def save(self, to: str, pct: float = 0.0, mr_date: date = date(2026, 9, 1),
-             **step_kw) -> dict:
+             date_override: str = None, **step_kw) -> dict:
         sc = self.sc
         index = len(self.steps)
         co_id, branch_id = sc.co(to), sc.branch(to)
@@ -89,7 +89,7 @@ class Chain:
             prev_branch_id=sc.branch(prev), source_co_id=sc.a_co, source_branch_id=sc.a_branch,
             root_mr_id=self.root, updated_by=sc.user, rate_multiplier=1.0 + pct / 100.0,
             is_first_step=index == 0, is_final=is_final, original_source_mr_id=self.root,
-            use_new_rounding=True)
+            use_new_rounding=True, date_override_reason=date_override)
         self.steps.append({"to": to, "pct": pct, "mr_id": result["mr_id"], "final": is_final})
         return result
 

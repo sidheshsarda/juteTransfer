@@ -161,6 +161,7 @@ def _chain_script():
     import streamlit as st
     from src.jutetransfer.pages import new_transfer_chain as p
     st.session_state.setdefault("user_id", 1)
+    st.session_state.setdefault("role", "admin")
     p.transfer_chain_page()
     pick = st.session_state.get("_pick")
     if pick is not None:
@@ -466,7 +467,95 @@ def test_a_database_error_during_reload_shows_a_message_and_nothing_else(chain):
     assert not _texts(at, "error")
 
 
+# --- MR date order: the refusal names the rule; only an admin gets the override box ----------------
+
+def test_an_out_of_order_date_is_refused_in_words_and_an_admin_can_override(chain):
+    from src.jutetransfer.transfer import MrDateOrderError
+    at = _start(A_ROOT)
+    _open_step_2(at, A_ROOT)
+    chain.save_raises = MrDateOrderError("The earliest date allowed is 05-09-2026.")
+    at.button(key=f"save_{A_ROOT}_1").click()
+    _run(at)
+    assert chain.saves[-1]["date_override_reason"] is None
+    (error,) = [e.value for e in at.error]
+    assert "earliest date allowed is 05-09-2026" in error and "Date override (admin)" in error
+
+    chain.save_raises = None
+    at.text_input(key=f"dateovr_{A_ROOT}_1").set_value("lorry keyed late")
+    _run(at)
+    at.button(key=f"save_{A_ROOT}_1").click()
+    _run(at)
+    assert chain.saves[-1]["date_override_reason"] == "lorry keyed late"
+
+
+def test_a_plain_user_gets_no_override_box(chain):
+    at = AppTest.from_function(_chain_script, default_timeout=60)
+    at.session_state["_pick"] = A_ROOT
+    at.session_state["role"] = "user"
+    _run(at)
+    _open_step_2(at, A_ROOT)
+    assert f"dateovr_{A_ROOT}_1" not in [w.key for w in at.text_input]
+    at.button(key=f"save_{A_ROOT}_1").click()
+    _run(at)
+    assert chain.saves[-1]["date_override_reason"] is None
+
+
+# --- A new step starts on the previous transfer's date, not on today -------------------------------
+
+def test_a_new_step_opens_on_the_previous_transfers_date(chain):
+    from src.jutetransfer.jute_mr_chain_helpers import as_date
+    at = _start(A_ROOT)
+    previous = as_date(_steps(at, A_ROOT)[0]["mr_date"])
+    assert previous is not None and previous != date.today()
+    assert as_date(_steps(at, A_ROOT)[1]["mr_date"]) == previous
+    _open_step_2(at, A_ROOT)
+    assert at.date_input(key=f"date_{A_ROOT}_1").value == previous
+
+
+# --- Edit mode: a saved step is changed in place, by an admin, with a reason ----------------------
+
+def test_an_admin_edits_a_saved_steps_date_in_place(chain, monkeypatch):
+    calls = []
+
+    def edit(root, step_mr, **kw):
+        calls.append((root, step_mr, kw))
+        return {"mr_date": [None, kw["new_date"]]}
+    monkeypatch.setattr(chain_page, "edit_chain_step", edit)
+    at = _start(A_ROOT)
+    assert at.button(key=f"editsave_{A_ROOT}_0").disabled             # nothing changed yet
+    old = at.date_input(key=f"editdate_{A_ROOT}_0").value
+    new = old.replace(day=2 if old.day != 2 else 3)
+    at.date_input(key=f"editdate_{A_ROOT}_0").set_value(new)
+    at.text_input(key=f"editwhy_{A_ROOT}_0").set_value("keyed on the wrong day")
+    _run(at)
+    at.button(key=f"editsave_{A_ROOT}_0").click()
+    _run(at)
+    ((root, step_mr, kw),) = calls
+    assert (root, step_mr) == (A_ROOT, A_HOP)
+    assert kw["new_date"] == new and kw["new_warehouse_id"] is None
+    assert kw["reason"] == "keyed on the wrong day" and kw["allow_out_of_order"] is False
+    assert not chain.saves and not chain.deletes
+
+
+def test_a_plain_user_gets_no_edit_box(chain):
+    at = AppTest.from_function(_chain_script, default_timeout=60)
+    at.session_state["_pick"] = A_ROOT
+    at.session_state["role"] = "user"
+    _run(at)
+    assert f"editsave_{A_ROOT}_0" not in [w.key for w in at.button]
+
+
 # --- P9: deleting saved steps takes a confirming tick --------------------------------------------
+
+def test_a_plain_user_is_not_offered_delete_on_a_saved_step(chain):
+    at = AppTest.from_function(_chain_script, default_timeout=60)
+    at.session_state["_pick"] = A_ROOT
+    at.session_state["role"] = "user"
+    _run(at)
+    keys = [w.key for w in list(at.button) + list(at.checkbox)]
+    assert f"delete_saved_{A_ROOT}_0" not in keys
+    assert f"confirm_delete_{A_ROOT}_0" not in keys
+
 
 def test_delete_from_step_needs_the_tick_and_names_what_goes(chain):
     at = _start(A_ROOT)

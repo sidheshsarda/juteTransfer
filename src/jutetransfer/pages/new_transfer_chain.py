@@ -30,8 +30,12 @@ from ..jute_mr_chain_helpers import (
     _calculate_line_item_amount,
     _stored_amount,
     is_root_eligible_for_new_chain,
+    default_step_date,
 )
-from ..transfer import save_transfer_step, delete_chain_from_step, TransferStep
+from ..transfer import (save_transfer_step, delete_chain_from_step, TransferStep,
+                        MrDateOrderError, ChainDateError)
+from ..auth import is_admin
+from ..edit_ops import edit_chain_step
 
 FLASH_KEY = "chain_flash"
 # Every '% Rate Increase' box is a widget keyed 'pct_input_<root mr>_<step>'.
@@ -112,7 +116,8 @@ def _chain_changed(steps, chain_data, is_finalized: bool, mr_id: int) -> bool:
 
 
 STEP_WIDGETS = ("company", "date", "transport", "lc_ref", "lc_date", "po_lc", "od_lc",
-                "pct_input", "pct", "confirm_delete")
+                "pct_input", "pct", "confirm_delete", "dateovr",
+                "editdate", "editwh", "editwhy", "editooo")
 
 
 def _step_widget_keys(mr_id: int, step_index: int) -> list:
@@ -129,15 +134,14 @@ def _lorry_widget_keys(mr_id: int) -> list:
     return [k for k in st.session_state if isinstance(k, str) and k.startswith(prefixes)]
 
 
-def _source_mr_date(source_row):
-    """The selected MR's date (the default date of a new step); today when
-    the row has none."""
-    raw = None
-    if source_row is not None and "MR DATE" in getattr(source_row, "index", []):
-        raw = source_row.get("MR DATE")
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return date.today()
-    return raw
+def _new_step_date(earlier_steps, source_row):
+    """The date a new step starts with (the user can still change it): the
+    previous transfer's date, else the lorry's gate entry date -- never
+    simply today (owner rule 2026-11-17)."""
+    gate = None
+    if source_row is not None and "Jute Gate Entry Date" in getattr(source_row, "index", []):
+        gate = source_row.get("Jute Gate Entry Date")
+    return default_step_date(earlier_steps, gate)
 
 
 def _mr_label(step: dict) -> str:
@@ -816,7 +820,7 @@ def _render_chain_editor(filter_key):
         # (the synthetic return-to-origin step is the terminal state).
         if not is_finalized:
             new_step = _empty_transfer_step()
-            new_step["mr_date"] = raw_mr_date
+            new_step["mr_date"] = _new_step_date(transfers[mr_id], row)
             transfers[mr_id].append(new_step)
 
     steps = transfers[mr_id]
@@ -1204,13 +1208,17 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
         _render_step_line_items(step_index, line_items, all_steps, is_saved=is_saved, base_step_index=base_step_index)
 
         # Action buttons
-        if is_saved:
+        if is_saved and not is_admin():
+            st.caption("Saved. Only a transfer admin can change or delete a saved step.")
+        elif is_saved:
             # Saved steps: "Delete from here" deletes this step and every
             # later one -- MRs, invoices and transfer POs, on production, so
             # it takes a confirming tick first (one mis-tap on a phone must
             # not be enough). The tick is a plain widget: unticked on the
             # next visit to the card.
             saved_mr_id = step.get("saved_mr_id")
+            if saved_mr_id:
+                _render_edit_box(step_index, step, mr_id, filter_key, current_date)
             confirm_key = f"confirm_delete_{mr_id}_{step_index}"
             confirmed = st.checkbox(
                 _delete_confirm_label(step_index, step, all_steps),
@@ -1244,6 +1252,16 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
 
         elif step.get("company"):
             # Unsaved steps with company set: save, clear, or remove
+            if is_admin():
+                # MR date order rule (transfer.enforce_mr_date): an admin may
+                # save an out-of-order date by giving a reason, which is logged.
+                with st.expander("Date override (admin)"):
+                    st.text_input(
+                        "Reason for an MR date before the branch's latest MR",
+                        key=f"dateovr_{mr_id}_{step_index}",
+                        help="Leave empty to keep the date rule. With a reason, the step is "
+                             "saved even if its date is out of order, and the reason is logged.",
+                    )
             col_save, col_clear, col_delete = st.columns(3)
 
             with col_save:
@@ -1254,7 +1272,8 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                 if st.button("Clear", key=f"clear_{mr_id}_{step_index}",
                              help="Empty this step: company, date, godown, LC fields and %"):
                     all_steps[step_index] = _empty_transfer_step()
-                    all_steps[step_index]["mr_date"] = _source_mr_date(source_row)
+                    all_steps[step_index]["mr_date"] = _new_step_date(all_steps[:step_index],
+                                                                      source_row)
                     for k in _step_widget_keys(mr_id, step_index):
                         st.session_state.pop(k, None)
                     st.rerun()
@@ -1272,7 +1291,7 @@ def _render_step_card(step_index, step, all_steps, line_items, original_total_am
                     if not any(not s.get("saved_mr_id") for s in all_steps):
                         # Never leave the chain without a step to type into.
                         blank = _empty_transfer_step()
-                        blank["mr_date"] = _source_mr_date(source_row)
+                        blank["mr_date"] = _new_step_date(all_steps, source_row)
                         all_steps.append(blank)
                     st.rerun()
 
@@ -1394,6 +1413,64 @@ def _render_step_line_items(step_index, line_items, all_steps, is_saved=False, b
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def _render_edit_box(step_index, step, mr_id, filter_key, current_date):
+    """Edit mode for a saved step (admins): date and godown changed in place,
+    every number kept (edit_ops.edit_chain_step). Widgets are seeded once from
+    the saved step and keyed, never given value=."""
+    suffix = f"{mr_id}_{step_index}"
+    is_return = bool(step.get("is_final_return"))
+    with st.expander("Edit this step (admin)"):
+        st.caption("Changes the saved step in place: MR, invoice and PO numbers stay the same. "
+                   "The date can move within its month only.")
+        date_key = f"editdate_{suffix}"
+        if date_key not in st.session_state:
+            st.session_state[date_key] = current_date
+        new_date = st.date_input("MR date", key=date_key)
+
+        new_wh, current_wh = None, step.get("warehouse_id")
+        if not is_return:
+            _, co_branch_mapping = get_company_branch_options()
+            branch_id = co_branch_mapping.get(step.get("company", ""), (None, None))[1]
+            warehouses = get_warehouses_by_branch(branch_id) if branch_id else {}
+            if warehouses:
+                wh_key = f"editwh_{suffix}"
+                wh_ids = list(warehouses)
+                if wh_key not in st.session_state and current_wh in wh_ids:
+                    st.session_state[wh_key] = current_wh
+                new_wh = st.selectbox("Godown", options=wh_ids, key=wh_key,
+                                      format_func=lambda wid: warehouses.get(wid, str(wid)))
+        reason = st.text_input("Reason (required, kept in the change log)", key=f"editwhy_{suffix}")
+        out_of_order = st.checkbox("Save even if the date is out of the branch's MR date order",
+                                   key=f"editooo_{suffix}")
+        date_changed = new_date != current_date
+        wh_changed = new_wh is not None and new_wh != current_wh
+        if st.button("Save changes", key=f"editsave_{suffix}",
+                     disabled=not (date_changed or wh_changed)):
+            try:
+                changed = edit_chain_step(
+                    mr_id, int(step["saved_mr_id"]), reason=reason,
+                    updated_by=st.session_state.get("user_id", 1),
+                    new_date=new_date if date_changed else None,
+                    new_warehouse_id=int(new_wh) if wh_changed else None,
+                    allow_out_of_order=out_of_order,
+                )
+            except Exception as e:
+                st.error(f"Step {step_index + 1} was not changed: {e}")
+                return
+            parts = []
+            if "mr_date" in changed:
+                parts.append(f"date {new_date:%d-%m-%Y}")
+            if "warehouse_id" in changed:
+                parts.append("godown")
+            if "tds_amount" in changed:
+                parts.append(f"TDS {changed['tds_amount'][0]:,.2f} to {changed['tds_amount'][1]:,.2f}")
+            _flash("success", f"Step {step_index + 1} changed: " + ", ".join(parts or ["nothing"])
+                   + ". Numbers unchanged.")
+            _clear_tracker_cache()
+            _drop_chain_state(filter_key, mr_id)
+            st.rerun()
+
+
 def _save_step(step_index, step, all_steps, line_items, original_total_amount, mr_id, filter_key):
     """
     Save step to database via save_transfer_step().
@@ -1513,6 +1590,8 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             is_final=is_final,
             original_source_mr_id=mr_id,
             use_new_rounding=True,
+            date_override_reason=(st.session_state.get(f"dateovr_{mr_id}_{step_index}") or None
+                                  if is_admin() else None),
         )
 
         # Clear cache to force reload on next render
@@ -1536,6 +1615,12 @@ def _save_step(step_index, step, all_steps, line_items, original_total_amount, m
             _flash("success", f"{msg}.")
         st.rerun()
 
+    except ChainDateError as e:
+        st.error(f"Step {step_index + 1} was not saved: {e}")
+    except MrDateOrderError as e:
+        st.error(f"Step {step_index + 1} was not saved: {e} "
+                 + ("To save it anyway, give a reason under 'Date override (admin)'."
+                    if is_admin() else "Only a transfer admin can save an out-of-order date."))
     except Exception as e:
         # The whole step is one transaction: a failure writes nothing. The
         # traceback goes to the server log (.logs/jt.log), not to the phone.

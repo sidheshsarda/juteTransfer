@@ -35,6 +35,92 @@ def is_root_eligible_for_new_chain(status_id) -> bool:
 # Shared rounding helpers (used by live display, chain recalc, and posting)
 # ---------------------------------------------------------------------------
 
+def mr_date_problem(mr_date, latest_date=None, latest_no=None, today=None):
+    """Why `mr_date` may not be used for a new MR number, or None when it may.
+
+    Owner rule 2026-11-17: within one branch and financial year the MR number
+    order follows the MR date order, so a new MR may not be dated before the
+    latest MR already numbered there (the same day is fine). A date after
+    today is refused too: one future-dated MR would freeze the branch.
+    `latest_date` / `latest_no`: the newest numbered MR of that branch in
+    mr_date's financial year (None when there is none yet).
+    """
+    if today is not None and mr_date > today:
+        return (f"The date {mr_date:%d-%m-%Y} is after today. An MR dated in the future "
+                "would block every MR of this branch until that day.")
+    if latest_date is not None and mr_date < latest_date:
+        no = f" (MR no. {latest_no})" if latest_no else ""
+        return (f"The date {mr_date:%d-%m-%Y} is before the latest MR already made at this "
+                f"branch, {latest_date:%d-%m-%Y}{no}. The earliest date allowed is "
+                f"{latest_date:%d-%m-%Y}.")
+    return None
+
+
+def as_date(value):
+    """A date from what a page or a query hands over (date, datetime,
+    pandas Timestamp, 'YYYY-MM-DD...' text); None for nothing / NaT."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    if pd.isna(value):
+        return None
+    if hasattr(value, "date") and callable(value.date):
+        return value.date()
+    return value
+
+
+def received_date_problem(mr_date, came_from_date, what: str = "the step it came from"):
+    """Owner rule 2026-11-17: an MR in a chain is never dated before where
+    the lorry came from -- the previous transfer, or the gate entry for the
+    first one. None when the date is fine."""
+    came_from_date = as_date(came_from_date)
+    if came_from_date is not None and mr_date < came_from_date:
+        return (f"The date {mr_date:%d-%m-%Y} is before {what} ({came_from_date:%d-%m-%Y}). "
+                f"Use {came_from_date:%d-%m-%Y} or later.")
+    return None
+
+
+def default_step_date(earlier_steps, gate_entry_date, today=None):
+    """The date a new step starts with: the previous transfer's date, else the
+    lorry's gate entry date (owner rule 2026-11-17 -- it used to be today)."""
+    for step in reversed(list(earlier_steps or [])):
+        found = as_date(step.get("mr_date"))
+        if found is not None:
+            return found
+    return as_date(gate_entry_date) or today or date.today()
+
+
+def edit_date_problem(new_date, old_date, lower_date=None, higher_date=None, today=None):
+    """Why a SAVED MR may not be re-dated to `new_date`: (message, out_of_order).
+
+    (None, False) when it may. out_of_order=True marks the one refusal an
+    admin may overrule: the date leaves the window set by the neighbouring MR
+    numbers of the branch (`lower_date` = latest date among lower numbers,
+    `higher_date` = earliest among higher ones). The other two are final: a
+    date in another month is another challan / number series, and a date
+    after today would block the branch.
+    """
+    if (new_date.year, new_date.month) != (old_date.year, old_date.month):
+        return (f"The date can only move within {old_date:%B %Y}: the challan number carries "
+                "the month and every number series the year. For another month, delete the "
+                "step and save it again.", False)
+    if today is not None and new_date > today:
+        return (f"The date {new_date:%d-%m-%Y} is after today.", False)
+    if lower_date is not None and new_date < lower_date:
+        return (f"The date {new_date:%d-%m-%Y} is before an earlier MR number of this branch "
+                f"({lower_date:%d-%m-%Y}). To keep the date order, use {lower_date:%d-%m-%Y} "
+                "or later.", True)
+    if higher_date is not None and new_date > higher_date:
+        return (f"The date {new_date:%d-%m-%Y} is after a later MR number of this branch "
+                f"({higher_date:%d-%m-%Y}). To keep the date order, use {higher_date:%d-%m-%Y} "
+                "or earlier.", True)
+    return None, False
+
+
 def _cascade_rate(original_rate: float, steps: list, up_to_index: int) -> float:
     """Round-then-cascade: round at kg level (2 decimals) at each step boundary.
 
