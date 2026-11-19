@@ -1,0 +1,275 @@
+"""Jute Payment Tracker: pure shaping (no Streamlit / DB imports).
+
+One row per SUPPLIER BILL -- the MR of the company that bought the lorry from
+the supplier:
+  * the step-1 MR of a transfer chain (the first hop; its root is the gate
+    entry at the mill), or
+  * a mill MR that was never transferred (gate entry and purchase in one
+    company).
+A chain root itself, later hops and marked-stock children are not bills: they
+are inter-company.
+
+Bill amount = jute_mr.net_total (after claim and TDS: what is payable, owner
+ruling 2026-11-19). Terms = jute_mr.payment_terms_days (the MR column the ERP
+fills; the root's when the step-1 MR has none). Due = payment_due_date when
+set, else MR date + terms. Paid / pending come from the accounts module (the
+bill's JUTE_BILLPASS voucher and its bill reference); a bill accounts has not
+posted yet shows as 'Not in accounts' with the whole amount pending.
+"""
+
+from datetime import date, datetime, timedelta
+from typing import Optional
+
+import pandas as pd
+
+STATUS_PAID = "Paid"
+STATUS_PART = "Part paid"
+STATUS_PENDING = "Pending"
+STATUS_PROPOSED = "Payment proposed"      # a payment voucher is waiting for approval in VoW
+STATUS_NOT_POSTED = "Not in accounts"
+STATUSES = (STATUS_PENDING, STATUS_PART, STATUS_PROPOSED, STATUS_PAID, STATUS_NOT_POSTED)
+
+BILL_CURRENT = "Current"
+BILL_OPENING = "Opening"          # owed at the start of accounts, entered bill-wise in VoW
+
+COLUMNS = [
+    "Bill", "Gate Entry Co", "GE No", "GE Date", "Step 1 Co", "MR No", "MR Date", "Party",
+    "Supplier",
+    "Bill Amount", "Paid", "Pending", "Proposed", "Status", "Terms (days)", "Due Date",
+    "Overdue (days)", "Last Payment",
+]
+
+
+def _as_date(value) -> Optional[date]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    if pd.isna(value):
+        return None
+    if isinstance(value, datetime) or hasattr(value, "date"):
+        return value.date() if callable(getattr(value, "date", None)) else value
+    return value
+
+
+def _num(value) -> float:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0.0
+    return float(value)
+
+
+def _text(value) -> str:
+    """A string from a frame cell (None / NaN -> '')."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
+def fy_label(d: date) -> str:
+    start = d.year if d.month >= 4 else d.year - 1
+    return f"{start % 100:02d}-{(start + 1) % 100:02d}"
+
+
+def fy_bounds(fy_start_year: int) -> tuple:
+    return date(fy_start_year, 4, 1), date(fy_start_year + 1, 3, 31)
+
+
+def format_mr_no(co_prefix, branch_prefix, mr_no, mr_date) -> str:
+    """The ERP's jute MR number: CO[/BRANCH]/JMR/26-27/00024
+    (vowerp3be juteProcurement/formatters.format_jute_mr_number)."""
+    if mr_no is None or (isinstance(mr_no, float) and pd.isna(mr_no)) or not mr_date:
+        return ""
+    parts = [p for p in (_text(co_prefix), _text(branch_prefix)) if p]
+    return "/".join(parts + ["JMR", fy_label(mr_date), f"{int(mr_no):05d}"])
+
+
+def pick_bills(mrs: pd.DataFrame, first_hop_of: dict) -> pd.DataFrame:
+    """The supplier bills among candidate MRs. `first_hop_of` = {root id:
+    its first hop's id} for every chain; `mrs` needs jute_mr_id and
+    src_jute_mr_id."""
+    if mrs.empty:
+        return mrs
+    first_hops = set(first_hop_of.values())
+    roots = set(first_hop_of)
+
+    def is_bill(row) -> bool:
+        if pd.notna(row["src_jute_mr_id"]):
+            return int(row["jute_mr_id"]) in first_hops
+        return int(row["jute_mr_id"]) not in roots       # a mill MR never transferred
+    return mrs[mrs.apply(is_bill, axis=1)].copy()
+
+
+def bill_status(bill_amount: float, pending: float, posted: bool, proposed: float = 0.0) -> str:
+    if not posted:
+        return STATUS_NOT_POSTED
+    if pending <= 0.005:
+        return STATUS_PAID
+    if proposed > 0.005:
+        return STATUS_PROPOSED
+    if pending < bill_amount - 0.005:
+        return STATUS_PART
+    return STATUS_PENDING
+
+
+def build_rows(bills: pd.DataFrame, today: Optional[date] = None) -> pd.DataFrame:
+    """The tracker grid from the raw bill rows (payment_queries.load_bills)."""
+    today = today or date.today()
+    out = []
+    for r in bills.to_dict("records"):
+        mr_date = _as_date(r.get("jute_mr_date"))
+        amount = round(_num(r.get("net_total")), 2)
+        posted = pd.notna(r.get("acc_bill_ref_id")) and r.get("acc_bill_ref_id") is not None
+        pending = round(_num(r.get("acc_pending")), 2) if posted else amount
+        proposed = round(_num(r.get("acc_proposed")), 2) if posted else 0.0
+        terms = r.get("payment_terms_days")
+        if terms is None or pd.isna(terms):
+            terms = r.get("root_terms_days")
+        terms = None if terms is None or pd.isna(terms) else int(terms)
+        due = _as_date(r.get("payment_due_date")) or _as_date(r.get("acc_due_date"))
+        if due is None and mr_date is not None and terms is not None:
+            due = mr_date + timedelta(days=terms)
+        overdue = (today - due).days if due and pending > 0.005 and today > due else None
+        out.append({
+            "jute_mr_id": int(r["jute_mr_id"]),
+            "step1_co_id": int(r["step1_co_id"]),
+            "party_id": None if pd.isna(r.get("party_id")) else int(r["party_id"]),
+            "acc_bill_ref_id": int(r["acc_bill_ref_id"]) if posted else None,
+            "Bill": BILL_CURRENT,
+            "Gate Entry Co": _text(r.get("gate_co")),
+            "GE No": None if pd.isna(r.get("ge_no")) else int(r["ge_no"]),
+            "GE Date": _as_date(r.get("ge_date")),
+            "Step 1 Co": _text(r.get("step1_co")),
+            "MR No": format_mr_no(r.get("step1_co"), r.get("step1_branch_prefix"),
+                                  r.get("branch_mr_no"), mr_date),
+            "MR Date": mr_date,
+            "Party": _text(r.get("party")),
+            "Supplier": _text(r.get("supplier")),
+            "Bill Amount": amount,
+            "Paid": round(amount - pending, 2),
+            "Pending": pending,
+            "Proposed": proposed,
+            "can_pay": round(max(pending - proposed, 0.0), 2) if posted else 0.0,
+            "Status": bill_status(amount, pending, posted, proposed),
+            "Terms (days)": terms,
+            "Due Date": due,
+            "Overdue (days)": overdue,
+            "Last Payment": _as_date(r.get("last_payment_date")),
+        })
+    return pd.DataFrame(out, columns=["jute_mr_id", "step1_co_id", "party_id", "acc_bill_ref_id",
+                                      "can_pay"] + COLUMNS)
+
+
+def build_opening_rows(opening: pd.DataFrame, opening_mrs: pd.DataFrame,
+                       today: Optional[date] = None) -> pd.DataFrame:
+    """Opening bills as tracker rows. One entered against an old jute MR shows
+    that MR's gate-entry mill, number and party; one entered as a plain bill
+    shows the bill number it was given and its note in place of the party."""
+    today = today or date.today()
+    by_id = ({int(m["jute_mr_id"]): m for m in opening_mrs.to_dict("records")}
+             if opening_mrs is not None and not opening_mrs.empty else {})
+    out = []
+    for r in (opening.to_dict("records") if opening is not None and not opening.empty else []):
+        linked = _text(r.get("src_doc_type")) == "JUTE_MR" and not pd.isna(r.get("src_doc_id"))
+        mr = by_id.get(int(r["src_doc_id"])) if linked else None
+        amount, pending = round(_num(r.get("acc_amount")), 2), round(_num(r.get("acc_pending")), 2)
+        proposed = round(_num(r.get("acc_proposed")), 2)
+        bill_date = _as_date(mr.get("jute_mr_date")) if mr else _as_date(r.get("bill_date"))
+        due = _as_date(r.get("acc_due_date"))
+        out.append({
+            "jute_mr_id": int(mr["jute_mr_id"]) if mr else None,
+            "step1_co_id": int(r["step1_co_id"]),
+            "party_id": None if pd.isna(r.get("party_id")) else int(r["party_id"]),
+            "acc_bill_ref_id": int(r["acc_bill_ref_id"]),
+            "can_pay": round(max(pending - proposed, 0.0), 2),
+            "Bill": BILL_OPENING,
+            "Gate Entry Co": _text(mr.get("gate_co")) if mr else "",
+            "GE No": int(mr["ge_no"]) if mr and not pd.isna(mr.get("ge_no")) else None,
+            "GE Date": _as_date(mr.get("ge_date")) if mr else None,
+            "Step 1 Co": _text(r.get("step1_co")),
+            "MR No": (format_mr_no(mr.get("step1_co"), mr.get("step1_branch_prefix"),
+                                   mr.get("branch_mr_no"), bill_date) if mr else "")
+                     or _text(r.get("bill_no")),
+            "MR Date": bill_date,
+            "Party": _text(mr.get("party")) if mr else _text(r.get("origin_note")),
+            "Supplier": _text(r.get("supplier")),
+            "Bill Amount": amount,
+            "Paid": round(amount - pending, 2),
+            "Pending": pending,
+            "Proposed": proposed,
+            "Status": bill_status(amount, pending, True, proposed),
+            "Terms (days)": None,
+            "Due Date": due,
+            "Overdue (days)": (today - due).days if due and pending > 0.005 and today > due else None,
+            "Last Payment": _as_date(r.get("last_payment_date")),
+        })
+    return pd.DataFrame(out, columns=["jute_mr_id", "step1_co_id", "party_id", "acc_bill_ref_id",
+                                      "can_pay"] + COLUMNS)
+
+
+def totals(rows: pd.DataFrame) -> dict:
+    if rows.empty:
+        return {"bills": 0, "bill_amount": 0.0, "paid": 0.0, "pending": 0.0, "overdue": 0.0}
+    over = rows[rows["Overdue (days)"].notna()]
+    return {"bills": len(rows), "bill_amount": float(rows["Bill Amount"].sum()),
+            "paid": float(rows["Paid"].sum()), "pending": float(rows["Pending"].sum()),
+            "overdue": float(over["Pending"].sum())}
+
+
+def selection_problem(picked: pd.DataFrame) -> Optional[str]:
+    """Why the picked bills cannot be paid together, or None. A payment is
+    party-wise: one step-1 company (it pays) and one supplier."""
+    if picked.empty:
+        return "Tick the bills to pay."
+    if picked["step1_co_id"].nunique() > 1:
+        return ("The bills picked belong to more than one company ("
+                + ", ".join(sorted(picked["Step 1 Co"].unique())) + "). Pick one company's bills.")
+    if picked["party_id"].nunique(dropna=False) > 1:
+        return "The bills picked belong to more than one supplier. Pick one supplier's bills."
+    if (picked["Pending"] <= 0.005).any():
+        return "A bill that is already paid is ticked. Untick it."
+    if (picked["Bill"] == BILL_OPENING).any():
+        return ("An opening bill is ticked. Opening bills are paid from VoW (Accounting > Pay "
+                "Bills) for now. Untick it.")
+    if picked["acc_bill_ref_id"].isna().any():
+        return ("A ticked bill is not in the accounts module yet. It has to be posted in "
+                "accounts before a payment can be made against it.")
+    if (picked["can_pay"] <= 0.005).any():
+        return ("A ticked bill already has a payment for its full pending amount waiting for "
+                "approval in VoW. Untick it.")
+    return None
+
+
+def payment_payload(co_id: int, party_id: int, form: dict, pay_now: dict,
+                    acting_user_id: int) -> dict:
+    """The request VoW's jute-payments API expects. `pay_now` = {jute_mr_id:
+    amount}; bills with nothing to pay are left out. Raises ValueError in
+    plain words when the form cannot be sent."""
+    bills = [{"jute_mr_id": int(mr_id), "amount": round(float(amount), 2)}
+             for mr_id, amount in pay_now.items() if amount and float(amount) > 0.005]
+    if not bills:
+        raise ValueError("Enter an amount to pay on at least one bill.")
+    if not form.get("branch_id"):
+        raise ValueError("Pick the branch.")
+    if not form.get("bank_ledger_id"):
+        raise ValueError("Pick the bank or cash account the payment goes from.")
+    if not form.get("voucher_date"):
+        raise ValueError("Enter the payment date.")
+    return {
+        "co_id": int(co_id), "branch_id": int(form["branch_id"]),
+        "voucher_date": form["voucher_date"].isoformat(), "party_id": int(party_id),
+        "bank_ledger_id": int(form["bank_ledger_id"]), "pay_mode": form.get("pay_mode") or "NEFT",
+        "instrument_no": (form.get("instrument_no") or "").strip() or None,
+        "instrument_date": (form["instrument_date"].isoformat()
+                            if form.get("instrument_date") else None),
+        "narration": (form.get("narration") or "").strip() or None,
+        "acting_user_id": int(acting_user_id),
+        "bills": bills,
+    }
+
+
+def default_narration(supplier: str, mr_nos: list) -> str:
+    listed = ", ".join(mr_nos[:6]) + (f" and {len(mr_nos) - 6} more" if len(mr_nos) > 6 else "")
+    return f"Payment to {supplier} against {listed}"[:500]
