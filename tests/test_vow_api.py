@@ -51,7 +51,8 @@ def test_a_call_carries_the_key_the_tenant_and_the_body(linked):
 
 
 def test_the_bill_list_is_unwrapped(linked, monkeypatch):
-    bills = [{"jute_mr_id": 1, "allocatable_amount": 5.0}]
+    bills = [{"acc_bill_ref_id": 7, "jute_mr_id": None, "allocatable_amount": 5.0,
+              "on_hold": False, "hold_note": None, "source": "OPENING"}]
     monkeypatch.setattr(vow_api, "_call", lambda *a, **k: bills)       # _call strips {"data": ...}
     assert vow_api.open_bills(67, 501) == bills
 

@@ -56,6 +56,15 @@ _OPENING_SQL = """
     ORDER BY br.bill_date, br.acc_bill_ref_id
 """
 
+# Suppliers VoW has put on payment hold (one party ledger per company +
+# party). The columns are new and may not exist on a database yet.
+_HOLDS_SQL = """
+    SELECT co_id, party_id, payment_hold_note AS note
+    FROM acc_ledger
+    WHERE COALESCE(payment_hold, 0) = 1 AND party_id IS NOT NULL
+"""
+HOLD_COLUMNS = ["co_id", "party_id", "note"]
+
 # The first hop of every chain: one pass over the hop rows (src_jute_mr_id
 # has no index, so no per-row subquery).
 _FIRST_HOPS_SQL = """
@@ -95,7 +104,9 @@ _ACC_SQL = f"""
 def load_bills(date_from: date, date_to: date) -> dict:
     """{'mrs': approved mode-0 MRs dated in the range, 'first_hop_of': {root
     id: first hop id}, 'acc': one row per bill accounts has posted, 'opening':
-    the opening bills entered in VoW, 'opening_mrs': the old MRs they name}."""
+    the opening bills entered in VoW, 'opening_mrs': the old MRs they name,
+    'holds': frame co_id / party_id / note of suppliers on payment hold (empty
+    when the hold columns are not on this database yet)}."""
     with DatabaseConnection.get_engine().connect() as conn:
         mrs = pd.read_sql_query(text(_MRS_SQL + _MRS_IN_RANGE), conn,
                                 params={"date_from": date_from, "date_to": date_to})
@@ -110,6 +121,10 @@ def load_bills(date_from: date, date_to: date) -> dict:
             opening = pd.read_sql_query(text(_OPENING_SQL.format(settled=_SETTLED)), conn)
         except Exception:        # the origin columns are not on this database yet
             opening = pd.DataFrame()
+        try:
+            holds = pd.read_sql_query(text(_HOLDS_SQL), conn)
+        except Exception:        # payment_hold columns not on this database yet: no holds
+            holds = pd.DataFrame(columns=HOLD_COLUMNS)
         opening_mrs = pd.DataFrame()
         if not opening.empty:
             ids = sorted({int(i) for i in opening.loc[opening["src_doc_type"] == "JUTE_MR",
@@ -118,7 +133,7 @@ def load_bills(date_from: date, date_to: date) -> dict:
                 opening_mrs = pd.read_sql_query(
                     text(_MRS_SQL + f" WHERE h.jute_mr_id IN ({','.join(map(str, ids))})"), conn)
     return {"mrs": mrs, "first_hop_of": {int(r[0]): int(r[1]) for r in hops}, "acc": acc,
-            "opening": opening, "opening_mrs": opening_mrs}
+            "opening": opening, "opening_mrs": opening_mrs, "holds": holds}
 
 
 def clear_cache() -> None:

@@ -84,12 +84,13 @@ def test_a_payment_waiting_for_approval_shows_as_proposed():
 def test_the_request_sent_to_vow():
     form = dict(branch_id=35, bank_ledger_id=118, voucher_date=D(2026, 11, 19), pay_mode="RTGS",
                 instrument_no=" UTR123 ", instrument_date=None, narration="")
-    payload = H.payment_payload(67, 501, form, {201: 1000000, 202: 0, 203: 5.5}, acting_user_id=24)
+    payload = H.payment_payload(67, 501, form, {9001: 1000000, 9002: 0, 9003: 5.5}, acting_user_id=24)
     assert payload == {
         "co_id": 67, "branch_id": 35, "voucher_date": "2026-11-19", "party_id": 501,
         "bank_ledger_id": 118, "pay_mode": "RTGS", "instrument_no": "UTR123",
         "instrument_date": None, "narration": None, "acting_user_id": 24,
-        "bills": [{"jute_mr_id": 201, "amount": 1000000.0}, {"jute_mr_id": 203, "amount": 5.5}]}
+        "bills": [{"acc_bill_ref_id": 9001, "amount": 1000000.0},
+                  {"acc_bill_ref_id": 9003, "amount": 5.5}]}
     import pytest
     with pytest.raises(ValueError, match="at least one bill"):
         H.payment_payload(67, 501, form, {201: 0}, 24)
@@ -141,4 +142,92 @@ def test_opening_bills_sit_next_to_this_years_bills():
         "OLD-7", "", "EJM old", H.STATUS_PENDING)
     assert H.build_opening_rows(pd.DataFrame(), pd.DataFrame()).empty
     both = H.build_opening_rows(opening, old_mr)
-    assert "paid from VoW" in H.selection_problem(both.iloc[[1]])
+    assert H.selection_problem(both.iloc[[1]]) is None          # opening bills can be paid
+    assert H.selection_problem(both) is None                    # alone or with each other
+
+
+def test_a_supplier_on_hold_is_marked_and_cannot_be_ticked():
+    assert H.COLUMNS.index("On hold") == H.COLUMNS.index("Status") + 1
+    posted = dict(acc_bill_ref_id=9.0, acc_pending=1799511.0)
+    bills = pd.DataFrame([mr(1, src=100, **posted), mr(2, src=101, party_id=777, **posted),
+                          mr(3, src=102, party_id=888, **posted)])
+    holds = pd.DataFrame([dict(co_id=65, party_id=501, note="cheque bounced"),
+                          dict(co_id=65, party_id=888, note=None),
+                          dict(co_id=67, party_id=777, note="other company")])
+    rows = H.build_rows(bills, holds=holds)
+    assert list(rows["On hold"]) == ["cheque bounced", "", "Yes"]
+    assert list(rows["on_hold"]) == [True, False, True]
+    problem = H.selection_problem(rows.iloc[[0]])
+    assert problem == ("JAY TULSI JUTE is on hold for payment. Release the hold in VoW "
+                       "(Accounting > Pay Bills) first.")
+    assert H.selection_problem(rows.iloc[[1]]) is None
+    # no holds at all (frame empty, None or dict): nothing marked
+    for none in (None, pd.DataFrame(columns=["co_id", "party_id", "note"]), {}):
+        again = H.build_rows(bills, holds=none)
+        assert (again["On hold"] == "").all() and not again["on_hold"].any()
+    assert H.holds_map({(65, 501): "x"}) == {(65, 501): "x"}
+    assert H.build_rows(bills.iloc[0:0]).empty
+
+
+def test_opening_rows_carry_the_hold_too():
+    opening = pd.DataFrame([dict(
+        acc_bill_ref_id=502, step1_co_id=67, step1_co="AVPL", party_id=9, supplier="SHIVAM",
+        bill_no="OLD-7", bill_date=D(2025, 12, 1), acc_due_date=None, acc_amount=700000.0,
+        acc_pending=700000.0, src_doc_type=None, src_doc_id=NAN, origin_note=None,
+        last_payment_date=None, acc_proposed=0.0)])
+    held = H.build_opening_rows(opening, pd.DataFrame(), holds={(67, 9): ""})
+    assert held.iloc[0]["On hold"] == "Yes" and bool(held.iloc[0]["on_hold"])
+    assert "on hold for payment" in H.selection_problem(held)
+    free = H.build_opening_rows(opening, pd.DataFrame())
+    assert free.iloc[0]["On hold"] == "" and not free.iloc[0]["on_hold"]
+
+
+def _opening_row(ref_id, mr_id, bill_date):
+    return pd.DataFrame([dict(
+        acc_bill_ref_id=ref_id, step1_co_id=65, step1_co="ACPL", party_id=9, supplier="S",
+        bill_no="B-%d" % ref_id, bill_date=bill_date, acc_due_date=None, acc_amount=1000.0,
+        acc_pending=1000.0, src_doc_type="JUTE_MR" if mr_id else None,
+        src_doc_id=mr_id if mr_id else NAN, origin_note="n", last_payment_date=None,
+        acc_proposed=0.0)])
+
+
+def _mr_rows(*specs):
+    bills = pd.DataFrame([mr(i, acc_bill_ref_id=ref) for i, ref in specs])
+    return H.build_rows(bills, D(2026, 11, 19))
+
+
+def test_imported_ref_replaces_the_unposted_mr_row():
+    src = pd.DataFrame([mr(88, step1_co_id=65, jute_mr_date=D(2026, 6, 1))])
+    opening = H.build_opening_rows(_opening_row(700, 88, D(2026, 6, 1)), src, D(2026, 11, 19))
+    merged = H.merge_rows(opening, _mr_rows((88, NAN), (89, NAN)))
+    assert list(merged["jute_mr_id"]) == [88, 89]
+    assert merged.iloc[0]["acc_bill_ref_id"] == 700
+    assert list(merged.columns) == list(opening.columns)
+
+
+def test_posted_mr_keeps_both_rows():
+    src = pd.DataFrame([mr(88)])
+    opening = H.build_opening_rows(_opening_row(700, 88, D(2026, 6, 1)), src, D(2026, 11, 19))
+    merged = H.merge_rows(opening, _mr_rows((88, 55.0)))
+    assert list(merged["acc_bill_ref_id"]) == [700, 55]
+
+
+def test_opening_without_an_mr_is_untouched():
+    opening = H.build_opening_rows(_opening_row(701, None, D(2025, 12, 1)), pd.DataFrame())
+    merged = H.merge_rows(opening, _mr_rows((89, NAN)))
+    assert len(merged) == 2 and merged.iloc[0]["acc_bill_ref_id"] == 701
+
+
+def test_label_is_opening_before_the_start_and_imported_after():
+    both = pd.concat([_opening_row(1, None, D(2026, 3, 31)), _opening_row(2, None, D(2026, 4, 1))])
+    r = H.build_opening_rows(both, pd.DataFrame(), accounts_start=D(2026, 4, 1))
+    assert list(r["Bill"]) == [H.BILL_OPENING, H.BILL_IMPORTED]
+    assert set(H.build_opening_rows(both, pd.DataFrame())["Bill"]) == {H.BILL_OPENING}
+
+
+def test_merge_with_empty_inputs():
+    mrs = _mr_rows((89, NAN))
+    assert len(H.merge_rows(pd.DataFrame(), mrs)) == 1
+    opening = H.build_opening_rows(_opening_row(701, None, D(2025, 12, 1)), pd.DataFrame())
+    assert len(H.merge_rows(opening, mrs.iloc[0:0])) == 1
+    assert H.merge_rows(pd.DataFrame(), pd.DataFrame()).empty

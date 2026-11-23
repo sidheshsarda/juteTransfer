@@ -85,8 +85,9 @@ def payment_options(co_id: int) -> dict:
 
 
 def open_bills(co_id: int, party_id: int) -> list:
-    """The supplier's open jute bills as accounts sees them (with what is
-    already proposed on unapproved payments)."""
+    """Every open bill of the supplier (BILLPASS and OPENING) as accounts sees
+    it: acc_bill_ref_id, jute_mr_id (may be null), allocatable_amount,
+    on_hold, hold_note, source."""
     out = _call("GET", "/bills", {"co_id": co_id, "party_id": party_id})
     return out.get("bills", []) if isinstance(out, dict) else out
 
