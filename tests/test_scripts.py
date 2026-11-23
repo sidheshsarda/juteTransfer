@@ -452,8 +452,9 @@ def test_repair_hop_tds_lists_and_rewrites_old_hops_by_the_erp_rule(scenario, tm
     with DatabaseConnection.get_transaction() as conn:
         (planned,) = repair.plan_hop_tds(conn)
     assert planned["jute_mr_id"] == hop and planned["approved_before"] == 6_000_000.0
+    # TKT-000344: 0.1 % of 13,78,878.50 - 13,757.30 = 1,365.12 -> 1,365 (was 1378.88 on gross)
     assert planned["new"] == {"total_amount": 1378878.5, "claim_amount": 13757.3,
-                              "tds_amount": 1378.88, "roundoff": -0.32, "net_total": 1363742.0}
+                              "tds_amount": 1365.0, "roundoff": -0.2, "net_total": 1363756.0}
 
     assert repair.main(["--apply", "--only", "hop-tds", "--expect", "1",
                         "--log-dir", str(tmp_path)]) == 0

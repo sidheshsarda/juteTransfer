@@ -122,12 +122,90 @@ def test_every_delete_and_line_update_goes_by_primary_key(scenario, po_on):
 # --- money exactly as the ERP writes it ------------------------------------------------------
 
 def test_erp_tds_rule():
+    # TKT-000344: 194Q TDS is on value NET of claims and in whole rupees, half up
+    # (it was gross and in paise: 1385.75 / 1285.75 here). The lorry: total
+    # 13,85,746.01 less claim 13,757.30 = 13,71,988.71.
+    net = transfer.erp_mr_tds_value(1_385_746.01, 13_757.3)
+    assert round(net, 2) == 1_371_988.71
+    assert transfer.erp_mr_tds_value(None, None) == 0.0 and transfer.erp_mr_tds_value(100.0, None) == 100.0
     assert transfer._erp_tds_amount(0.0, 4_000_000.0) == 0.0               # under Rs 50 lakh
-    assert transfer._erp_tds_amount(6_000_000.0, 1_385_746.01) == 1385.75  # already over: all
-    # crossing the threshold with this MR: only the part above it
-    assert transfer._erp_tds_amount(4_900_000.0, 1_385_746.01) == round(1_285_746.01 * 0.001, 2)
-    assert transfer._erp_jute_totals(1385746.01, 13757.3, 1385.75) == (0.04, 1370603.0)
+    assert transfer._erp_tds_amount(3_628_011.29, net) == 0.0              # exactly Rs 50 lakh: still none
+    assert transfer._erp_tds_amount(6_000_000.0, net) == 1372.0            # already over: all of it
+    # crossing the threshold with this MR: only the part above it (12,71,988.71)
+    assert transfer._erp_tds_amount(4_900_000.0, net) == 1272.0
+    assert transfer._erp_jute_totals(1385746.01, 13757.3, 1372.0) == (0.29, 1370617.0)
     assert transfer._erp_jute_totals(100.5, 0, 0) == (-0.5, 100.0)          # Python round, as the ERP
+
+
+def test_erp_tds_is_whole_rupees_half_up():
+    """TKT-000344 / ERP ruling 2026-10-09: 50 paise and up rounds up -- never
+    banker's rounding, never paise."""
+    over = 6_000_000.0                       # the party is already past Rs 50 lakh
+    assert transfer._erp_tds_amount(over, 499.99) == 0.0        # 0.49999
+    assert transfer._erp_tds_amount(over, 500.0) == 1.0         # 0.5   (round() gives 0)
+    assert transfer._erp_tds_amount(over, 2_500.0) == 3.0       # 2.5   (round() gives 2)
+    assert transfer._erp_tds_amount(over, 1_385_500.0) == 1386.0  # 1385.5
+    assert transfer._erp_tds_amount(over, 1_385_499.99) == 1385.0
+    assert transfer._erp_tds_amount(over, 1_371_988.71) == 1372.0   # 1371.98871, was 1371.99 in paise
+    # crossing: the half-rupee is of the part above the threshold only
+    assert transfer._erp_tds_amount(4_999_500.0, 1_000.0) == 1.0    # 500 over -> 0.5 -> 1
+    assert transfer._erp_tds_amount(4_999_500.0, 999.99) == 0.0     # 499.99 over
+
+
+def test_tds_threshold_counts_earlier_mrs_net_of_their_claims(scenario, po_on):
+    """TKT-000344: an earlier approved MR counts for total - claim. Rs 50 lakh
+    gross with a Rs 14 lakh claim is Rs 36 lakh towards the threshold, so this
+    lorry (13,71,988.71 net) stays BELOW it -- on gross it was Rs 13.86 lakh over."""
+    sc, db = scenario, scenario.db
+    b_in_a = sc.add_party(sc.a_co, sc.b_name)
+    earlier = db.insert("jute_mr", branch_id=sc.a_branch, party_id=str(b_in_a), status_id=3,
+                        jute_mr_date=date(2026, 8, 1), branch_mr_no=1, total_amount=5_000_000.0,
+                        claim_amount=1_400_000.0, transfer_mode=0)
+    chain = Chain(sc)
+    chain.save("B", mr_date=date(2026, 9, 1))
+    chain.save("A", pct=0.5, mr_date=date(2026, 9, 3))
+    root = db.row("jute_mr", jute_mr_id=sc.root)
+    assert in_txn(transfer._erp_cumulative_previous, b_in_a, root["jute_mr_date"],
+                  root["branch_mr_no"], sc.root) == 3_600_000.0
+    assert (root["total_amount"], root["claim_amount"], root["tds_amount"]) == (1385746.01, 13757.3, 0.0)
+    assert (root["roundoff"], root["net_total"]) == (0.29, 1371989.0)
+
+    # the same lorry CROSSING the threshold: the earlier claim is only Rs 1 lakh, so
+    # Rs 49 lakh counts and 49,00,000 + 13,71,988.71 is 12,71,988.71 over -> 1,272
+    chain.unfinalize()
+    db.update("jute_mr", {"jute_mr_id": earlier}, claim_amount=100_000.0)
+    chain.save("A", pct=0.5, mr_date=date(2026, 9, 3))
+    root = db.row("jute_mr", jute_mr_id=sc.root)
+    assert in_txn(transfer._erp_cumulative_previous, b_in_a, root["jute_mr_date"],
+                  root["branch_mr_no"], sc.root) == 4_900_000.0
+    assert (root["tds_amount"], root["roundoff"], root["net_total"]) == (1272.0, 0.29, 1370717.0)
+    # net_total is what the ERP's compute_jute_totals gives: total - claim - TDS, whole rupee
+    assert root["net_total"] == round(1385746.01 - 13757.3 - 1272.0)
+
+
+def test_each_hop_is_netted_by_its_own_flat_claim(scenario, po_on):
+    """TKT-000344 on a chain: claims never cascade, so the second hop's value
+    is 0.5 % up while its claim is the same flat 13,757.30 -- and each hop's
+    TDS is on ITS total less ITS header claim."""
+    sc, db = scenario, scenario.db
+    supplier_in_b, _ = sc.party_in(sc.b_co, sc.supplier_party_name)
+    b_in_c = sc.add_party(sc.c_co, sc.b_name)
+    for branch, party in ((sc.b_branch, supplier_in_b), (sc.c_branch, b_in_c)):
+        db.insert("jute_mr", branch_id=branch, party_id=str(party), status_id=3,
+                  jute_mr_date=date(2026, 8, 1), total_amount=6_500_000.0, claim_amount=500_000.0,
+                  transfer_mode=0)                       # Rs 60 lakh net: already over
+    chain = Chain(sc)
+    hop_b = chain.save("B", mr_date=date(2026, 9, 1))["mr_id"]
+    hop_c = chain.save("C", pct=0.5, mr_date=date(2026, 9, 2))["mr_id"]
+    b, c = money(db, hop_b), money(db, hop_c)
+    assert db.row("jute_mr", jute_mr_id=hop_c)["party_id"] == str(b_in_c)
+    assert b["claim_amount"] == c["claim_amount"] == 13757.3          # flat, not cascaded
+    assert (b["total_amount"], c["total_amount"]) == (1378878.5, 1385746.01)
+    # 13,65,121.20 -> 1,365.12 -> 1,365 ; 13,71,988.71 -> 1,371.99 -> 1,372
+    assert (b["tds_amount"], c["tds_amount"]) == (1365.0, 1372.0)
+    for hop, m in ((hop_b, b), (hop_c, c)):
+        assert m == erp_header(db, hop, tds=m["tds_amount"])
+        assert m["net_total"] == round(m["total_amount"] - m["claim_amount"] - m["tds_amount"])
 
 
 def test_finalize_derives_194q_tds_and_unfinalize_drops_it(scenario, po_on):
@@ -142,9 +220,10 @@ def test_finalize_derives_194q_tds_and_unfinalize_drops_it(scenario, po_on):
 
     root = db.row("jute_mr", jute_mr_id=sc.root)
     assert root["party_id"] == str(b_in_a)
+    # TKT-000344: 0.1 % of 13,85,746.01 - 13,757.30, whole rupees (was 1385.75 on gross)
     assert (root["total_amount"], root["claim_amount"], root["tds_amount"]) == (
-        1385746.01, 13757.3, 1385.75)
-    assert (root["roundoff"], root["net_total"]) == (0.04, 1370603.0)
+        1385746.01, 13757.3, 1372.0)
+    assert (root["roundoff"], root["net_total"]) == (0.29, 1370617.0)
 
     chain.unfinalize()
     root = db.row("jute_mr", jute_mr_id=sc.root)
@@ -168,7 +247,8 @@ def test_repair_counts_tds_in_the_order_the_lorries_were_finalized(scenario, po_
     chain.save("B", mr_date=date(2026, 9, 1))
     chain.save("A", pct=0.5, mr_date=date(2026, 9, 3), date_override="finalized late")
     # finalize itself now counts only the MRs before this one (ERP rule, 2026-10-03)
-    assert db.row("jute_mr", jute_mr_id=sc.root)["tds_amount"] == 385.75
+    # TKT-000344: 40,00,000 + 13,71,988.71 net is 3,71,988.71 over -> 372 (was 385.75 on gross)
+    assert db.row("jute_mr", jute_mr_id=sc.root)["tds_amount"] == 372.0
     # what the old finalize left behind
     db.update("jute_mr", {"jute_mr_id": sc.root}, claim_amount=None, tds_amount=None,
               roundoff=None, net_total=None)
@@ -178,7 +258,7 @@ def test_repair_counts_tds_in_the_order_the_lorries_were_finalized(scenario, po_
     assert plan[0]["approved_before"] == 4_000_000.0
     # the same figure the live finalize writes: one rule, two code paths
     assert plan[0]["new"] == {"total_amount": 1385746.01, "claim_amount": 13757.3,
-                              "tds_amount": 385.75, "roundoff": 0.04, "net_total": 1371603.0}
+                              "tds_amount": 372.0, "roundoff": 0.29, "net_total": 1371617.0}
 
     in_txn(repair._repair_finalized_net, plan[0])
     root = db.row("jute_mr", jute_mr_id=sc.root)
@@ -597,9 +677,11 @@ def test_a_hop_mr_carries_the_tds_the_erp_would_derive(scenario, po_on):
     db.insert("jute_mr", branch_id=sc.b_branch, party_id=str(supplier_in_b), status_id=3,
               jute_mr_date=date(2026, 8, 1), total_amount=6_000_000.0, transfer_mode=0)
     hop = Chain(sc).save("B", mr_date=date(2026, 9, 1))["mr_id"]
-    total = erp_header(db, hop)["total_amount"]
-    assert money(db, hop) == erp_header(db, hop, tds=round(total * 0.001, 2))
-    assert money(db, hop)["tds_amount"] == 1378.88
+    plain = erp_header(db, hop)
+    # TKT-000344: on the hop's total less its own claim, whole rupees (was 1378.88 on gross)
+    assert plain["total_amount"] - plain["claim_amount"] == pytest.approx(1365121.2)
+    assert money(db, hop) == erp_header(db, hop, tds=1365.0)
+    assert money(db, hop)["tds_amount"] == 1365.0
 
     earlier = Chain(sc, root=sc.add_root(ge_no=9, ge_date=date(2026, 7, 20)))
     hop2 = earlier.save("B", mr_date=date(2026, 7, 25),               # before the Rs 60 lakh
@@ -811,9 +893,9 @@ def test_finalize_counts_only_the_partys_approved_mrs_before_this_one(scenario, 
 
     root = db.row("jute_mr", jute_mr_id=sc.root)
     assert root["branch_mr_no"] == 3
-    # 45 lakh before + 13,85,746.01 crosses 50 lakh by 8,85,746.01 -> 885.75 (every other
-    # approved MR counting, as before the ruling, gave 1,385.75)
-    assert (root["total_amount"], root["tds_amount"], root["net_total"]) == (1385746.01, 885.75, 1371103.0)
+    # TKT-000344: 45 lakh before + 13,71,988.71 (net of the 13,757.30 claim) crosses
+    # 50 lakh by 8,71,988.71 -> 872 (on gross and in paise it was 885.75)
+    assert (root["total_amount"], root["tds_amount"], root["net_total"]) == (1385746.01, 872.0, 1371117.0)
     # the Python key says the same as the SQL predicate
     mine = transfer.mr_sequence_key(root["jute_mr_date"], root["branch_mr_no"], sc.root)
     peers = db.rows("jute_mr", party_id=str(b_in_a), status_id=3)
@@ -835,8 +917,11 @@ def test_erp_cumulative_previous_matches_the_repairs_python_order(scenario, po_o
     sc, db = scenario, scenario.db
     b_in_a = sc.add_party(sc.a_co, sc.b_name)
     rows = [db.insert("jute_mr", branch_id=sc.a_branch, party_id=str(b_in_a), status_id=3,
-                      jute_mr_date=date(2026, 9, d), branch_mr_no=n, total_amount=t, transfer_mode=0)
-            for d, n, t in ((5, 1, 100.0), (5, 2, 200.0), (6, 1, 400.0), (5, 2, 800.0), (4, 9, 1600.0))]
+                      jute_mr_date=date(2026, 9, d), branch_mr_no=n, total_amount=t + 7.0,
+                      claim_amount=c, transfer_mode=0)
+            # TKT-000344: each counts net of its claim (7.0; a NULL claim is 0 -> t + 7)
+            for d, n, t, c in ((5, 1, 100.0, 7.0), (5, 2, 200.0, 7.0), (6, 1, 400.0, 7.0),
+                               (5, 2, 800.0, 7.0), (4, 9, 1593.0, None))]
     with DatabaseConnection.get_transaction() as conn:
         for mr_id in rows:
             mr = db.row("jute_mr", jute_mr_id=mr_id)
