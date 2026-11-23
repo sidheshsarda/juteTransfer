@@ -21,8 +21,9 @@ Repairs:
                   -- the same code finalize now runs. TDS is counted in MR-date
                   order (then MR number): only what the party had been paid
                   BEFORE a lorry is in its Rs 50 lakh count, so the first
-                  Rs 50 lakh carry no TDS. (The ERP's Bill Pass save derives
-                  TDS again from ALL the party's approved MRs of the year.)
+                  Rs 50 lakh carry no TDS. Value is NET of claims and TDS is
+                  whole rupees, half up (TKT-000344), as the ERP's approve
+                  and Bill Pass save derive it.
                   The rows keep their updated_by / updated_date_time -- the
                   only record of when each lorry was finalized. Stops at the
                   first row that fails: later lorries count the earlier ones.
@@ -76,7 +77,8 @@ Repairs:
                   it; the old ones are LISTED here first). Rewrites each hop's
                   header by the ERP's rule (transfer._erp_money: total and
                   claim from the lines, TDS from the party's earlier approved
-                  MRs in MR-date order, roundoff, net); nothing else on the
+                  MRs in MR-date order, net of claims and in whole rupees
+                  -- TKT-000344 --, roundoff, net); nothing else on the
                   row changes. Stops at the first row that fails. Run only
                   after accounts have seen the list.
   po-lorry-quantity
@@ -125,7 +127,7 @@ from src.jutetransfer.po_helpers import ROLE_FINAL, ROLE_FORWARD, format_po_no, 
 from src.jutetransfer.queries import _get_financial_year_bounds, get_source_mr_full
 from src.jutetransfer.lot_helpers import line_price, restore_amounts
 from src.jutetransfer.transfer import (
-    _derive_original_party, _erp_jute_totals, _erp_money, _erp_recompute_money,
+    _derive_original_party, _erp_jute_totals, _erp_money, _erp_recompute_money, erp_mr_tds_value,
     mr_sequence_key,
 )
 
@@ -189,16 +191,18 @@ def _approval_order(mr) -> tuple:
 
 def _approved_before(conn, mr, repaired_total: dict, peers: dict) -> float:
     """What the ERP's 194Q count stood at when this MR was finalized: the
-    total_amount of the party's approved MRs of the same financial year that
-    come before it (an MR repaired earlier in this run counts with its
-    repaired total)."""
+    value NET of claims (total_amount - claim_amount, TKT-000344;
+    transfer.erp_mr_tds_value) of the party's approved MRs of the same
+    financial year that come before it. repaired_total holds, for an MR
+    planned earlier in this run, its planned NET value, which counts in
+    place of the stored one."""
     if not mr["party_id"] or not mr["jute_mr_date"]:
         return 0.0
     fy_start, fy_end = _get_financial_year_bounds(_as_date(mr["jute_mr_date"]))
     key = (str(mr["party_id"]), fy_start)
     if key not in peers:
         peers[key] = _rows(conn, """
-            SELECT jute_mr_id, jute_mr_date, branch_mr_no, total_amount
+            SELECT jute_mr_id, jute_mr_date, branch_mr_no, total_amount, claim_amount
             FROM jute_mr
             WHERE party_id = :party AND status_id = 3
               AND jute_mr_date IS NOT NULL
@@ -206,7 +210,8 @@ def _approved_before(conn, mr, repaired_total: dict, peers: dict) -> float:
         """, party=str(mr["party_id"]), fy_start=fy_start.strftime("%Y-%m-%d"),
             fy_end=fy_end.strftime("%Y-%m-%d"))
     mine = _approval_order(mr)
-    return sum(float(repaired_total.get(int(p["jute_mr_id"]), p["total_amount"]) or 0)
+    return sum(float(repaired_total.get(
+                   int(p["jute_mr_id"]), erp_mr_tds_value(p["total_amount"], p["claim_amount"])) or 0)
                for p in peers[key]
                if int(p["jute_mr_id"]) != int(mr["jute_mr_id"]) and _approval_order(p) < mine)
 
@@ -231,7 +236,7 @@ def plan_finalized_net(conn) -> list:
     for mr in todo:
         before = _approved_before(conn, mr, repaired_total, peers)
         new = _erp_money(conn, mr["jute_mr_id"], cumulative_previous=before)
-        repaired_total[int(mr["jute_mr_id"])] = new["total_amount"]
+        repaired_total[int(mr["jute_mr_id"])] = erp_mr_tds_value(new["total_amount"], new["claim_amount"])
         out.append({
             "jute_mr_id": mr["jute_mr_id"],
             "mr_no": mr["branch_mr_no"], "mr_date": mr["jute_mr_date"],
@@ -710,7 +715,7 @@ def plan_hop_tds(conn) -> list:
     for mr in hops:
         before = _approved_before(conn, mr, repaired_total, peers)
         new = _erp_money(conn, mr["jute_mr_id"], cumulative_previous=before)
-        repaired_total[int(mr["jute_mr_id"])] = new["total_amount"]
+        repaired_total[int(mr["jute_mr_id"])] = erp_mr_tds_value(new["total_amount"], new["claim_amount"])
         old = {k: mr[k] for k in _MONEY}
         if all(_same(old[k], new[k]) for k in _MONEY):
             continue
@@ -951,10 +956,8 @@ def report(plans: dict, applying: bool = False) -> None:
         p = plans["finalized-net"]
         print(f"\n[finalized-net] {len(p)} finalized root MR(s) with NULL claim / net total"
               " -> the ERP's own money rule (as its approve would have written it)")
-        print("  TDS (194Q, 0.1%) is counted in MR-date order: nothing on the first 50,00,000"
-              " bought from a party in the year.")
-        print("  (An ERP Bill Pass save on one of these MRs derives its TDS again from ALL the"
-              " party's approved MRs of the year.)")
+        print("  TDS (194Q, 0.1%, whole rupees) is counted in MR-date order on value net of claims:"
+              " nothing on the first 50,00,000 bought from a party in the year.")
         for r in p:
             o, n = r["old"], r["new"]
             print(f"  MR {r['jute_mr_id']} (MR no {r['mr_no']}, {_as_date(r['mr_date']):%d-%m-%Y}):"
