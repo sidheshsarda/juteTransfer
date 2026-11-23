@@ -15,6 +15,11 @@ fills; the root's when the step-1 MR has none). Due = payment_due_date when
 set, else MR date + terms. Paid / pending come from the accounts module (the
 bill's JUTE_BILLPASS voucher and its bill reference); a bill accounts has not
 posted yet shows as 'Not in accounts' with the whole amount pending.
+
+Party payment hold (acc_ledger.payment_hold / payment_hold_note, set in VoW):
+rows of a held supplier carry an 'On hold' column and cannot be ticked for
+payment. Any bill VoW holds a reference for (current or opening) can be paid;
+the payment request names bills by acc_bill_ref_id.
 """
 
 from datetime import date, datetime, timedelta
@@ -31,11 +36,13 @@ STATUSES = (STATUS_PENDING, STATUS_PART, STATUS_PROPOSED, STATUS_PAID, STATUS_NO
 
 BILL_CURRENT = "Current"
 BILL_OPENING = "Opening"          # owed at the start of accounts, entered bill-wise in VoW
+BILL_IMPORTED = "Imported"        # entered the same way but dated on/after the accounts start
+OPENING_KINDS = (BILL_OPENING, BILL_IMPORTED)
 
 COLUMNS = [
     "Bill", "Gate Entry Co", "GE No", "GE Date", "Step 1 Co", "MR No", "MR Date", "Party",
     "Supplier",
-    "Bill Amount", "Paid", "Pending", "Proposed", "Status", "Terms (days)", "Due Date",
+    "Bill Amount", "Paid", "Pending", "Proposed", "Status", "On hold", "Terms (days)", "Due Date",
     "Overdue (days)", "Last Payment",
 ]
 
@@ -66,6 +73,29 @@ def _text(value) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
     return str(value).strip()
+
+
+def holds_map(holds) -> dict:
+    """{(co_id, party_id): note} from payment_queries' holds frame (columns
+    co_id, party_id, note) or an already-built dict; None / empty -> {}."""
+    if holds is None:
+        return {}
+    if isinstance(holds, dict):
+        return {(int(k[0]), int(k[1])): _text(v) for k, v in holds.items()}
+    if holds.empty:
+        return {}
+    return {(int(r["co_id"]), int(r["party_id"])): _text(r.get("note"))
+            for r in holds.to_dict("records")}
+
+
+def hold_text(holds: dict, co_id, party_id) -> str:
+    """The 'On hold' cell: the note, 'Yes' when held without a note, else ''."""
+    if party_id is None or (isinstance(party_id, float) and pd.isna(party_id)):
+        return ""
+    key = (int(co_id), int(party_id))
+    if key not in holds:
+        return ""
+    return holds[key] or "Yes"
 
 
 def fy_label(d: date) -> str:
@@ -114,9 +144,10 @@ def bill_status(bill_amount: float, pending: float, posted: bool, proposed: floa
     return STATUS_PENDING
 
 
-def build_rows(bills: pd.DataFrame, today: Optional[date] = None) -> pd.DataFrame:
+def build_rows(bills: pd.DataFrame, today: Optional[date] = None, holds=None) -> pd.DataFrame:
     """The tracker grid from the raw bill rows (payment_queries.load_bills)."""
     today = today or date.today()
+    holds = holds_map(holds)
     out = []
     for r in bills.to_dict("records"):
         mr_date = _as_date(r.get("jute_mr_date"))
@@ -153,21 +184,27 @@ def build_rows(bills: pd.DataFrame, today: Optional[date] = None) -> pd.DataFram
             "Proposed": proposed,
             "can_pay": round(max(pending - proposed, 0.0), 2) if posted else 0.0,
             "Status": bill_status(amount, pending, posted, proposed),
+            "On hold": hold_text(holds, r["step1_co_id"], r.get("party_id")),
             "Terms (days)": terms,
             "Due Date": due,
             "Overdue (days)": overdue,
             "Last Payment": _as_date(r.get("last_payment_date")),
         })
+    for row in out:
+        row["on_hold"] = bool(row["On hold"])
     return pd.DataFrame(out, columns=["jute_mr_id", "step1_co_id", "party_id", "acc_bill_ref_id",
-                                      "can_pay"] + COLUMNS)
+                                      "can_pay", "on_hold"] + COLUMNS)
 
 
 def build_opening_rows(opening: pd.DataFrame, opening_mrs: pd.DataFrame,
-                       today: Optional[date] = None) -> pd.DataFrame:
-    """Opening bills as tracker rows. One entered against an old jute MR shows
+                       today: Optional[date] = None, holds=None,
+                       accounts_start: Optional[date] = None) -> pd.DataFrame:
+    """Opening bills as tracker rows. With `accounts_start`, a bill dated on or
+    after it is labelled 'Imported' instead of 'Opening'. One entered against an old jute MR shows
     that MR's gate-entry mill, number and party; one entered as a plain bill
     shows the bill number it was given and its note in place of the party."""
     today = today or date.today()
+    holds = holds_map(holds)
     by_id = ({int(m["jute_mr_id"]): m for m in opening_mrs.to_dict("records")}
              if opening_mrs is not None and not opening_mrs.empty else {})
     out = []
@@ -184,7 +221,8 @@ def build_opening_rows(opening: pd.DataFrame, opening_mrs: pd.DataFrame,
             "party_id": None if pd.isna(r.get("party_id")) else int(r["party_id"]),
             "acc_bill_ref_id": int(r["acc_bill_ref_id"]),
             "can_pay": round(max(pending - proposed, 0.0), 2),
-            "Bill": BILL_OPENING,
+            "Bill": (BILL_IMPORTED if accounts_start and bill_date and bill_date >= accounts_start
+                     else BILL_OPENING),
             "Gate Entry Co": _text(mr.get("gate_co")) if mr else "",
             "GE No": int(mr["ge_no"]) if mr and not pd.isna(mr.get("ge_no")) else None,
             "GE Date": _as_date(mr.get("ge_date")) if mr else None,
@@ -200,13 +238,33 @@ def build_opening_rows(opening: pd.DataFrame, opening_mrs: pd.DataFrame,
             "Pending": pending,
             "Proposed": proposed,
             "Status": bill_status(amount, pending, True, proposed),
+            "On hold": hold_text(holds, r["step1_co_id"], r.get("party_id")),
             "Terms (days)": None,
             "Due Date": due,
             "Overdue (days)": (today - due).days if due and pending > 0.005 and today > due else None,
             "Last Payment": _as_date(r.get("last_payment_date")),
         })
+    for row in out:
+        row["on_hold"] = bool(row["On hold"])
     return pd.DataFrame(out, columns=["jute_mr_id", "step1_co_id", "party_id", "acc_bill_ref_id",
-                                      "can_pay"] + COLUMNS)
+                                      "can_pay", "on_hold"] + COLUMNS)
+
+
+def merge_rows(opening_rows: pd.DataFrame, mr_rows: pd.DataFrame) -> pd.DataFrame:
+    """Opening rows first, then MR rows. An opening/imported ref entered against
+    an MR that accounts has not posted itself (no acc_bill_ref_id) IS that bill:
+    keep the accounts-backed opening row, drop the MR row. A posted MR keeps its
+    row (the imported ref is then an adjustment)."""
+    has_o = opening_rows is not None and not opening_rows.empty
+    has_m = mr_rows is not None and not mr_rows.empty
+    if not has_o:
+        return mr_rows.reset_index(drop=True) if has_m else (
+            mr_rows if mr_rows is not None else pd.DataFrame(columns=["jute_mr_id"] + COLUMNS))
+    if not has_m:
+        return opening_rows.reset_index(drop=True)
+    named = set(opening_rows["jute_mr_id"].dropna().astype(int))
+    dup = mr_rows["jute_mr_id"].isin(named) & mr_rows["acc_bill_ref_id"].isna()
+    return pd.concat([opening_rows, mr_rows[~dup]], ignore_index=True)
 
 
 def totals(rows: pd.DataFrame) -> dict:
@@ -228,11 +286,12 @@ def selection_problem(picked: pd.DataFrame) -> Optional[str]:
                 + ", ".join(sorted(picked["Step 1 Co"].unique())) + "). Pick one company's bills.")
     if picked["party_id"].nunique(dropna=False) > 1:
         return "The bills picked belong to more than one supplier. Pick one supplier's bills."
+    if picked["on_hold"].any():
+        supplier = picked.loc[picked["on_hold"], "Supplier"].iloc[0]
+        return (f"{supplier} is on hold for payment. Release the hold in VoW "
+                "(Accounting > Pay Bills) first.")
     if (picked["Pending"] <= 0.005).any():
         return "A bill that is already paid is ticked. Untick it."
-    if (picked["Bill"] == BILL_OPENING).any():
-        return ("An opening bill is ticked. Opening bills are paid from VoW (Accounting > Pay "
-                "Bills) for now. Untick it.")
     if picked["acc_bill_ref_id"].isna().any():
         return ("A ticked bill is not in the accounts module yet. It has to be posted in "
                 "accounts before a payment can be made against it.")
@@ -244,11 +303,11 @@ def selection_problem(picked: pd.DataFrame) -> Optional[str]:
 
 def payment_payload(co_id: int, party_id: int, form: dict, pay_now: dict,
                     acting_user_id: int) -> dict:
-    """The request VoW's jute-payments API expects. `pay_now` = {jute_mr_id:
+    """The request VoW's jute-payments API expects. `pay_now` = {acc_bill_ref_id:
     amount}; bills with nothing to pay are left out. Raises ValueError in
     plain words when the form cannot be sent."""
-    bills = [{"jute_mr_id": int(mr_id), "amount": round(float(amount), 2)}
-             for mr_id, amount in pay_now.items() if amount and float(amount) > 0.005]
+    bills = [{"acc_bill_ref_id": int(ref_id), "amount": round(float(amount), 2)}
+             for ref_id, amount in pay_now.items() if amount and float(amount) > 0.005]
     if not bills:
         raise ValueError("Enter an amount to pay on at least one bill.")
     if not form.get("branch_id"):

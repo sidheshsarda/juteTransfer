@@ -1341,12 +1341,25 @@ def _create_sales_invoice(conn, seller_step: TransferStep,
 
 # The ERP's money rules for an MR header, mirrored: vowerp3be
 # src/juteProcurement/mr.py (recompute_mr_money, calculate_mr_amounts,
-# calculate_tds_amount, get_cumulative_mr_value_for_party_in_fy) and totals.py
+# MR_TDS_VALUE_SQL / mr_tds_value, derive_mr_tds, calculate_tds_amount,
+# get_cumulative_mr_value_for_party_in_fy) and totals.py
 # (compute_jute_totals). A header the app writes is then exactly the header the
 # ERP itself would write, so its bill pass list, view and save agree. Keep in
 # step with those functions.
 ERP_TDS_THRESHOLD = 5000000.0   # 194Q: purchases from one party in a FY
 ERP_TDS_RATE = 0.001
+
+# What one jute_mr row counts for under 194Q: its value NET of claims (owner
+# ruling 2026-11-22, TKT-000344; mr.py MR_TDS_VALUE_SQL). Both the Rs 50 lakh
+# count and the TDS base use it -- never sum total_amount on its own for a
+# TDS purpose. On a chain hop the claim is the hop's OWN header claim (the
+# flat sum of the original claims: claims never cascade).
+_ERP_MR_TDS_VALUE_SQL = "COALESCE(total_amount, 0) - COALESCE(claim_amount, 0)"
+
+
+def erp_mr_tds_value(total_amount, claim_amount) -> float:
+    """mr_tds_value: Python side of _ERP_MR_TDS_VALUE_SQL."""
+    return float(total_amount or 0) - float(claim_amount or 0)
 
 # A hop MR (the lorry as received at a forwarding company) carries the 194Q
 # TDS the ERP's own approve would derive for that company's purchase from the
@@ -1385,12 +1398,13 @@ def mr_sequence_key(jute_mr_date, branch_mr_no, jute_mr_id) -> tuple:
 
 
 def _erp_cumulative_previous(conn, party_id, mr_date: date, branch_mr_no, mr_id: int) -> float:
-    """get_cumulative_mr_value_for_party_in_fy: total_amount of the party's
-    approved MRs of mr_date's financial year that come before (mr_date,
-    branch_mr_no, mr_id) -- READ ONLY."""
+    """get_cumulative_mr_value_for_party_in_fy: the NET-of-claim value
+    (total_amount - claim_amount, TKT-000344) of the party's approved MRs of
+    mr_date's financial year that come before (mr_date, branch_mr_no, mr_id)
+    -- READ ONLY."""
     fy_start, fy_end = _get_financial_year_bounds(mr_date)
     value = conn.execute(text(f"""
-        SELECT COALESCE(SUM(COALESCE(total_amount, 0)), 0)
+        SELECT COALESCE(SUM({_ERP_MR_TDS_VALUE_SQL}), 0)
         FROM jute_mr
         WHERE party_id = :party AND status_id = 3
           AND jute_mr_date IS NOT NULL
@@ -1405,7 +1419,11 @@ def _erp_cumulative_previous(conn, party_id, mr_date: date, branch_mr_no, mr_id:
 
 def _erp_tds_amount(cumulative_previous: float, current_total: float) -> float:
     """calculate_tds_amount: 0.1 % of what crosses Rs 50 lakh of the party's
-    approved MR value in the financial year."""
+    approved MR value in the financial year, in WHOLE RUPEES, 50 paise and up
+    rounding up (ERP owner ruling 2026-10-09). Both arguments are NET of
+    claims (TKT-000344): the caller nets them (erp_mr_tds_value); this only
+    applies threshold, rate and rounding. Decimal, so a .5 never lands on the
+    wrong side through float noise."""
     cumulative_after = cumulative_previous + current_total
     if cumulative_after <= ERP_TDS_THRESHOLD:
         return 0.0
@@ -1413,7 +1431,8 @@ def _erp_tds_amount(cumulative_previous: float, current_total: float) -> float:
         applicable = current_total
     else:
         applicable = cumulative_after - ERP_TDS_THRESHOLD
-    return round(applicable * ERP_TDS_RATE, 2)
+    return float((Decimal(str(applicable)) * Decimal(str(ERP_TDS_RATE)))
+                 .quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def _erp_jute_totals(total_amount, claim_amount, tds_amount) -> tuple:
@@ -1431,12 +1450,13 @@ def _erp_money(conn, mr_id: int, tds_amount: Optional[float] = None,
     """The header money the ERP would compute for an MR from its active lines
     (calculate_mr_amounts + calculate_tds_amount + compute_jute_totals) --
     READ ONLY. tds_amount=None derives 194Q TDS as the ERP's approve and bill
-    pass do (derive_mr_tds): from the party's approved MRs of the FY that come
+    pass do (derive_mr_tds), on the MR's value NET of its own claim
+    (TKT-000344): from the party's approved MRs of the FY that come
     BEFORE this one in the ERP's sequence, placed by the MR's own stored
     jute_mr_date / branch_mr_no / jute_mr_id (so call it after those are
-    written) -- or from cumulative_previous, when the caller has computed
-    that figure itself (the repair script, which counts rows it has just
-    planned with their planned totals)."""
+    written) -- or from cumulative_previous (net of claims too), when the
+    caller has computed that figure itself (the repair script, which counts
+    rows it has just planned with their planned net values)."""
     sums = conn.execute(text("""
         SELECT COALESCE(SUM((COALESCE(accepted_weight, actual_weight, 0) / 100) * COALESCE(rate, 0)), 0),
                COALESCE(SUM((COALESCE(accepted_weight, actual_weight, 0) / 100) * COALESCE(claim_rate, 0)), 0)
@@ -1444,8 +1464,10 @@ def _erp_money(conn, mr_id: int, tds_amount: Optional[float] = None,
     """), {"id": mr_id}).fetchone()
     raw_total, raw_claim = float(sums[0] or 0), float(sums[1] or 0)
     total_amount, claim_amount = round(raw_total, 2), round(raw_claim, 2)
+    # As derive_mr_tds: the unrounded line sums, netted (calculate_mr_amounts).
+    tds_value = erp_mr_tds_value(raw_total, raw_claim)
     if tds_amount is None and cumulative_previous is not None:
-        tds_amount = _erp_tds_amount(float(cumulative_previous), raw_total)
+        tds_amount = _erp_tds_amount(float(cumulative_previous), tds_value)
     if tds_amount is None:
         hdr = conn.execute(text(
             "SELECT party_id, jute_mr_date, branch_mr_no FROM jute_mr WHERE jute_mr_id = :id"
@@ -1454,7 +1476,7 @@ def _erp_money(conn, mr_id: int, tds_amount: Optional[float] = None,
         if hdr and hdr[0] and hdr[1]:
             mr_date = hdr[1].date() if isinstance(hdr[1], datetime) else hdr[1]
             cumulative = _erp_cumulative_previous(conn, hdr[0], mr_date, hdr[2], mr_id)
-        tds_amount = _erp_tds_amount(cumulative, raw_total)
+        tds_amount = _erp_tds_amount(cumulative, tds_value)
     tds_amount = round(float(tds_amount), 2)
     roundoff, net_total = _erp_jute_totals(total_amount, claim_amount, tds_amount)
     return {"total_amount": total_amount, "claim_amount": claim_amount,

@@ -148,6 +148,10 @@ def _edit_mr(conn, mr_id: int, kind: str, invoice_ids: list, po_ids: list,
         # 194Q TDS follows the MR's place in the party's sequence (date, no,
         # id). Only the TDS, roundoff and net are rewritten, from the STORED
         # total and claim: a date edit never changes a rate or an amount.
+        # The TDS itself is the ERP's current rule (_erp_money: net of claims,
+        # whole rupees -- TKT-000344), so an MR still carrying a TDS of the
+        # old gross / paise rule is brought to the new one here, as an ERP
+        # bill pass save would.
         if kind != KIND_MARKED:
             old_tds = round(float(hdr[3] or 0), 2)
             new_tds = _erp_money(conn, mr_id,
