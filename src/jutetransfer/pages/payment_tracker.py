@@ -20,14 +20,11 @@ import streamlit as st
 from .. import payment_tracker_helpers as H
 from .. import vow_api
 from ..auth import is_admin
+from ..payment_tracker_helpers import ACCOUNTS_START
 from ..payment_queries import clear_cache, load_bills
 
 ALL = "All"
 ALL_YEARS = 0      # the period box's "every year" choice
-# Bills dated before this are not read from the MRs: what was still owed on
-# them is the opening bills entered in VoW (otherwise every old MR, paid long
-# ago outside the system, would show as pending).
-ACCOUNTS_START = date(2026, 4, 1)
 
 
 def _money(value: float) -> str:
@@ -177,19 +174,9 @@ def payment_tracker_page() -> None:
     except Exception as e:
         st.error(f"Could not load the bills: {e}")
         return
-    bills = H.pick_bills(data["mrs"], data["first_hop_of"])
-    if not bills.empty:
-        bills = bills.merge(data["acc"], on="jute_mr_id", how="left")
-    holds = H.holds_map(data.get("holds"))
-    rows = H.build_rows(bills, today, holds)
-    opening = H.build_opening_rows(data.get("opening"), data.get("opening_mrs"), today, holds,
-                                  accounts_start=ACCOUNTS_START)
-    if not opening.empty and fy != ALL_YEARS:
-        # a single year also shows what is still pending from the opening
-        opening = opening[opening["Status"] != H.STATUS_PAID]
     # what was owed at the start of accounts comes first; an imported ref for an
     # MR accounts has not posted replaces that MR's 'Not in accounts' row
-    rows = H.merge_rows(opening, rows)
+    rows = H.tracker_rows(data, today, ACCOUNTS_START, drop_paid_opening=(fy != ALL_YEARS))
 
     with top[1]:
         gate = _pick("Gate entry company", rows["Gate Entry Co"], "pt_gate")

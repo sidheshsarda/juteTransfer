@@ -231,3 +231,57 @@ def test_merge_with_empty_inputs():
     opening = H.build_opening_rows(_opening_row(701, None, D(2025, 12, 1)), pd.DataFrame())
     assert len(H.merge_rows(opening, mrs.iloc[0:0])) == 1
     assert H.merge_rows(pd.DataFrame(), pd.DataFrame()).empty
+
+
+def test_hidden_supplier_columns_on_current_rows():
+    bills = pd.DataFrame([mr(1, acc_bill_ref_id=5, acc_pending=10.0, jute_supplier_id=7.0),
+                          mr(2, jute_supplier_id=NAN)])
+    r = H.build_rows(bills, D(2026, 11, 19))
+    assert list(r.columns) == H.HIDDEN + H.COLUMNS
+    assert r["jute_supplier_id"].tolist()[0] == 7 and r["jute_supplier_id"].isna().tolist()[1]
+    assert list(r["sheet_party"]) == ["", ""]
+    # a frame without the column is tolerated
+    assert H.build_rows(pd.DataFrame([mr(3)]), D(2026, 11, 19))["jute_supplier_id"].isna().all()
+
+
+def test_hidden_supplier_columns_on_opening_rows():
+    def op(ref, note, src=NAN):
+        return dict(acc_bill_ref_id=ref, step1_co_id=67, step1_co="AVPL", party_id=9, supplier="S",
+                    bill_no="B", bill_date=D(2025, 12, 1), acc_due_date=None, acc_amount=10.0,
+                    acc_pending=10.0, src_doc_type="JUTE_MR" if src == src else None,
+                    src_doc_id=src, origin_note=note, last_payment_date=None, acc_proposed=0.0)
+    opening = pd.DataFrame([op(1, "LCPL | kishan k"), op(2, "EJM old | others | no MR in system"),
+                            op(3, "EJM old"), op(4, None), op(5, "x | y", src=88.0)])
+    old_mr = pd.DataFrame([mr(88, jute_supplier_id=12, step1_co_id=67, step1_co="AVPL")])
+    r = H.build_opening_rows(opening, old_mr, D(2026, 11, 19))
+    assert list(r.columns) == H.HIDDEN + H.COLUMNS
+    assert list(r["sheet_party"]) == ["kishan k", "others", "", "", "y"]
+    assert r["jute_supplier_id"].isna().tolist() == [True, True, True, True, False]
+    assert r["jute_supplier_id"].iloc[4] == 12
+
+
+def test_tracker_rows_matches_the_pages_pipeline():
+    drop = ["acc_bill_ref_id", "acc_pending", "acc_due_date", "last_payment_date", "acc_proposed"]
+    mrs = pd.DataFrame([mr(10), mr(11)]).drop(columns=drop)
+    acc = pd.DataFrame([dict(jute_mr_id=11, acc_bill_ref_id=5, acc_pending=0.0, acc_due_date=None,
+                             last_payment_date=D(2026, 11, 7), acc_proposed=0.0)])
+    opening = pd.DataFrame([dict(acc_bill_ref_id=1, step1_co_id=67, step1_co="AVPL", party_id=9,
+                                 supplier="S", bill_no="OLD", bill_date=D(2026, 4, 2),
+                                 acc_due_date=None, acc_amount=10.0, acc_pending=0.0,
+                                 src_doc_type=None, src_doc_id=NAN, origin_note="a | b",
+                                 last_payment_date=None, acc_proposed=0.0),
+                            dict(acc_bill_ref_id=2, step1_co_id=67, step1_co="AVPL", party_id=9,
+                                 supplier="S", bill_no="OLD2", bill_date=D(2025, 12, 2),
+                                 acc_due_date=None, acc_amount=10.0, acc_pending=4.0,
+                                 src_doc_type=None, src_doc_id=NAN, origin_note="a | c",
+                                 last_payment_date=None, acc_proposed=0.0)])
+    data = dict(mrs=mrs, first_hop_of={}, acc=acc, opening=opening, opening_mrs=pd.DataFrame(),
+                holds=pd.DataFrame(columns=["co_id", "party_id", "note"]))
+    rows = H.tracker_rows(data, D(2026, 11, 19), H.ACCOUNTS_START)
+    assert list(rows["Bill"]) == ["Imported", "Opening", "Current", "Current"]
+    assert list(rows["Status"])[2:] == ["Not in accounts", "Paid"]
+    kept = H.tracker_rows(data, D(2026, 11, 19), H.ACCOUNTS_START, drop_paid_opening=True)
+    assert list(kept["Bill"]) == ["Opening", "Current", "Current"]
+    assert H.ACCOUNTS_START == D(2026, 4, 1)
+    empty = dict(data, mrs=mrs.iloc[0:0], opening=None, opening_mrs=None)
+    assert H.tracker_rows(empty, D(2026, 11, 19), H.ACCOUNTS_START).empty

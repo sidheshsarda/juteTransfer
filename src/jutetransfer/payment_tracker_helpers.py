@@ -27,6 +27,11 @@ from typing import Optional
 
 import pandas as pd
 
+# Bills dated before this are not read from the MRs: what was still owed on
+# them is the opening bills entered in VoW (otherwise every old MR, paid long
+# ago outside the system, would show as pending).
+ACCOUNTS_START = date(2026, 4, 1)
+
 STATUS_PAID = "Paid"
 STATUS_PART = "Part paid"
 STATUS_PENDING = "Pending"
@@ -73,6 +78,26 @@ def _text(value) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
     return str(value).strip()
+
+
+def _int_or_none(value) -> Optional[int]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def sheet_party_of(origin_note) -> str:
+    """The sheet's party name inside an opening bill's origin note: the middle
+    '|' segment ('LCPL | kishan k' -> 'kishan k'); '' when there is no '|'."""
+    parts = _text(origin_note).split("|")
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+HIDDEN = ["jute_mr_id", "step1_co_id", "party_id", "acc_bill_ref_id", "can_pay", "on_hold",
+          "jute_supplier_id", "sheet_party"]
 
 
 def holds_map(holds) -> dict:
@@ -167,6 +192,8 @@ def build_rows(bills: pd.DataFrame, today: Optional[date] = None, holds=None) ->
             "jute_mr_id": int(r["jute_mr_id"]),
             "step1_co_id": int(r["step1_co_id"]),
             "party_id": None if pd.isna(r.get("party_id")) else int(r["party_id"]),
+            "jute_supplier_id": _int_or_none(r.get("jute_supplier_id")),
+            "sheet_party": "",
             "acc_bill_ref_id": int(r["acc_bill_ref_id"]) if posted else None,
             "Bill": BILL_CURRENT,
             "Gate Entry Co": _text(r.get("gate_co")),
@@ -192,8 +219,7 @@ def build_rows(bills: pd.DataFrame, today: Optional[date] = None, holds=None) ->
         })
     for row in out:
         row["on_hold"] = bool(row["On hold"])
-    return pd.DataFrame(out, columns=["jute_mr_id", "step1_co_id", "party_id", "acc_bill_ref_id",
-                                      "can_pay", "on_hold"] + COLUMNS)
+    return pd.DataFrame(out, columns=HIDDEN + COLUMNS)
 
 
 def build_opening_rows(opening: pd.DataFrame, opening_mrs: pd.DataFrame,
@@ -219,6 +245,8 @@ def build_opening_rows(opening: pd.DataFrame, opening_mrs: pd.DataFrame,
             "jute_mr_id": int(mr["jute_mr_id"]) if mr else None,
             "step1_co_id": int(r["step1_co_id"]),
             "party_id": None if pd.isna(r.get("party_id")) else int(r["party_id"]),
+            "jute_supplier_id": _int_or_none(mr.get("jute_supplier_id")) if mr else None,
+            "sheet_party": sheet_party_of(r.get("origin_note")),
             "acc_bill_ref_id": int(r["acc_bill_ref_id"]),
             "can_pay": round(max(pending - proposed, 0.0), 2),
             "Bill": (BILL_IMPORTED if accounts_start and bill_date and bill_date >= accounts_start
@@ -246,8 +274,7 @@ def build_opening_rows(opening: pd.DataFrame, opening_mrs: pd.DataFrame,
         })
     for row in out:
         row["on_hold"] = bool(row["On hold"])
-    return pd.DataFrame(out, columns=["jute_mr_id", "step1_co_id", "party_id", "acc_bill_ref_id",
-                                      "can_pay", "on_hold"] + COLUMNS)
+    return pd.DataFrame(out, columns=HIDDEN + COLUMNS)
 
 
 def merge_rows(opening_rows: pd.DataFrame, mr_rows: pd.DataFrame) -> pd.DataFrame:
@@ -265,6 +292,26 @@ def merge_rows(opening_rows: pd.DataFrame, mr_rows: pd.DataFrame) -> pd.DataFram
     named = set(opening_rows["jute_mr_id"].dropna().astype(int))
     dup = mr_rows["jute_mr_id"].isin(named) & mr_rows["acc_bill_ref_id"].isna()
     return pd.concat([opening_rows, mr_rows[~dup]], ignore_index=True)
+
+
+def tracker_rows(data: dict, today: Optional[date] = None, accounts_start: Optional[date] = None,
+                 drop_paid_opening: bool = False) -> pd.DataFrame:
+    """The tracker's rows from payment_queries.load_bills' dict: bills picked,
+    accounts merged, opening bills added (a single year passes
+    drop_paid_opening=True to show only the opening bills still pending)."""
+    today = today or date.today()
+    accounts_start = accounts_start or ACCOUNTS_START
+    mrs = data["mrs"]
+    bills = pick_bills(mrs, data["first_hop_of"])
+    if not bills.empty:
+        bills = bills.merge(data["acc"], on="jute_mr_id", how="left")
+    holds = holds_map(data.get("holds"))
+    rows = build_rows(bills, today, holds)
+    opening = build_opening_rows(data.get("opening"), data.get("opening_mrs"), today, holds,
+                                 accounts_start=accounts_start)
+    if drop_paid_opening and not opening.empty:
+        opening = opening[opening["Status"] != STATUS_PAID]
+    return merge_rows(opening, rows)
 
 
 def totals(rows: pd.DataFrame) -> dict:

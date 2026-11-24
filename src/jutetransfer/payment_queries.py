@@ -7,13 +7,14 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 
+from . import supplier_map
 from .database import DatabaseConnection
 
 CACHE_TTL = 120  # seconds
 
 _MRS_SQL = """
     SELECT h.jute_mr_id, h.src_jute_mr_id, h.branch_mr_no, h.jute_mr_date, h.net_total,
-           h.payment_terms_days, h.payment_due_date, h.party_id,
+           h.payment_terms_days, h.payment_due_date, h.party_id, h.jute_supplier_id,
            hc.co_id AS step1_co_id, hc.co_prefix AS step1_co, hb.branch_prefix AS step1_branch_prefix,
            pm.supp_name AS supplier, js.supplier_name AS party,
            rc.co_prefix AS gate_co, r.jute_gate_entry_no AS ge_no,
@@ -136,5 +137,54 @@ def load_bills(date_from: date, date_to: date) -> dict:
             "opening": opening, "opening_mrs": opening_mrs, "holds": holds}
 
 
+_MASTER_SQL = "SELECT supplier_id, supplier_name FROM jute_supplier_mst"
+_ON_ACCOUNT_SQL = """
+    SELECT br.co_id, c.co_prefix, br.party_id, pm.supp_name AS supplier,
+           br.pending_amount AS amount, br.bill_date
+    FROM acc_voucher v
+    JOIN acc_bill_ref br ON br.acc_voucher_id = v.acc_voucher_id
+                        AND br.ref_type = 'ON_ACCOUNT' AND COALESCE(br.active, 1) = 1
+                        AND br.pending_amount > 0
+    JOIN co_mst c ON c.co_id = br.co_id
+    LEFT JOIN party_mst pm ON pm.party_id = br.party_id
+    WHERE v.status_id = 3 AND COALESCE(v.is_reversed, 0) = 0 AND COALESCE(v.active, 1) = 1
+"""
+_PARTY_HISTORY_SQL = """
+    SELECT party_id, jute_supplier_id, COUNT(*) AS n
+    FROM jute_mr
+    WHERE status_id = 3 AND jute_supplier_id IS NOT NULL AND party_id IS NOT NULL
+    GROUP BY party_id, jute_supplier_id
+"""
+_EXTRA_COLUMNS = {
+    "master": ["supplier_id", "supplier_name"],
+    "on_account": ["co_id", "co_prefix", "party_id", "supplier", "amount", "bill_date"],
+    "party_history": ["party_id", "jute_supplier_id", "n"],
+}
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Loading supplier lists…")
+def load_summary_extras() -> dict:
+    """What the Payment Summary page needs besides the bills: the jute
+    supplier master, on-account (advance) refs, each party's MR history by
+    jute supplier, and the confirmed party -> supplier list. Each part falls
+    back to an empty frame / dict on its own."""
+    out = {}
+    sqls = {"master": _MASTER_SQL, "on_account": _ON_ACCOUNT_SQL,
+            "party_history": _PARTY_HISTORY_SQL}
+    with DatabaseConnection.get_engine().connect() as conn:
+        for name, sql in sqls.items():
+            try:
+                out[name] = pd.read_sql_query(text(sql), conn)
+            except Exception:
+                out[name] = pd.DataFrame(columns=_EXTRA_COLUMNS[name])
+    try:
+        out["map_ready"] = bool(supplier_map.table_exists())
+        out["party_map"] = supplier_map.load_map() if out["map_ready"] else {}
+    except Exception:
+        out["map_ready"], out["party_map"] = False, {}
+    return out
+
+
 def clear_cache() -> None:
     load_bills.clear()
+    load_summary_extras.clear()
