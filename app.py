@@ -13,6 +13,7 @@ from src.jutetransfer.pages import (
     po_tracker_page,
     users_page,
     payment_tracker_page,
+    payment_summary_page,
 )
 
 
@@ -42,6 +43,7 @@ def display_sidebar():
                      "Transfer Chain (Vertical)",
                      "PO Tracker",
                      "Payment Tracker",
+                     "Payment Summary",
                      "Warehouse Stock",
                      "Company P&L", "Schema Viewer"]
             if is_admin():
@@ -125,6 +127,8 @@ def main():
         users_page()
     elif page == "Payment Tracker":
         payment_tracker_page()
+    elif page == "Payment Summary":
+        payment_summary_page()
 
 
 if __name__ == "__main__":

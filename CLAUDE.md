@@ -88,6 +88,13 @@ Replaces the 'Entry sheet' of the owner's payments workbook: one row per **suppl
 - **Party payment hold (set in VoW):** `acc_ledger.payment_hold` / `payment_hold_note` (one party ledger per company + party). `load_bills` returns `holds` (co_id, party_id, note; empty when the columns are not on the database yet — the read is try/fallback). Rows get an 'On hold' column (note, or 'Yes') after Status plus a hidden `on_hold`; a ticked held bill is refused by `selection_problem`; page checkbox 'Hide on-hold' and a caption with the held count / amount; the pay popup also errors and blocks saving when VoW's live row says `on_hold`.
 - **Payments are never written by this app.** An admin ticks bills of ONE step-1 company and ONE supplier (`selection_problem`), the popup collects what VoW's Pay Bills form asks (branch, date, bank / cash ledger, pay mode, UTR / cheque, amount per bill keyed by `acc_bill_ref_id`, narration; a 'Bill' column says Current / Opening) and `vow_api.create_payment` posts it to VoW's integration API `/api/integration/jute_payments` (vowerp3be `docs/integration/jute_payments_api.md`; headers `X-Integration-Key`, `X-Tenant`; answers wrapped as `{"data": …}`), which calls VoW's own payment function and leaves a Draft voucher for accounts to approve. `.env`: `JT_VOW_API_URL`, `JT_VOW_API_KEY` (= VoW's `VOW_INTEGRATION_KEY`), `JT_VOW_TENANT` (default sls); without URL and key the page is read-only. Each payment item is `{acc_bill_ref_id, amount}`; `GET /bills` lists every open bill of the supplier (BILLPASS and OPENING) with `acc_bill_ref_id`, `jute_mr_id` (may be null), `allocatable_amount`, `on_hold`, `hold_note`, `source`. Create is not idempotent on VoW's side: the popup re-reads what is already proposed on each bill every time it opens.
 
+### Payment Summary (2026-11-24) — `pages/payment_summary.py`
+
+Spec `docs/superpowers/specs/2026-11-24-payment-summary-design.md`. Sidebar "Payment Summary", right after Payment Tracker. The tracker's bills (`payment_tracker_helpers.tracker_rows`, all years) summed per **jute supplier** (`jute_supplier_mst`, the broker; not `party_mst`): pending, on hold, free to pay, on-account advances, month-year columns (FY columns before the chosen "Month-wise from"), days pending, a company-wise sheet and the bills. Three tabs: Supplier dues, Company-wise, Others → supplier. Read-only on accounts and MRs; Excel (needs `openpyxl`) + CSV downloads.
+- **Days are notional.** Payments are pooled per supplier across all companies and set against the oldest bills first (`payment_summary_helpers.fifo_position`); that only yields "pending from" / "cleared till" / days. Nothing is re-applied or saved; the month columns show each bill's own pending in its bill month, as in accounts. "Days Pending" leaves bills of held parties out, "Days Incl. Hold" counts them.
+- **'others' matching:** many MRs carry jute supplier `others`. A party is grouped under a real supplier only from the MR itself, an exact sheet-name match on opening rows, or the owner's confirmation in table `jt_party_supplier_map` (sls only; `party_id` PK, `jute_supplier_id` NULL = confirmed "stays in others"). Tab 3 lists the suggestions, one row per party NAME + sheet name (`group_suggestions`: `party_mst` has one record per company for the same party, and one answer is saved for every record of the row; a party the sheet books under two names, e.g. S.S. Rungta as 'rungta' / 'ss rungta adpl', stays on separate rows). A suggestion comes from the sheet's name for the party (`acc_bill_ref.origin_note`, `match_master`), else the party's own name being in the master, else its MR history; only an admin can confirm (`supplier_map.save_map`, admin-checked, one transaction; no audit row, as `audit.log` refuses the change when `jt_change_log` is absent). Without the table the list is read-only. Create it with `python -m scripts.migrate_jt_party_supplier_map --apply` (dry run by default; owner's OK first).
+- New modules: `payment_summary_helpers.py` (pure), `supplier_map.py`, `pages/payment_summary.py`; `payment_queries.load_summary_extras()` (master, on-account refs, party history, confirmed map). `ACCOUNTS_START` now lives in `payment_tracker_helpers`.
+
 ### Transfer POs (2026-10-01 — spec `docs/superpowers/specs/2026-10-01-transfer-po-design.md`)
 
 Every chain transfer also writes ERP purchase orders (`jute_po` + `jute_po_li` + one `jute_po_status_log` row), in the same transaction as the step:
@@ -121,6 +128,7 @@ src/jutetransfer/
 ├── pages/
 │   ├── new_transfer_chain.py         # Type 1: vertical chain page (sole chain-editing UI)
 │   ├── warehouse_stock.py            # Type 2: marked-godown stock page
+│   ├── payment_summary.py            # Payment Summary: dues per jute supplier (read-only except the party list)
 │   ├── po_tracker.py                 # PO Tracker: Original / Forwarding / Final PO per lorry (read-only)
 │   ├── company_pl_dashboard.py       # Company P&L dashboard
 │   ├── schema_viewer.py              # Schema browser (dev tool)
@@ -142,6 +150,8 @@ src/jutetransfer/
 ├── audit.py                          # jt_change_log: admin exceptions (date overrides), caller's transaction
 ├── payment_tracker_helpers.py        # Payment Tracker: pure shaping (what a bill is, statuses, payment request)
 ├── payment_queries.py                # Payment Tracker reads (jute_mr + acc_* bill refs, read-only)
+├── payment_summary_helpers.py        # Payment Summary: pure supplier grouping, notional oldest-first days, period matrix
+├── supplier_map.py                   # jt_party_supplier_map: confirmed party -> jute supplier (admin writes)
 ├── vow_api.py                        # Client for VoW's jute-payments integration API (no accounting writes here)
 ├── freed.py                          # jt_freed_no: numbers freed by a delete, re-used when the date fits
 ├── edit_ops.py                       # Edit mode: saved step / marked move changed in place (date, godown), logged

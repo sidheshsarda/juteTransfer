@@ -7,6 +7,7 @@ from .warehouse_stock import warehouse_stock_page
 from .po_tracker import po_tracker_page
 from .users import users_page
 from .payment_tracker import payment_tracker_page
+from .payment_summary import payment_summary_page
 
 __all__ = [
     'schema_viewer_page',
@@ -16,4 +17,5 @@ __all__ = [
     'po_tracker_page',
     'users_page',
     'payment_tracker_page',
+    'payment_summary_page',
 ]
